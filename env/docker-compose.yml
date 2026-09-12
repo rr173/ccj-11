@@ -8,15 +8,22 @@ services:
     environment:
       NODE_ENV: production
       DB_PATH: /data/wizard.db
+      # 回执核验码密钥。留空时容器会在数据卷自动生成 /data/receipt-secret.key；
+      # 也可在此显式提供固定值（建议使用 docker compose secret 或编排平台密钥管理）。
+      # RECEIPT_SECRET: "change-me-to-a-long-random-secret"
+      RECEIPT_SECRET_PATH: /data/receipt-secret.key
       TOKEN_TTL_MS: 600000
       SESSION_TTL_MS: 43200000
+      VERIFY_RATE_MAX: "20"
+      VERIFY_RATE_WINDOW_MS: "900000"
+      DISPLAY_TIMEZONE: Asia/Shanghai
       DEMO_PASSWORD: password123
       # Set COOKIE_SECURE=1 when HTTPS is terminated by the reverse proxy.
       COOKIE_SECURE: "0"
     volumes:
       - wizard-data:/data
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/verify').then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -4,13 +4,41 @@ import Database from 'better-sqlite3';
 import { config } from './config.js';
 import { hashPassword, sha256, tokenUrlSafe, verifyPassword } from './crypto.js';
 import { STEPS } from './workflow.js';
+import {
+  buildSnapshot,
+  newReceiptNo,
+  ownerReceipt,
+  receiptSummary,
+  RECEIPT_NO_PATTERN,
+} from './receipts.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
 export const db = new Database(config.dbPath);
 db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
 db.pragma('busy_timeout = 5000');
+
+function columnInfo(table) {
+  try {
+    return db.prepare(`PRAGMA table_info(${table})`).all();
+  } catch {
+    return [];
+  }
+}
+
+const hasDb = columnInfo('users').length > 0;
+const legacyWorkflows = hasDb && columnInfo('workflows').some((c) => c.name === 'user_id')
+  && !columnInfo('workflows').some((c) => c.name === 'sequence');
+const hasReceipts = columnInfo('receipts').length > 0;
+
+// 旧库迁移必须在 foreign_keys 开启前完成（SQLite 不允许在事务中切换该开关）
+if (legacyWorkflows) {
+  db.pragma('foreign_keys = OFF');
+  // 保持子表外键仍引用 "workflows" 表名，不被 RENAME 改写
+  db.pragma('legacy_alter_table = ON');
+  db.exec('ALTER TABLE workflows RENAME TO workflows_old;');
+  db.pragma('legacy_alter_table = OFF');
+}
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
@@ -31,15 +59,35 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
+CREATE TABLE IF NOT EXISTS receipts (
+  id TEXT PRIMARY KEY,
+  receipt_no TEXT NOT NULL UNIQUE,
+  workflow_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'issued' CHECK (status IN ('issued', 'revoked')),
+  snapshot_json TEXT NOT NULL,
+  revoke_reason TEXT NOT NULL DEFAULT '',
+  issued_at INTEGER NOT NULL,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_receipts_user ON receipts(user_id, issued_at);
+CREATE INDEX IF NOT EXISTS idx_receipts_workflow ON receipts(workflow_id);
+
+-- 同一用户可有多条办理记录：首次办理 + 每次更正产生的新记录；
+-- 旧的已完成记录与其回执永久冻结、不可覆盖。
 CREATE TABLE IF NOT EXISTS workflows (
   id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  sequence INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'completed')),
+  source_receipt_no TEXT NOT NULL DEFAULT '',
   progress INTEGER NOT NULL DEFAULT 0,
   version INTEGER NOT NULL DEFAULT 0,
   completed_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_workflows_user ON workflows(user_id, sequence);
 
 CREATE TABLE IF NOT EXISTS workflow_steps (
   workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
@@ -92,6 +140,26 @@ CREATE TABLE IF NOT EXISTS events (
 );
 `);
 
+// 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_workflows_one_open
+  ON workflows(user_id) WHERE status = 'open';
+`);
+
+if (legacyWorkflows) {
+  db.transaction(() => {
+    db.exec(`
+      INSERT INTO workflows (id, user_id, sequence, status, source_receipt_no, progress, version, completed_at, created_at, updated_at)
+      SELECT id, user_id, 1,
+             CASE WHEN completed_at IS NOT NULL THEN 'completed' ELSE 'open' END,
+             '', progress, version, completed_at, created_at, updated_at
+      FROM workflows_old;
+    `);
+    db.exec('DROP TABLE workflows_old;');
+  })();
+  db.pragma('foreign_keys = ON');
+}
+
 function now() {
   return Date.now();
 }
@@ -119,6 +187,13 @@ export function cryptoId() {
 seedUser('alice', 'Alice 示例用户');
 seedUser('bob', 'Bob 示例用户');
 seedUser('carol', 'Carol 并发测试用户');
+seedUser('dave', 'Dave 回执测试用户');
+seedUser('erin', 'Erin 回执测试用户');
+
+// 旧库已完成但当时尚未签发回执的记录，在升级时补签（内容按已持久化的确认冻结）
+if (legacyWorkflows || !hasReceipts) {
+  backfillReceipts();
+}
 
 export function findUserByLogin(username, password) {
   const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
@@ -158,31 +233,84 @@ export function deleteSession(sessionId) {
   db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId);
 }
 
-export function getOrCreateWorkflow(userId) {
+function createWorkflowRow(userId) {
   const ts = now();
   return immediateTransaction(() => {
-    let workflow = db.prepare('SELECT * FROM workflows WHERE user_id = ?').get(userId);
-    if (!workflow) {
-      const id = cryptoId();
+    const maxSeq = db.prepare('SELECT COALESCE(MAX(sequence), 0) AS max_seq FROM workflows WHERE user_id = ?').get(userId).max_seq;
+    const id = cryptoId();
+    db.prepare(`
+      INSERT INTO workflows (id, user_id, sequence, status, source_receipt_no, progress, version, completed_at, created_at, updated_at)
+      VALUES (?, ?, ?, 'open', '', 0, 0, NULL, ?, ?)
+    `).run(id, userId, maxSeq + 1, ts, ts);
+    STEPS.forEach((_, step) => {
       db.prepare(`
-        INSERT INTO workflows (id, user_id, progress, version, completed_at, created_at, updated_at)
-        VALUES (?, ?, 0, 0, NULL, ?, ?)
-      `).run(id, userId, ts, ts);
-      STEPS.forEach((_, step) => {
-        db.prepare(`
-          INSERT INTO workflow_steps (workflow_id, step, draft_json, confirmed_json, confirmed_at, updated_at)
-          VALUES (?, ?, NULL, NULL, NULL, ?)
-        `).run(id, step, ts);
-      });
-      workflow = db.prepare('SELECT * FROM workflows WHERE id = ?').get(id);
-      addEvent(id, 'workflow.created', null, {});
-    }
+        INSERT INTO workflow_steps (workflow_id, step, draft_json, confirmed_json, confirmed_at, updated_at)
+        VALUES (?, ?, NULL, NULL, NULL, ?)
+      `).run(id, step, ts);
+    });
+    const workflow = db.prepare('SELECT * FROM workflows WHERE id = ?').get(id);
+    addEvent(id, 'workflow.created', null, { sequence: workflow.sequence });
     return workflow;
   });
 }
 
+// 进行中的办理优先；首次访问时创建；已完成时返回最近的只读记录，
+// 只有显式的“更正”接口才会创建新的办理记录。
+export function getOrCreateWorkflow(userId) {
+  const active = getActiveWorkflow(userId);
+  if (active) return active;
+  const latest = db.prepare('SELECT * FROM workflows WHERE user_id = ? ORDER BY sequence DESC LIMIT 1').get(userId);
+  return latest || createWorkflowRow(userId);
+}
+
+export function getActiveWorkflow(userId) {
+  return db.prepare(`
+    SELECT * FROM workflows WHERE user_id = ? AND status = 'open'
+    ORDER BY sequence DESC LIMIT 1
+  `).get(userId) || null;
+}
+
+// 基于一份已签发回执发起更正：原回执与原办理冻结不变，另开一条新的办理记录
+export function createCorrectionWorkflow({ userId, sourceReceiptNo }) {
+  return immediateTransaction(() => {
+    const source = db.prepare(`
+      SELECT * FROM receipts WHERE receipt_no = ? AND user_id = ?
+    `).get(sourceReceiptNo, userId);
+    if (!source) return { ok: false, status: 404, code: 'RECEIPT_NOT_FOUND' };
+
+    const existingOpen = getActiveWorkflow(userId);
+    if (existingOpen) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'OPEN_WORKFLOW_EXISTS',
+        message: '已有进行中的办理，请先完成后再发起更正',
+        workflow: publicWorkflow(existingOpen, getSteps(existingOpen.id)),
+      };
+    }
+
+    const ts = now();
+    const maxSeq = db.prepare('SELECT COALESCE(MAX(sequence), 0) AS max_seq FROM workflows WHERE user_id = ?').get(userId).max_seq;
+    const id = cryptoId();
+    db.prepare(`
+      INSERT INTO workflows (id, user_id, sequence, status, source_receipt_no, progress, version, completed_at, created_at, updated_at)
+      VALUES (?, ?, ?, 'open', ?, 0, 0, NULL, ?, ?)
+    `).run(id, userId, maxSeq + 1, source.receipt_no, ts, ts);
+    STEPS.forEach((_, step) => {
+      db.prepare(`
+        INSERT INTO workflow_steps (workflow_id, step, draft_json, confirmed_json, confirmed_at, updated_at)
+        VALUES (?, ?, NULL, NULL, NULL, ?)
+      `).run(id, step, ts);
+    });
+    addEvent(id, 'workflow.created', null, { sequence: maxSeq + 1, correctionOf: source.receipt_no });
+    return { ok: true, workflow: db.prepare('SELECT * FROM workflows WHERE id = ?').get(id) };
+  });
+}
+
 export function getWorkflowForUser(userId) {
-  return db.prepare('SELECT * FROM workflows WHERE user_id = ?').get(userId);
+  const active = getActiveWorkflow(userId);
+  if (active) return active;
+  return db.prepare('SELECT * FROM workflows WHERE user_id = ? ORDER BY sequence DESC LIMIT 1').get(userId);
 }
 
 export function getSteps(workflowId) {
@@ -231,10 +359,9 @@ export function confirmStep({ workflowId, userId, sessionId, pageId, step, token
   return immediateTransaction(() => {
     const workflow = db.prepare('SELECT * FROM workflows WHERE id = ? AND user_id = ?').get(workflowId, userId);
     if (!workflow) return { ok: false, status: 404, code: 'WORKFLOW_NOT_FOUND' };
-    if (workflow.completed_at) {
-      return { ok: false, status: 409, code: 'WORKFLOW_COMPLETED', workflow: publicWorkflow(workflow, getSteps(workflowId)) };
-    }
 
+    // 幂等回放必须先于“已完成”检查：最后一步的网络重试在完成后到达，
+    // 仍应返回同一份提交结果与同一份回执，而不是报错或生成第二份。
     const priorSubmission = db.prepare(`
       SELECT * FROM submissions WHERE workflow_id = ? AND idempotency_key = ?
     `).get(workflowId, idempotencyKey);
@@ -242,16 +369,26 @@ export function confirmStep({ workflowId, userId, sessionId, pageId, step, token
       if (priorSubmission.request_hash !== requestHash || workflow.progress !== priorSubmission.step + 1) {
         return conflict(workflow, 'SUBMISSION_ALREADY_PROCESSED', '该提交已经处理或其确认已被退回失效，不能重复使用');
       }
-      if (workflow.progress === priorSubmission.step + 1) {
-        return {
-          ok: true,
-          replay: true,
-          submissionId: priorSubmission.id,
-          confirmation: JSON.parse(priorSubmission.confirmation_json),
-          nextStep: workflow.progress >= STEPS.length ? null : workflow.progress,
-          workflow: publicWorkflow(workflow, getSteps(workflowId)),
-        };
-      }
+      const refreshed = db.prepare('SELECT * FROM workflows WHERE id = ?').get(workflowId);
+      return {
+        ok: true,
+        replay: true,
+        submissionId: priorSubmission.id,
+        confirmation: JSON.parse(priorSubmission.confirmation_json),
+        nextStep: refreshed.progress >= STEPS.length ? null : refreshed.progress,
+        workflow: publicRow(refreshed),
+        receipt: getReceiptForWorkflow(workflowId),
+      };
+    }
+
+    if (workflow.completed_at) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'WORKFLOW_COMPLETED',
+        message: '办理已完成，回执不可修改或覆盖；如需更正请发起新的办理记录',
+        workflow: publicRow(workflow),
+      };
     }
 
     const tokenRow = db.prepare('SELECT * FROM tokens WHERE hash = ?').get(sha256(token));
@@ -322,22 +459,31 @@ export function confirmStep({ workflowId, userId, sessionId, pageId, step, token
     );
 
     const nextProgress = step + 1;
-    const completedAt = nextProgress >= STEPS.length ? ts : null;
+    const isFinal = nextProgress >= STEPS.length;
     db.prepare(`
       UPDATE workflows
-      SET progress = ?, version = version + 1, completed_at = ?, updated_at = ?
+      SET progress = ?, version = version + 1, completed_at = ?,
+          status = CASE WHEN ? >= ? THEN 'completed' ELSE 'open' END,
+          updated_at = ?
       WHERE id = ?
-    `).run(nextProgress, completedAt, ts, workflowId);
+    `).run(nextProgress, isFinal ? ts : null, nextProgress, STEPS.length, ts, workflowId);
 
-    addEvent(workflowId, completedAt ? 'workflow.completed' : 'step.confirmed', step, { submissionId });
+    let receipt = null;
+    if (isFinal) {
+      const completed = db.prepare('SELECT * FROM workflows WHERE id = ?').get(workflowId);
+      receipt = issueReceiptForWorkflow(completed);
+      addEvent(workflowId, 'receipt.issued', step, { receiptNo: receipt.receiptNo });
+    }
+    addEvent(workflowId, isFinal ? 'workflow.completed' : 'step.confirmed', step, { submissionId });
 
     const refreshed = db.prepare('SELECT * FROM workflows WHERE id = ?').get(workflowId);
     return {
       ok: true,
       submissionId,
       confirmation,
-      nextStep: completedAt ? null : nextProgress,
-      workflow: publicWorkflow(refreshed, getSteps(workflowId)),
+      nextStep: isFinal ? null : nextProgress,
+      workflow: publicRow(refreshed),
+      receipt,
     };
   });
 }
@@ -346,12 +492,21 @@ export function rollbackStep({ workflowId, userId, targetStep, expectedVersion }
   return immediateTransaction(() => {
     const workflow = db.prepare('SELECT * FROM workflows WHERE id = ? AND user_id = ?').get(workflowId, userId);
     if (!workflow) return { ok: false, status: 404, code: 'WORKFLOW_NOT_FOUND' };
-    if (workflow.completed_at) return { ok: false, status: 409, code: 'WORKFLOW_COMPLETED' };
+    // 已完成（回执已签发）的办理不可退回修改
+    if (workflow.completed_at) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'WORKFLOW_COMPLETED',
+        message: '已完成的回执不能退回修改；如需更正请发起新的办理记录',
+        workflow: publicRow(workflow),
+      };
+    }
     if (!Number.isInteger(targetStep) || targetStep < 0 || targetStep >= workflow.progress) {
       return { ok: false, status: 400, code: 'INVALID_ROLLBACK_TARGET' };
     }
     if (expectedVersion !== undefined && expectedVersion !== workflow.version) {
-      return { ok: false, status: 409, code: 'WORKFLOW_VERSION_CONFLICT', workflow: publicWorkflow(workflow, getSteps(workflowId)) };
+      return { ok: false, status: 409, code: 'WORKFLOW_VERSION_CONFLICT', workflow: publicRow(workflow) };
     }
 
     const ts = now();
@@ -388,13 +543,13 @@ export function rollbackStep({ workflowId, userId, targetStep, expectedVersion }
 
     db.prepare(`
       UPDATE workflows
-      SET progress = ?, version = version + 1, completed_at = NULL, updated_at = ?
+      SET progress = ?, version = version + 1, completed_at = NULL, status = 'open', updated_at = ?
       WHERE id = ?
     `).run(targetStep, ts, workflowId);
     addEvent(workflowId, 'steps.invalidated', targetStep, { from: targetStep });
 
     const refreshed = db.prepare('SELECT * FROM workflows WHERE id = ?').get(workflowId);
-    return { ok: true, workflow: publicWorkflow(refreshed, getSteps(workflowId)) };
+    return { ok: true, workflow: publicRow(refreshed) };
   });
 }
 
@@ -408,6 +563,10 @@ function conflict(workflow, code, message) {
   };
 }
 
+function publicRow(workflow) {
+  return publicWorkflow(workflow, getSteps(workflow.id));
+}
+
 function bumpWorkflow(workflowId) {
   db.prepare('UPDATE workflows SET version = version + 1, updated_at = ? WHERE id = ?').run(now(), workflowId);
 }
@@ -418,6 +577,109 @@ function addEvent(workflowId, type, step, detail) {
     VALUES (?, ?, ?, ?, ?)
   `).run(workflowId, type, step ?? null, JSON.stringify(detail), now());
 }
+
+// ---------------------------------------------------------------------------
+// 回执
+// ---------------------------------------------------------------------------
+
+// 在事务内调用：编号碰撞时重试（编号含 40 位随机熵，碰撞概率可忽略，仅作严谨兜底）
+function insertReceiptRow(workflow, issuedAt) {
+  const steps = getSteps(workflow.id);
+  const snapshot = buildSnapshot({ workflow, steps, sequence: workflow.sequence });
+  const snapshotJson = JSON.stringify(snapshot);
+  const insert = db.prepare(`
+    INSERT INTO receipts (id, receipt_no, workflow_id, user_id, status, snapshot_json, revoke_reason, issued_at, revoked_at)
+    VALUES (?, ?, ?, ?, 'issued', ?, '', ?, NULL)
+  `);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const receiptNo = newReceiptNo(issuedAt);
+    try {
+      const id = cryptoId();
+      insert.run(id, receiptNo, workflow.id, workflow.user_id, snapshotJson, issuedAt);
+      return db.prepare('SELECT * FROM receipts WHERE id = ?').get(id);
+    } catch (error) {
+      if (String(error?.message || '').includes('UNIQUE') && attempt < 4) continue;
+      throw error;
+    }
+  }
+  throw new Error('回执编号连续冲突，请重试');
+}
+
+function issueReceiptForWorkflow(workflow) {
+  // 已存在则原样返回：网络重试、并发、回放都只能拿到同一份回执
+  const existing = db.prepare('SELECT * FROM receipts WHERE workflow_id = ?').get(workflow.id);
+  if (existing) return hydrateReceipt(existing);
+  const row = insertReceiptRow(workflow, workflow.completed_at || now());
+  return hydrateReceipt(row);
+}
+
+function backfillReceipts() {
+  const rows = db.prepare(`
+    SELECT w.* FROM workflows w
+    LEFT JOIN receipts r ON r.workflow_id = w.id
+    WHERE w.completed_at IS NOT NULL AND r.id IS NULL
+  `).all();
+  if (rows.length === 0) return;
+  immediateTransaction(() => {
+    for (const workflow of rows) {
+      const receipt = issueReceiptForWorkflow(workflow);
+      addEvent(workflow.id, 'receipt.issued', null, { receiptNo: receipt.receiptNo, backfilled: true });
+    }
+  });
+}
+
+function hydrateReceipt(row) {
+  return ownerReceipt(row, JSON.parse(row.snapshot_json));
+}
+
+export function getReceiptForWorkflow(workflowId) {
+  const row = db.prepare('SELECT * FROM receipts WHERE workflow_id = ?').get(workflowId);
+  return row ? hydrateReceipt(row) : null;
+}
+
+export function getReceiptForOwner(receiptNo, userId) {
+  const row = db.prepare('SELECT * FROM receipts WHERE receipt_no = ? AND user_id = ?').get(receiptNo, userId);
+  return row ? hydrateReceipt(row) : null;
+}
+
+export function listReceiptsForUser(userId) {
+  return db.prepare(`
+    SELECT r.*, w.sequence, w.completed_at
+    FROM receipts r
+    JOIN workflows w ON w.id = r.workflow_id
+    WHERE r.user_id = ?
+    ORDER BY r.issued_at DESC, r.receipt_no DESC
+  `).all(userId).map(receiptSummary);
+}
+
+export function findReceiptRowByNo(receiptNo) {
+  if (!RECEIPT_NO_PATTERN.test(receiptNo)) return null;
+  return db.prepare('SELECT * FROM receipts WHERE receipt_no = ?').get(receiptNo) || null;
+}
+
+export function snapshotOfReceiptRow(row) {
+  return JSON.parse(row.snapshot_json);
+}
+
+// 撤销：回执内容（snapshot_json）永不删除、永不修改，只变更状态
+export function revokeReceipt({ userId, receiptNo, reason }) {
+  return immediateTransaction(() => {
+    const row = db.prepare('SELECT * FROM receipts WHERE receipt_no = ? AND user_id = ?').get(receiptNo, userId);
+    if (!row) return { ok: false, status: 404, code: 'RECEIPT_NOT_FOUND' };
+    if (row.status === 'revoked') {
+      return { ok: false, status: 409, code: 'RECEIPT_ALREADY_REVOKED', message: '该回执已经处于撤销状态', receipt: hydrateReceipt(row) };
+    }
+    const ts = now();
+    db.prepare('UPDATE receipts SET status = ?, revoked_at = ?, revoke_reason = ? WHERE id = ?')
+      .run('revoked', ts, String(reason || '').slice(0, 200), row.id);
+    addEvent(row.workflow_id, 'receipt.revoked', null, { receiptNo: row.receipt_no, reason: String(reason || '').slice(0, 200) });
+    return { ok: true, receipt: hydrateReceipt(db.prepare('SELECT * FROM receipts WHERE id = ?').get(row.id)) };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 对外视图
+// ---------------------------------------------------------------------------
 
 export function publicWorkflow(workflow, rows) {
   const steps = rows.map((row) => {
@@ -441,10 +703,27 @@ export function publicWorkflow(workflow, rows) {
   });
   return {
     id: workflow.id,
+    sequence: workflow.sequence,
+    status: workflow.status,
+    sourceReceiptNo: workflow.source_receipt_no || '',
     progress: workflow.progress,
     version: workflow.version,
     completedAt: workflow.completed_at || null,
     completed: Boolean(workflow.completed_at),
     steps,
   };
+}
+
+// 状态信封：当前进行中的办理（无则最近一条只读记录）+ 该记录回执 + 历史回执清单
+export function stateEnvelope(workflow) {
+  const publicView = publicWorkflow(workflow, getSteps(workflow.id));
+  const receipt = getReceiptForWorkflow(workflow.id);
+  return { workflow: publicView, receipt };
+}
+
+export function getStateForUser(userId) {
+  const workflow = getOrCreateWorkflow(userId);
+  const envelope = stateEnvelope(workflow);
+  envelope.records = listReceiptsForUser(userId);
+  return envelope;
 }

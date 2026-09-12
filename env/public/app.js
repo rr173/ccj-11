@@ -41,11 +41,15 @@ const els = {
   userBox: $('#userBox'), userName: $('#userName'), logoutBtn: $('#logoutBtn'), stepList: $('#stepList'),
   stateVersion: $('#stateVersion'), currentStepLabel: $('#currentStepLabel'), globalAlert: $('#globalAlert'),
   stepForm: $('#stepForm'), receiptPanel: $('#receiptPanel'),
+  recordsPanel: $('#recordsPanel'), recordsList: $('#recordsList'),
 };
 
 const state = {
   csrfToken: readCookie('csrf'),
   workflow: null,
+  receipt: null,
+  viewingReceipt: null,
+  records: [],
   user: null,
   pageId: getPageId(),
   token: null,
@@ -56,6 +60,7 @@ const state = {
   saving: false,
   formController: null,
   tokenRequestId: 0,
+  busy: false,
 };
 
 document.addEventListener('DOMContentLoaded', boot);
@@ -71,8 +76,7 @@ els.logoutBtn.addEventListener('click', logout);
 async function boot() {
   try {
     const result = await api('GET', '/api/state');
-    state.user = result.user;
-    state.workflow = result.workflow;
+    applyState(result);
     showApp();
   } catch (error) {
     if (error.status === 401) {
@@ -84,6 +88,13 @@ async function boot() {
   }
 }
 
+function applyState(result) {
+  state.user = result.user;
+  state.workflow = result.workflow;
+  state.receipt = result.receipt || null;
+  state.records = Array.isArray(result.records) ? result.records : [];
+}
+
 async function login(event) {
   event.preventDefault();
   hideAlert();
@@ -92,8 +103,7 @@ async function login(event) {
   try {
     const result = await api('POST', '/api/login', data, false);
     state.csrfToken = result.csrfToken;
-    state.user = result.user;
-    state.workflow = result.workflow;
+    applyState(result);
     form.reset();
     showApp();
   } catch (error) {
@@ -106,6 +116,8 @@ async function logout() {
   try { await api('POST', '/api/logout', {}, false); } finally {
     state.csrfToken = null;
     state.workflow = null;
+    state.receipt = null;
+    state.records = [];
     showLogin();
   }
 }
@@ -130,12 +142,54 @@ function render() {
   renderProgress();
   els.stateVersion.textContent = state.workflow.version;
 
+  renderRecords();
   if (state.workflow.completed) {
-    renderReceipt();
+    renderReceipt(state.receipt || state.viewingReceipt || null);
     return;
   }
+  state.viewingReceipt = null;
   els.receiptPanel.classList.add('hidden');
+  els.receiptPanel.innerHTML = '';
   renderCurrentStep();
+}
+
+function renderRecords() {
+  if (!state.records.length) {
+    els.recordsPanel.classList.add('hidden');
+    els.recordsList.innerHTML = '';
+    return;
+  }
+  els.recordsPanel.classList.remove('hidden');
+  els.recordsList.innerHTML = '';
+  state.records.forEach((record) => {
+    const li = document.createElement('li');
+    li.className = `record-item ${record.status}`;
+    const statusText = record.status === 'revoked' ? '已撤销' : '有效';
+    li.innerHTML = `
+      <div class="record-main">
+        <span class="mono">${escapeHtml(record.receiptNo)}</span>
+        <span class="badge ${record.status === 'revoked' ? 'invalidated' : 'confirmed'}">${statusText}</span>
+      </div>
+      <div class="muted small">第 ${record.sequence} 次办理 · 完成于 ${formatTime(record.completedAt)}</div>
+      <div class="record-actions"></div>
+    `;
+    const actions = li.querySelector('.record-actions');
+    const viewBtn = document.createElement('button');
+    viewBtn.type = 'button';
+    viewBtn.className = 'link-button';
+    viewBtn.textContent = '查看 / 打印回执';
+    viewBtn.addEventListener('click', () => openReceiptDoc(record.receiptNo));
+    actions.append(viewBtn);
+    if (record.workflowId !== state.workflow?.id) {
+      const detailBtn = document.createElement('button');
+      detailBtn.type = 'button';
+      detailBtn.className = 'link-button muted-link';
+      detailBtn.textContent = '加载完整内容';
+      detailBtn.addEventListener('click', () => loadReceipt(record.receiptNo));
+      actions.append(detailBtn);
+    }
+    els.recordsList.append(li);
+  });
 }
 
 function renderProgress() {
@@ -274,11 +328,15 @@ async function submitStep(event) {
       payload,
     });
     state.workflow = result.workflow;
+    if (result.receipt) state.receipt = result.receipt;
     state.pendingIdempotencyKey = null;
     clearToken();
     showAlert(result.replay
-      ? '网络重试命中了同一次提交的幂等记录；服务端返回原确认，未重复推进、未重复生成确认。'
-      : `第 ${step + 1} 步已由服务端确认。`, result.replay ? 'warning' : 'success');
+      ? '网络重试命中了同一次提交的幂等记录；服务端返回原确认，未重复推进、未重复生成回执。'
+      : result.receipt
+        ? '全部四步已确认成功，电子回执已生成并固定保存。'
+        : `第 ${step + 1} 步已由服务端确认。`, result.replay ? 'warning' : 'success');
+    if (result.receipt) void refreshRecords();
     render();
   } catch (error) {
     if (error.body?.workflow) state.workflow = error.body.workflow;
@@ -373,21 +431,146 @@ async function requestRollback(targetStep) {
   }
 }
 
-function renderReceipt() {
+function renderReceipt(receipt = state.receipt) {
   els.stepForm.innerHTML = '';
   els.receiptPanel.classList.remove('hidden');
-  const confirmations = state.workflow.steps.map((s, i) => `
+  if (!receipt) {
+    els.receiptPanel.innerHTML = `
+      <h2>办理完成</h2>
+      <p class="muted">回执数据加载中。如长时间未显示，请<a href="#" id="reloadState">重新加载状态</a>。</p>`;
+    els.receiptPanel.querySelector('#reloadState')?.addEventListener('click', async (e) => {
+      e.preventDefault();
+      await boot();
+    });
+    return;
+  }
+  const revoked = receipt.status === 'revoked';
+  const stepsHtml = receipt.snapshot.steps.map((s, i) => `
     <div class="confirmation">
       <strong>${i + 1}. ${escapeHtml(s.title)}</strong>
-      <div>确认时间：${s.confirmedAt ? new Date(s.confirmedAt).toLocaleString() : '无'}</div>
-      <pre>${escapeHtml(JSON.stringify(s.confirmed, null, 2))}</pre>
+      <div class="muted small">确认时间：${formatTime(s.confirmedAt)}</div>
+      <pre>${escapeHtml(JSON.stringify(s.data, null, 2))}</pre>
     </div>
   `).join('');
   els.receiptPanel.innerHTML = `
-    <h2>办理完成</h2>
-    <p>所有步骤都由服务端确认。完成时间：${new Date(state.workflow.completedAt).toLocaleString()}</p>
-    ${confirmations}
+    <div class="receipt-head">
+      <h2>电子办理回执</h2>
+      <span class="status-pill ${revoked ? 'revoked' : 'completed'}">${revoked ? '已撤销（失效）' : '已完成'}</span>
+    </div>
+    <div class="receipt-meta">
+      <div><span class="muted">回执编号</span><b class="mono selectable">${escapeHtml(receipt.receiptNo)}</b></div>
+      <div><span class="muted">核验码（请与编号分开保管）</span><b class="mono selectable code-value">${escapeHtml(receipt.code)}</b></div>
+      <div><span class="muted">最终完成时间</span><b>${formatTime(receipt.completedAt)}</b></div>
+      <div><span class="muted">回执签发时间</span><b>${formatTime(receipt.issuedAt)}</b></div>
+      <div><span class="muted">办理记录</span><b>第 ${receipt.snapshot.sequence} 次办理</b></div>
+      <div><span class="muted">公开核验</span><b><a href="/verify" target="_blank" rel="noopener">/verify</a>（无需登录，仅显示脱敏信息）</b></div>
+    </div>
+    ${revoked ? `<div class="alert error">本回执已于 ${formatTime(receipt.revokedAt)} 撤销${receipt.revokeReason ? `，原因：${escapeHtml(receipt.revokeReason)}` : ''}，不再作为办理完成的有效凭证。回执内容仍按原始记录留档。</div>` : ''}
+    <div class="receipt-actions">
+      <button class="button primary" type="button" data-action="print">查看 / 下载可打印回执</button>
+      <button class="button secondary" type="button" data-action="copy-no">复制回执编号</button>
+      <button class="button secondary" type="button" data-action="copy-code">复制核验码</button>
+      <button class="button secondary" type="button" data-action="correct">基于本回执发起更正（生成新办理记录）</button>
+      ${revoked ? '' : '<button class="button danger" type="button" data-action="revoke">撤销本回执</button>'}
+    </div>
+    <p class="muted small">
+      回执内容在签发时已固定保存，包含各步已确认信息、各步确认时间和最终完成时间；
+      刷新页面、重新登录或服务重启后看到的都是同一份回执。已完成的回执不能退回修改或被覆盖。
+    </p>
+    <h3>各步已确认信息</h3>
+    ${stepsHtml}
   `;
+  els.receiptPanel.querySelector('[data-action="print"]').addEventListener('click', () => openReceiptDoc(receipt.receiptNo));
+  els.receiptPanel.querySelector('[data-action="copy-no"]').addEventListener('click', () => copyText(receipt.receiptNo, '回执编号已复制'));
+  els.receiptPanel.querySelector('[data-action="copy-code"]').addEventListener('click', () => copyText(receipt.code, '核验码已复制'));
+  els.receiptPanel.querySelector('[data-action="correct"]').addEventListener('click', () => startCorrection(receipt.receiptNo));
+  if (!revoked) {
+    els.receiptPanel.querySelector('[data-action="revoke"]').addEventListener('click', () => revokeCurrentReceipt(receipt));
+  }
+}
+
+function formatTime(epochMs) {
+  if (!epochMs) return '—';
+  return new Date(epochMs).toLocaleString('zh-CN', { hour12: false });
+}
+
+function openReceiptDoc(receiptNo) {
+  window.open(`/api/receipts/${encodeURIComponent(receiptNo)}/print`, '_blank', 'noopener');
+}
+
+async function loadReceipt(receiptNo) {
+  try {
+    const result = await api('GET', `/api/receipts/${encodeURIComponent(receiptNo)}`);
+    state.viewingReceipt = result.receipt;
+    renderReceipt(result.receipt);
+    els.receiptPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (error) {
+    showAlert(error.message || '回执加载失败', 'error');
+  }
+}
+
+async function copyText(text, okMessage) {
+  try {
+    await navigator.clipboard.writeText(text);
+    showAlert(okMessage, 'success');
+  } catch {
+    window.prompt('请手动复制：', text);
+  }
+}
+
+async function startCorrection(receiptNo) {
+  const ok = window.confirm(
+    '将基于该回执发起一次更正办理：\n\n'
+    + '· 原回执与原办理记录固定保留，不会被修改或覆盖；\n'
+    + '· 系统会创建一条全新的办理记录，需要重新逐步确认四步；\n'
+    + '· 新流程全部完成后会生成新的回执编号与核验码。\n\n'
+    + '确定发起更正吗？',
+  );
+  if (!ok || state.busy) return;
+  state.busy = true;
+  try {
+    const result = await api('POST', '/api/corrections', { receiptNo });
+    state.workflow = result.workflow;
+    state.receipt = null;
+    state.viewingReceipt = null;
+    state.records = result.records || state.records;
+    state.pendingIdempotencyKey = null;
+    clearToken();
+    showAlert('已创建新的更正办理记录，请从第 1 步开始重新确认。原回执保持不变。', 'warning');
+    render();
+  } catch (error) {
+    if (error.body?.workflow) state.workflow = error.body.workflow;
+    showAlert(`发起更正失败：${error.message || explainConflict(error.body?.error?.code)}`, 'error');
+    render();
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function revokeCurrentReceipt(receipt) {
+  const reason = window.prompt(
+    `撤销后回执 ${receipt.receiptNo} 将立即失效，公开核验会明确提示“已撤销”，\n`
+    + '回执内容仍固定留档，且该操作不能恢复。请输入撤销原因（可留空）：',
+    '',
+  );
+  if (reason === null || state.busy) return;
+  state.busy = true;
+  try {
+    const result = await api('POST', `/api/receipts/${encodeURIComponent(receipt.receiptNo)}?action=revoke`, {
+      reason: reason.slice(0, 200),
+    });
+    if (state.receipt?.receiptNo === receipt.receiptNo) state.receipt = result.receipt;
+    state.viewingReceipt = result.receipt;
+    state.records = result.records || state.records;
+    showAlert('回执已撤销。如需办理，请发起更正以生成新的办理记录与回执。', 'warning');
+    render();
+  } catch (error) {
+    if (error.body?.receipt) state.receipt = error.body.receipt;
+    showAlert(`撤销失败：${error.message || '请稍后重试'}`, 'error');
+    render();
+  } finally {
+    state.busy = false;
+  }
 }
 
 function updateTokenStatus(prefix = '') {
@@ -427,8 +610,19 @@ function explainConflict(code) {
     STEP_NOT_CURRENT: '该步骤不是服务端记录的当前步骤。',
     WORKFLOW_VERSION_CONFLICT: '进度已在其他页面变化。',
     SUBMISSION_ALREADY_PROCESSED: '提交已处理或其确认已失效，拒绝重复使用。',
-    WORKFLOW_COMPLETED: '办理已完成。',
+    WORKFLOW_COMPLETED: '办理已完成，回执不能退回修改或覆盖；如需更正请发起新的办理记录。',
+    OPEN_WORKFLOW_EXISTS: '已有进行中的办理，请先完成后再发起更正。',
+    RECEIPT_NOT_FOUND: '回执不存在或不属于当前账号。',
+    RECEIPT_ALREADY_REVOKED: '该回执已经处于撤销状态。',
   }[code] || '请求被服务端拒绝。';
+}
+
+async function refreshRecords() {
+  try {
+    const result = await api('GET', '/api/receipts');
+    state.records = result.receipts || [];
+    renderRecords();
+  } catch { /* 列表刷新失败不影响主流程 */ }
 }
 
 function showStepError(message) {

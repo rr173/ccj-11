@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>电子回执核验</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell verify-shell">
+    <header class="verify-head">
+      <h1>电子回执核验</h1>
+      <p class="muted">输入回执编号与核验码后才能查询结果。核验无需登录。</p>
+      <p><a class="button secondary" href="/">返回办理入口</a></p>
+    </header>
+
+    <section class="card verify-card">
+      <form id="verifyForm">
+        <label>回执编号
+          <input name="receiptNo" required autocomplete="off" inputmode="text"
+                 placeholder="HZ-20260912-XXXXXXXX" pattern="[HZhz0-9A-Za-z\s-]{10,30}">
+        </label>
+        <label>核验码
+          <input name="code" required autocomplete="off" inputmode="text"
+                 placeholder="XXXX-XXXX（8 位字符，不区分大小写）" maxlength="9">
+        </label>
+        <div id="verifyError" class="alert error hidden"></div>
+        <button class="button primary" type="submit" id="verifyBtn">核验回执</button>
+      </form>
+    </section>
+
+    <section id="verifyResult" class="card hidden"></section>
+
+    <footer class="verify-foot muted">
+      为保护隐私，核验结果仅展示脱敏后的姓名、手机号、办理事项和完成时间，不展示证件号码或完整地址。
+      连续多次核验失败将暂时受限，请稍后再试。
+    </footer>
+  </main>
+  <script type="module" src="/verify.js"></script>
+</body>
+</html>

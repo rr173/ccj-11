@@ -49,5 +49,51 @@ textarea { min-height: 92px; resize: vertical; }
 .inline-hint { color: #667085; font-size: 13px; }
 .confirmation { background: #f8fafc; border: 1px solid #e4e7ec; border-radius: 10px; padding: 12px; margin: 12px 0; }
 .confirmation pre { white-space: pre-wrap; word-break: break-all; }
+
+/* 顶部操作区 */
+.top-actions { display: flex; align-items: center; gap: 12px; }
+a.button { display: inline-block; text-decoration: none; }
+
+/* 电子回执 */
+.receipt-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.status-pill { border-radius: 999px; padding: 6px 16px; font-weight: 700; font-size: 14px; white-space: nowrap; }
+.status-pill.completed { background: #d1fadf; color: #05603a; border: 1px solid #1d8a53; }
+.status-pill.revoked { background: #fee4e2; color: #b42318; border: 1px solid #b42318; }
+.receipt-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 24px; margin: 18px 0; }
+.receipt-meta div { display: grid; gap: 3px; font-size: 14px; border-bottom: 1px dotted #cbd2de; padding-bottom: 8px; }
+.mono { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; letter-spacing: .5px; }
+.selectable { user-select: all; }
+.code-value { font-size: 16px; }
+.receipt-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 16px 0 8px; }
+.small { font-size: 12px; }
+
+/* 侧栏历史记录 */
+.side-col { display: grid; gap: 18px; align-items: start; }
+.records-panel { padding: 16px; }
+.records-list { list-style: none; margin: 0 0 10px; padding: 0; display: grid; gap: 10px; }
+.record-item { border: 1px solid #dce2ec; border-radius: 10px; padding: 10px 12px; background: #f8fafc; }
+.record-item.revoked { background: #fef3f2; border-color: #fecdca; }
+.record-main { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+.record-main .mono { font-size: 12px; word-break: break-all; }
+.record-actions { display: flex; gap: 12px; margin-top: 6px; flex-wrap: wrap; }
+.muted-link { color: #647084 !important; }
+
+/* 免登录核验页 */
+.verify-shell { max-width: 720px; }
+.verify-head { text-align: center; margin: 30px 0 22px; }
+.verify-head h1 { margin-bottom: 8px; }
+.verify-card { max-width: 480px; margin: 0 auto 20px; }
+.verify-card form label { margin-bottom: 18px; }
+.verify-result { max-width: 640px; margin: 0 auto; }
+.kv-table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+.kv-table th, .kv-table td { border: 1px solid #d8dee9; padding: 10px 12px; text-align: left; font-size: 14px; }
+.kv-table th { width: 150px; background: #f5f7fb; }
+.status-line { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+.verify-foot { max-width: 560px; margin: 24px auto 0; text-align: center; font-size: 12px; line-height: 1.7; }
+
 .hidden { display: none !important; }
-@media (max-width: 760px) { .app { grid-template-columns: 1fr; } .topbar { align-items: flex-start; } }
+@media (max-width: 760px) { .app { grid-template-columns: 1fr; } .topbar { align-items: flex-start; } .receipt-meta { grid-template-columns: 1fr; } .top-actions { flex-direction: column; align-items: flex-end; } }
+@media print {
+  body { background: #fff; }
+  .topbar, .side-col, .work-panel > #globalAlert { display: none !important; }
+}
