@@ -1,0 +1,25 @@
+services:
+  wizard:
+    build: .
+    image: server-driven-wizard:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      DB_PATH: /data/wizard.db
+      TOKEN_TTL_MS: 600000
+      SESSION_TTL_MS: 43200000
+      DEMO_PASSWORD: password123
+      # Set COOKIE_SECURE=1 when HTTPS is terminated by the reverse proxy.
+      COOKIE_SECURE: "0"
+    volumes:
+      - wizard-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  wizard-data:
