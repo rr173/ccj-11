@@ -13,6 +13,13 @@ import {
 } from './receipts.js';
 import { buildCorrectionDiff } from './corrections.js';
 import { buildReviewView, reviewFieldDef, reviewTextValue } from './reviews.js';
+import {
+  attachCorrectionReceiptForBatch,
+  reopenBatchDecisionsForWorkflow,
+  buildBatchTimelineEntries,
+  listBatchesForOwner,
+  bindCorrectionFactory,
+} from './batchStore.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -204,13 +211,121 @@ CREATE INDEX IF NOT EXISTS idx_review_objections_workflow ON review_objections(c
 CREATE UNIQUE INDEX IF NOT EXISTS idx_review_objections_idempotency
   ON review_objections(session_id, idempotency_key) WHERE idempotency_key <> '';
 
--- 接受的异议与因此进入的更正办理（多对多：一次更正可回应多条异议）
-CREATE TABLE IF NOT EXISTS correction_objections (
+-- 接受的意见与更正办理的多对多关联（多对多：一次更正可回应多条意见）。
+-- objection_id 为普通复核异议；batch_opinion_id 为多方复核批次字段意见，二者至少有一个。
+-- 新结构在下方“增量迁移”区按库况创建/重建（旧库的 objection_id 为 NOT NULL，需重建）。
+
+-- ---------------------------------------------------------------------------
+-- 多方复核批次：办理人为同一份已签发回执编排 2-5 个限时一次性邀请，
+-- 逐字段配置接受/驳回阈值；批次只有在全部邀请校验完成后才能进入复核。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS review_batches (
+  id TEXT PRIMARY KEY,
+  receipt_no TEXT NOT NULL,
   workflow_id TEXT NOT NULL,
-  objection_id TEXT NOT NULL REFERENCES review_objections(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'collecting'
+    CHECK (status IN ('collecting', 'in_review', 'completed', 'cancelled')),
+  note TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
-  PRIMARY KEY (workflow_id, objection_id)
+  expires_at INTEGER NOT NULL,
+  started_at INTEGER,
+  completed_at INTEGER,
+  cancelled_at INTEGER,
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  invitation_count INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_review_batches_receipt ON review_batches(receipt_no, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_batches_user ON review_batches(user_id, created_at);
+
+-- 同一回执至多存在一个未终结（collecting/in_review）的批次
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_batches_one_open_per_receipt
+  ON review_batches(receipt_no) WHERE status IN ('collecting', 'in_review');
+
+-- 批次逐字段配置与决议：阈值在创建时冻结；决议结果、理由、处理人与时间全部留档
+CREATE TABLE IF NOT EXISTS review_batch_fields (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES review_batches(id) ON DELETE CASCADE,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  field_label TEXT NOT NULL DEFAULT '',
+  accept_threshold INTEGER NOT NULL,
+  reject_threshold INTEGER NOT NULL,
+  decision TEXT CHECK (decision IS NULL OR decision IN ('accepted', 'rejected')),
+  decided_at INTEGER,
+  decided_by_user_id TEXT,
+  decision_reason TEXT NOT NULL DEFAULT '',
+  correction_workflow_id TEXT,
+  correction_receipt_no TEXT NOT NULL DEFAULT '',
+  UNIQUE(batch_id, step, field)
+);
+CREATE INDEX IF NOT EXISTS idx_review_batch_fields_batch ON review_batch_fields(batch_id);
+
+CREATE TABLE IF NOT EXISTS review_batch_invitations (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES review_batches(id) ON DELETE CASCADE,
+  receipt_no TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL DEFAULT '',
+  token_hash BLOB NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'used', 'revoked', 'expired')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER,
+  used_ip TEXT NOT NULL DEFAULT '',
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_review_batch_invitations_batch ON review_batch_invitations(batch_id, created_at);
+
+-- 每个邀请可查看/可提交意见的字段范围（字段必须已纳入批次编排）
+CREATE TABLE IF NOT EXISTS review_batch_invitation_fields (
+  invitation_id TEXT NOT NULL REFERENCES review_batch_invitations(id) ON DELETE CASCADE,
+  batch_field_id TEXT NOT NULL REFERENCES review_batch_fields(id) ON DELETE CASCADE,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  PRIMARY KEY (invitation_id, step, field)
+);
+CREATE INDEX IF NOT EXISTS idx_review_batch_inv_fields_field ON review_batch_invitation_fields(batch_field_id);
+
+-- 批次邀请校验成功后建立的免登录会话（独立于单份复核邀请的 rid 会话）
+CREATE TABLE IF NOT EXISTS review_batch_sessions (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES review_batches(id) ON DELETE CASCADE,
+  batch_invitation_id TEXT NOT NULL REFERENCES review_batch_invitations(id) ON DELETE CASCADE,
+  receipt_no TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '',
+  token_hash BLOB NOT NULL UNIQUE,
+  csrf_secret TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_batch_sessions_invitation ON review_batch_sessions(batch_invitation_id);
+
+-- 字段意见：同一邀请对同一字段至多一条（UNIQUE 兜底并发）；逐字保留复核人原始说明
+CREATE TABLE IF NOT EXISTS review_batch_opinions (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES review_batches(id) ON DELETE CASCADE,
+  batch_field_id TEXT NOT NULL REFERENCES review_batch_fields(id) ON DELETE CASCADE,
+  batch_invitation_id TEXT NOT NULL REFERENCES review_batch_invitations(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES review_batch_sessions(id) ON DELETE CASCADE,
+  receipt_no TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  reviewer_label TEXT NOT NULL DEFAULT '',
+  field_label TEXT NOT NULL DEFAULT '',
+  value_snapshot TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL,
+  correction_receipt_no TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  request_hash TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE(batch_invitation_id, batch_field_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_batch_opinions_receipt ON review_batch_opinions(receipt_no, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_batch_opinions_idempotency
+  ON review_batch_opinions(session_id, idempotency_key) WHERE idempotency_key <> '';
 `);
 
 // 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
@@ -218,6 +333,46 @@ db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_workflows_one_open
   ON workflows(user_id) WHERE status = 'open';
 `);
+
+// 增量迁移：为早期多方批次表补齐后加列（全新库建表时已包含）
+for (const [table, column, ddl] of [
+  ['review_batch_opinions', 'correction_receipt_no', "TEXT NOT NULL DEFAULT ''"],
+]) {
+  if (columnInfo(table).length > 0 && !columnInfo(table).some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl};`);
+  }
+}
+
+// correction_objections：普通复核异议与多方批次意见共用的更正来源关联。
+// 全新库直接建（objection_id/batch_opinion_id 均可空）；旧库为 NOT NULL 三列结构，
+// 需要数据搬迁后重建以容纳批次意见（无外键约束，删除重建安全）。
+{
+  const columns = columnInfo('correction_objections');
+  if (columns.length === 0) {
+    db.exec(`
+      CREATE TABLE correction_objections (
+        workflow_id TEXT NOT NULL,
+        objection_id TEXT,
+        batch_opinion_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX idx_correction_objections_obj
+        ON correction_objections(workflow_id, objection_id) WHERE objection_id IS NOT NULL;
+      CREATE UNIQUE INDEX idx_correction_objections_batch
+        ON correction_objections(workflow_id, batch_opinion_id) WHERE batch_opinion_id IS NOT NULL;
+    `);
+  } else if (!columns.some((c) => c.name === 'batch_opinion_id')) {
+    db.exec(`
+      ALTER TABLE correction_objections ADD COLUMN batch_opinion_id TEXT;
+    `);
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_objections_obj
+      ON correction_objections(workflow_id, objection_id) WHERE objection_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_objections_batch
+      ON correction_objections(workflow_id, batch_opinion_id) WHERE batch_opinion_id IS NOT NULL;
+  `);
+}
 
 // 同一份回执至多一条进行中的更正（与上一索引叠加，兜底并发与异常路径）
 db.exec(`
@@ -391,7 +546,7 @@ export function createCorrectionWorkflow({ userId, sourceReceiptNo }) {
 
 // 事务内调用：为指定回执创建 sequence+1 的更正办理，草稿用原回执预填。
 // 调用方负责完成归属校验、进行中办理冲突等前置检查。
-function insertCorrectionWorkflowTx(source) {
+export function insertCorrectionWorkflowTx(source) {
   const ts = now();
   const maxSeq = db.prepare('SELECT COALESCE(MAX(sequence), 0) AS max_seq FROM workflows WHERE user_id = ?')
     .get(source.user_id).max_seq;
@@ -411,6 +566,8 @@ function insertCorrectionWorkflowTx(source) {
   addEvent(id, 'workflow.created', null, { sequence: maxSeq + 1, correctionOf: source.receipt_no });
   return db.prepare('SELECT * FROM workflows WHERE id = ?').get(id);
 }
+// 注入给多方复核批次模块在其事务内复用（打破 ESM 循环依赖的初始化时序）
+bindCorrectionFactory(insertCorrectionWorkflowTx);
 
 // 放弃进行中的更正：只删除更正产生的新办理记录及其草稿/令牌/提交，
 // 原回执（冻结快照、状态、核验码）与原办理记录完全不受影响。
@@ -447,6 +604,12 @@ export function abandonCorrectionWorkflow({ userId }) {
       for (const item of linked) {
         addReviewEvent(workflow.user_id, sourceReceiptNo, 'review.objection.reopened', { objectionId: item.id });
       }
+    }
+    // 多方复核批次：因接受字段而进入的更正被放弃，相关字段决议回收为待决议
+    const reopenedBatchFieldIds = reopenBatchDecisionsForWorkflow(workflow.id);
+    db.prepare('DELETE FROM correction_objections WHERE workflow_id = ?').run(workflow.id);
+    if (reopenedBatchFieldIds.length > 0) {
+      addReviewEvent(workflow.user_id, sourceReceiptNo, 'review.batch.fields.reopened', { batchFieldIds: reopenedBatchFieldIds });
     }
     // 显式清理子表（同时有外键级联兜底）
     db.prepare('DELETE FROM submissions WHERE workflow_id = ?').run(workflow.id);
@@ -636,6 +799,8 @@ export function confirmStep({ workflowId, userId, sessionId, pageId, step, token
           objectionIds: linkedObjections.map((item) => item.id),
         });
       }
+      // 多方复核批次：接受字段进入的更正完成后，回填新回执编号与来源关系
+      attachCorrectionReceiptForBatch({ workflowId, receiptNo: receipt.receiptNo });
     }
     addEvent(workflowId, isFinal ? 'workflow.completed' : 'step.confirmed', step, { submissionId });
 
@@ -1369,11 +1534,26 @@ export function getTimelineForUser(userId) {
     objectionsByReceipt.get(item.receipt_no).push(item);
   }
   const withReviews = [];
+  const batchEntriesByReceipt = new Map();
+  for (const batchEntry of buildBatchTimelineEntries(userId)) {
+    if (!batchEntriesByReceipt.has(batchEntry.receiptNo)) batchEntriesByReceipt.set(batchEntry.receiptNo, []);
+    batchEntriesByReceipt.get(batchEntry.receiptNo).push(batchEntry);
+  }
   for (const entry of entries) {
     withReviews.push(entry);
     if (entry.kind !== 'receipt') continue;
     const invs = invitations.filter((inv) => inv.receipt_no === entry.receiptNo);
-    for (const inv of invs) {
+    const reviewLike = invs.map((inv) => ({ type: 'review', at: inv.created_at, inv }));
+    for (const batchEntry of batchEntriesByReceipt.get(entry.receiptNo) || []) {
+      reviewLike.push({ type: 'reviewBatch', at: batchEntry.createdAt, batch: batchEntry });
+    }
+    reviewLike.sort((a, b) => a.at - b.at);
+    for (const item of reviewLike) {
+      if (item.type === 'reviewBatch') {
+        withReviews.push({ sequence: entry.sequence, ...item.batch });
+        continue;
+      }
+      const inv = item.inv;
       const invStatus = inv.status === 'active' && inv.expires_at <= now() ? 'expired' : inv.status;
       const objs = (objectionsByReceipt.get(inv.receipt_no) || []).filter((o) => o.invitation_id === inv.id);
       withReviews.push({
@@ -1445,5 +1625,22 @@ export function getStateForUser(userId) {
     invitations: listInvitationsForOwner(userId),
     objections: listObjectionsForOwner(userId),
   };
+  envelope.reviewBatches = listBatchesForOwner(userId);
   return envelope;
 }
+
+// 多方复核批次：统一从 db.js 重导出，路由层只依赖 db.js 一个模块
+export {
+  createReviewBatch,
+  listBatchesForOwner,
+  getBatchForOwner,
+  startReviewBatch,
+  cancelReviewBatch,
+  revokeBatchInvitation,
+  consumeBatchInvitation,
+  getValidBatchSession,
+  deleteBatchSession,
+  getBatchReviewerContext,
+  submitBatchOpinion,
+  decideBatchField,
+} from './batchStore.js';

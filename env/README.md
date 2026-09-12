@@ -41,6 +41,7 @@ docker compose up -d --build
 - 提交幂等记录和审计事件
 - **全部电子回执（固定快照、状态、撤销留档）**
 - **复核邀请、免登录复核会话、字段异议与处理结果、异议→更正→新回执来源关系**
+- **多方复核批次：批次状态、2-5 个限时一次性邀请、逐邀请字段授权、逐字段阈值、合并字段意见、逐字段决议与“接受意见→同一份更正→新回执”来源关系**
 - **回执核验码密钥 `receipt-secret.key`（核验能力依赖它，务必随数据卷备份）**
 
 默认监听 3000。若由反向代理终止 HTTPS，请设置：
@@ -202,6 +203,58 @@ COOKIE_SECURE: "1"
 - 办理人界面：回执卡片下方“回执复核协作”面板可创建邀请、复制/撤销链接、逐条接受/驳回；时间线条目内也可直接处理。复核人界面：`GET /review` 展示脱敏字段（每个字段可一键发起异议）、异议提交表单与本人异议的处理结果。
 
 
+## 多方复核批次（可配置的多方复核与决议编排）
+
+办理人可在**已签发回执**上创建一个多方复核批次：同一份回执配 2～5 个**限时、一次性**邀请，每个邀请有独立的**可查看字段范围**，批次对每个纳入编排的字段配置**接受阈值 / 驳回阈值**。批次只有在全部邀请完成一次性校验后才能进入复核；复核人只能针对**本邀请被授权的字段**提交意见；同一字段的多份意见**合并展示但逐字保留每位复核人的原始说明**；办理人逐字段作出接受或驳回决议时**必须满足对应阈值**；被接受字段的全部意见进入**同一份**新的更正办理并关联全部意见。
+
+### 1. 批次配置与状态
+
+- `POST /api/review-batches`（登录态，仅回执本人）：
+  - `invitations`：2～5 个，每个含 `label` 与 `fields`（本邀请可查看/可评价的字段 key 列表，如 `0.phone`）；
+  - `fields`：纳入编排的字段与阈值，每个字段 `acceptThreshold` / `rejectThreshold` 均为 1～邀请数之间的整数；
+  - 邀请的字段授权必须是批次编排字段的**子集**，且每个编排字段至少被一个邀请授权（否则 `INVALID_BATCH_FIELD` / `INVALID_BATCH_FIELD_SCOPE`）；
+  - 同一回执至多一个未终结批次（并发创建只有一个成功：`409 BATCH_ALREADY_OPEN`）。
+- 批次状态机：`collecting → in_review → completed`，另有终态 `cancelled`：
+  - **门控**：最后一个邀请校验成功时自动进入复核；办理人也可显式 `POST …/{batchId}/start`，未全部校验时明确失败（`BATCH_GATE_NOT_SATISFIED`，响应给出未校验邀请）；有邀请被撤销/过期时门控不可恢复（`BATCH_GATE_INVITATION_INVALID`），只能取消批次重建；
+  - 全部字段都有终局决议后批次自动 `completed`；批次在进入复核前、或复核中但**尚无任何决议**时可取消（`POST …/{batchId}/cancel`，可带理由）；已有字段决议后取消明确失败（`BATCH_HAS_DECISIONS`）。
+- 批次邀请链接形如 `/batch-review?t=…`，完整令牌同样只在创建当次返回（每个邀请一条一次性链接）。
+
+### 2. 限时一次性邀请与字段授权
+
+- 邀请 256 位随机令牌、数据库只存 SHA-256 哈希；`POST /api/batch-review/validate` 在 `BEGIN IMMEDIATE` 事务内把邀请置为 `used` 并建立独立的免登录批次会话（Cookie `bid` + CSRF `bcsrf`，有效期不超过邀请有效期）。
+
+| 情况 | HTTP | 错误码 |
+| --- | --- | --- |
+| 令牌不存在/格式错误 | 404/400 | `BATCH_INVITATION_NOT_FOUND` / `INVALID_INVITATION` |
+| 邀请已过期 / 批次已取消 | 410 | `BATCH_INVITATION_EXPIRED` / `BATCH_INVITATION_REVOKED` |
+| 邀请被办理人撤销 | 410 | `BATCH_INVITATION_REVOKED` |
+| 链接已被使用过（重复校验） | 410 | `BATCH_INVITATION_ALREADY_USED` |
+| 回执已撤销 | 410 | `RECEIPT_REVOKED` |
+| 校验尝试过频 | 429 | `TOO_MANY_REQUESTS` |
+
+- 办理人可在邀请使用前撤销单个邀请（`POST /api/review-batches/invitations/{id}/revoke`）；已使用不能撤销（`INVITATION_ALREADY_USED`）。
+- **复核页面与接口只返回本邀请被授权的字段**：`GET /api/batch-review/context` 的脱敏视图按字段授权过滤，未授权字段整列不出现；敏感字段（证件号码、详细地址）即使被授权也只下发遮罩值。携带其他回执编号提交得 `403 BATCH_RECEIPT_MISMATCH`。
+- **越权字段提交明确失败**：对未授权字段提交意见返回 `403 BATCH_FIELD_NOT_AUTHORIZED`；每个邀请对每个授权字段至多提交一份意见（重复得 `409 BATCH_FIELD_DUPLICATE_OPINION`，UNIQUE 约束兜底并发）。
+- 提交意见支持幂等键（同键同指纹回放同一条，换指纹得 `OBJECTION_DUPLICATE_KEY`）。
+
+### 3. 逐字段决议编排（阈值门控 + 并发安全 + 同一份更正）
+
+- 办理人侧 `POST /api/review-batches/{batchId}/fields/{fieldId}/accept|reject`：
+  - 批次必须处于 `in_review`（否则 `BATCH_GATE_NOT_SATISFIED`）；字段必须属于本批次；
+  - **接受**：对该字段提出意见的**不同复核人数**必须达到 `acceptThreshold`（否则 `ACCEPT_THRESHOLD_NOT_MET`）；
+  - **驳回**：已完成校验且未撤销的复核人中，**未对该字段提出意见的人数**必须达到 `rejectThreshold`（否则 `REJECT_THRESHOLD_NOT_MET`），且驳回理由 2～200 字持久化保存（`REJECT_REASON_REQUIRED`）；
+  - **同一份更正**：接受在事务内复用进行中的同源更正或当场新建一条 `source_receipt_no` 指向该回执的更正办理，并把该字段的**全部意见**写入关联表；再接受其他字段复用同一份更正，不新建第二条；
+  - 已有进行中的**其他**办理时接受失败（`OPEN_WORKFLOW_EXISTS`）；
+  - **重复决议与两个页面并发决议**：终局更新以 `WHERE … AND decision IS NULL` 为唯一判定，重复或并发的第二个请求得到 `409 BATCH_FIELD_ALREADY_DECIDED` 与**同一条已存在的决议**（含理由、处理人、时间）。
+- 被接受意见随更正完成签发时，新回执编号回填到字段与每条意见；放弃进行中的更正会把已接受字段的决议**回收为待决议**（批次从 completed 回到 in_review，可重新作出决议）。
+- **原回执始终冻结**：批次、意见、决议、更正全部走新办理记录，不写 `receipts.snapshot_json`。
+
+### 4. 合并视图、时间线与持久化
+
+- 复核人侧字段合并视图（`GET /api/batch-review/context` 的 `merged`）：按字段聚合所有复核人意见，标注哪条是“我的意见”，附该字段的接受/驳回阈值、当前意见数、办理人决议、驳回理由与后续更正回执编号。
+- 办理人侧时间线在对应回执之后插入 `kind: 'reviewBatch'` 条目：批次事件（创建/进入复核/完成/取消/邀请校验与撤销）、每个邀请的状态与字段授权、逐字段阈值与逐字段决议（处理人、理由、时间）、合并后的全部意见（每位复核人的原始说明），以及“接受意见 → 更正办理 → 新回执”的来源关系。
+- 全部状态（批次、邀请、字段授权、意见、阈值、处理人、决议、意见→更正关联）都在 SQLite 中，刷新、重新登录或服务重启后保留；批次复核会话同样持久化。
+
 ## 关键安全语义（原流程）
 
 ### 服务端以当前进度为准
@@ -256,10 +309,24 @@ COOKIE_SECURE: "1"
 | GET | `/api/review/context` | 否 | 当前复核会话绑定回执的脱敏内容与本人异议 |
 | POST | `/api/review/objections` | 否 | 复核人提交字段异议（需复核会话 + CSRF，幂等） |
 | POST | `/api/review/logout` | 否 | 退出并清除本机会话 |
+| POST | `/api/review-batches` | 是 | 创建多方复核批次（2-5 邀请、字段授权与阈值，返回一次性链接） |
+| GET | `/api/review-batches` | 是 | 多方复核批次清单（可按 `receiptNo` 过滤） |
+| GET | `/api/review-batches/field-options` | 是 | 可纳入批次编排的全部字段与邀请数上限 |
+| GET | `/api/review-batches/{id}` | 是 | 批次详情（邀请、字段授权、合并意见、决议） |
+| POST | `/api/review-batches/{id}/start` | 是 | 全部邀请校验完成后进入复核 |
+| POST | `/api/review-batches/{id}/cancel` | 是 | 取消批次（进入复核后且已有决议则失败） |
+| POST | `/api/review-batches/invitations/{id}/revoke` | 是 | 撤销未使用的批次邀请 |
+| POST | `/api/review-batches/{id}/fields/{fieldId}/accept` | 是 | 接受字段全部意见（必须达到接受阈值，进入同一份更正） |
+| POST | `/api/review-batches/{id}/fields/{fieldId}/reject` | 是 | 驳回字段意见（必须满足驳回阈值，理由必填） |
+| POST | `/api/batch-review/validate` | 否 | 批次邀请一次性校验，成功后建立批次复核会话 |
+| GET | `/api/batch-review/context` | 否 | 仅本邀请授权字段的脱敏视图、合并意见与本人意见 |
+| POST | `/api/batch-review/opinions` | 否 | 复核人提交字段意见（需批次会话 + CSRF，幂等） |
+| POST | `/api/batch-review/logout` | 否 | 退出并清除本机批次会话 |
 | POST | `/api/verify` | 否 | 编号+核验码核验，仅返回脱敏结果，按 IP 限流 |
 | GET | `/api/public/receipts/{no}/print?code=` | 否 | 脱敏可打印回执文档 |
 | GET | `/verify` | 否 | 免登录核验页面 |
 | GET | `/review` | 否 | 免登录复核页面（先完成邀请校验） |
+| GET | `/batch-review` | 否 | 免登录多方批次复核页面（先完成批次邀请校验） |
 
 所有非 GET 的登录态接口要求 `X-CSRF-Token`。会话 Cookie 为 `HttpOnly; SameSite=Lax`，HTTPS 环境可启用 `Secure`。
 
@@ -272,6 +339,12 @@ COOKIE_SECURE: "1"
 - `review_sessions`：免登录复核会话（只存令牌哈希、绑定邀请与单份回执、独立 CSRF、有效期）
 - `review_objections`：字段级异议（字段、脱敏值快照、说明、`open/accepted/rejected`、提交/处理时间、处理人、驳回理由、关联更正办理与新回执编号、咨询锁、幂等键）
 - `correction_objections`：已接受异议与因此进入的更正办理的多对多来源关系
+- `review_batches`：多方复核批次（状态 `collecting/in_review/completed/cancelled`、有效期、取消原因，部分唯一索引保证同一回执至多一个未终结批次）
+- `review_batch_fields`：批次逐字段编排（接受/驳回阈值，冻结不变）与逐字段决议（接受/驳回、理由、处理人、时间、关联更正办理与新回执编号）
+- `review_batch_invitations` / `review_batch_invitation_fields`：批次的 2-5 个限时一次性邀请（令牌只存哈希）与逐邀请字段授权
+- `review_batch_sessions`：批次邀请校验后的免登录会话（只存令牌哈希、独立 CSRF、绑定单个邀请与字段授权）
+- `review_batch_opinions`：字段意见（每邀请每字段唯一，逐字保留原始说明、脱敏值快照、幂等键）；同一字段的多份意见在查询时合并
+- `correction_opinions`：批次字段意见/普通异议与更正办理的统一来源关联（完成更正时据此回填新回执编号、放弃更正时据此回收决议）
 - `tokens`：令牌哈希、绑定维度、过期、使用、撤销状态
 - `submissions`：幂等键、请求指纹、提交和确认结果
 - `events`：创建、草稿、确认、退回、签发回执、撤销、更正创建、复核邀请/异议/处理等审计事件

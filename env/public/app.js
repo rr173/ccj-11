@@ -41,7 +41,7 @@ const els = {
   userBox: $('#userBox'), userName: $('#userName'), logoutBtn: $('#logoutBtn'), stepList: $('#stepList'),
   stateVersion: $('#stateVersion'), currentStepLabel: $('#currentStepLabel'), globalAlert: $('#globalAlert'),
   stepForm: $('#stepForm'), receiptPanel: $('#receiptPanel'), correctionPanel: $('#correctionPanel'),
-  reviewPanel: $('#reviewPanel'),
+  reviewPanel: $('#reviewPanel'), batchPanel: $('#batchPanel'),
   recordsPanel: $('#recordsPanel'), recordsList: $('#recordsList'),
 };
 
@@ -54,6 +54,9 @@ const state = {
   timeline: [],
   correction: null,
   reviews: { invitations: [], objections: [] },
+  reviewBatches: [],
+  batchFieldOptions: [],
+  batchMaxInvitations: 5,
   user: null,
   pageId: getPageId(),
   token: null,
@@ -100,6 +103,7 @@ function applyState(result) {
   state.timeline = Array.isArray(result.timeline) ? result.timeline : [];
   state.correction = result.correction || null;
   state.reviews = result.reviews || { invitations: [], objections: [] };
+  state.reviewBatches = Array.isArray(result.reviewBatches) ? result.reviewBatches : [];
 }
 
 async function login(event) {
@@ -128,6 +132,7 @@ async function logout() {
     state.timeline = [];
     state.correction = null;
     state.reviews = { invitations: [], objections: [] };
+    state.reviewBatches = [];
     showLogin();
   }
 }
@@ -157,11 +162,13 @@ function render() {
   if (state.workflow.completed) {
     renderReceipt(state.receipt || state.viewingReceipt || null);
     renderReviewPanel();
+    renderBatchPanel();
     return;
   }
   if (state.viewingReceipt) {
     renderReceipt(state.viewingReceipt);
     renderReviewPanel();
+    renderBatchPanel();
     return;
   }
   state.viewingReceipt = null;
@@ -169,6 +176,8 @@ function render() {
   els.receiptPanel.innerHTML = '';
   els.reviewPanel.classList.add('hidden');
   els.reviewPanel.innerHTML = '';
+  els.batchPanel.classList.add('hidden');
+  els.batchPanel.innerHTML = '';
   renderCurrentStep();
 }
 
@@ -231,6 +240,12 @@ function renderTimeline() {
       reviewBtn.textContent = '发起复核邀请';
       reviewBtn.addEventListener('click', () => createReviewInvitation(entry.receiptNo));
       actions.append(reviewBtn);
+      const batchBtn = document.createElement('button');
+      batchBtn.type = 'button';
+      batchBtn.className = 'link-button muted-link';
+      batchBtn.textContent = '创建多方复核批次';
+      batchBtn.addEventListener('click', () => openBatchBuilder(entry.receiptNo));
+      actions.append(batchBtn);
     } else if (entry.kind === 'review') {
       li.className = 'record-item review-item';
       const statusMap = {
@@ -299,6 +314,105 @@ function renderTimeline() {
         revokeBtn.textContent = '撤销邀请（立即失效）';
         revokeBtn.addEventListener('click', () => revokeInvitation(entry.invitationId));
         actions.append(revokeBtn);
+      }
+    } else if (entry.kind === 'reviewBatch') {
+      li.className = 'record-item batch-item';
+      const statusMap = {
+        collecting: ['邀请校验中', 'current'],
+        in_review: ['复核中', 'confirmed'],
+        completed: ['已完成决议', 'confirmed'],
+        cancelled: ['已取消', 'invalidated'],
+      };
+      const [statusText, statusCls] = statusMap[entry.status] || [entry.status, 'current'];
+      const fieldHtml = (entry.fields || []).map((field) => {
+        const badge = field.decision === 'accepted'
+          ? '<span class="badge confirmed">已接受</span>'
+          : field.decision === 'rejected'
+            ? '<span class="badge invalidated">已驳回</span>'
+            : '<span class="badge current">待决议</span>';
+        const opinionHtml = (field.opinions || []).map((o) => `
+          <li class="batch-opinion">
+            <div class="record-main"><b>${escapeHtml(o.reviewerLabel)}</b><span class="muted small">${formatTime(o.submittedAt)}</span></div>
+            <div class="small">${escapeHtml(o.reason)}</div>
+          </li>`).join('');
+        const corr = field.correctionReceiptNo
+          ? `<div class="small review-obj-result">→ 更正回执 <span class="mono">${escapeHtml(field.correctionReceiptNo)}</span></div>`
+          : field.decision === 'rejected'
+            ? `<div class="small review-obj-result">驳回理由：${escapeHtml(field.decisionReason || '—')}</div>`
+            : '';
+        return `
+          <div class="batch-field ${field.decision || 'pending'}">
+            <div class="record-main">
+              <span>${escapeHtml(field.label)} <span class="muted small">（接受阈值 ${field.acceptThreshold} / 驳回阈值 ${field.rejectThreshold}，${field.opinionCount} 份意见）</span></span>
+              ${badge}
+            </div>
+            <ul class="batch-opinion-list">${opinionHtml || '<li class="muted small">暂无意见</li>'}</ul>
+            ${corr}
+            <div class="record-actions" data-bf-actions data-bf-batch="${escapeHtml(entry.batchId)}" data-bf-field="${escapeHtml(field.id)}"></div>
+          </div>`;
+      }).join('');
+      const inviteHtml = (entry.invitations || []).map((inv) => {
+        const invStatus = {
+          active: '待使用', used: '已校验', revoked: '已撤销', expired: '已过期',
+        }[inv.status] || inv.status;
+        return `<li class="muted small">${escapeHtml(inv.label)}：${invStatus} · 授权 ${inv.fieldKeys.length} 个字段${inv.usedAt ? ` · 校验于 ${formatTime(inv.usedAt)}` : ''}</li>`;
+      }).join('');
+      li.innerHTML = `
+        <div class="record-main">
+          <span>多方复核批次</span>
+          <span class="badge ${statusCls}">${statusText}</span>
+        </div>
+        <div class="muted small">
+          创建于 ${formatTime(entry.createdAt)} · 有效期至 ${formatTime(entry.expiresAt)}
+          · 邀请 ${entry.validatedCount}/${entry.invitationCount} 已完成校验
+          ${entry.cancelledAt ? `· 取消于 ${formatTime(entry.cancelledAt)}` : ''}
+          ${entry.completedAt ? `· 完成于 ${formatTime(entry.completedAt)}` : ''}
+        </div>
+        <div class="muted small">针对回执 <span class="mono">${escapeHtml(entry.receiptNo)}</span>${entry.note ? ` · 备注：${escapeHtml(entry.note)}` : ''}</div>
+        <ul class="batch-invite-list">${inviteHtml}</ul>
+        <div class="batch-fields">${fieldHtml}</div>
+        <div class="record-actions" data-batch-actions="${escapeHtml(entry.batchId)}"></div>
+      `;
+      (entry.fields || []).forEach((field) => {
+        if (entry.status !== 'in_review' || field.decision) return;
+        const box = li.querySelector(`[data-bf-field="${cssEscape(field.id)}"]`);
+        if (!box) return;
+        const acceptBtn = document.createElement('button');
+        acceptBtn.type = 'button';
+        acceptBtn.className = 'link-button';
+        acceptBtn.textContent = `接受全部意见（阈值 ${field.acceptThreshold}）`;
+        acceptBtn.addEventListener('click', () => acceptBatchField(entry.batchId, field.id));
+        box.append(acceptBtn);
+        const rejectBtn = document.createElement('button');
+        rejectBtn.type = 'button';
+        rejectBtn.className = 'link-button muted-link';
+        rejectBtn.textContent = `驳回（阈值 ${field.rejectThreshold}，需理由）`;
+        rejectBtn.addEventListener('click', () => rejectBatchField(entry.batchId, field.id));
+        box.append(rejectBtn);
+      });
+      const batchActions = li.querySelector(`[data-batch-actions="${cssEscape(entry.batchId)}"]`);
+      if (entry.status === 'collecting') {
+        const startBtn = document.createElement('button');
+        startBtn.type = 'button';
+        startBtn.className = 'link-button';
+        startBtn.textContent = '全部已校验，进入复核';
+        startBtn.addEventListener('click', () => startBatch(entry.batchId));
+        batchActions.append(startBtn);
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'link-button danger-link';
+        cancelBtn.textContent = '取消批次';
+        cancelBtn.addEventListener('click', () => cancelBatch(entry.batchId));
+        batchActions.append(cancelBtn);
+        (entry.invitations || []).forEach((inv) => {
+          if (inv.status !== 'active') return;
+          const revokeBtn = document.createElement('button');
+          revokeBtn.type = 'button';
+          revokeBtn.className = 'link-button danger-link';
+          revokeBtn.textContent = `撤销邀请「${inv.label}」`;
+          revokeBtn.addEventListener('click', () => revokeBatchInvitation(inv.id));
+          batchActions.append(revokeBtn);
+        });
       }
     } else {
       const isCorrection = entry.kind === 'correction';
@@ -675,8 +789,8 @@ function renderReceipt(receipt = state.receipt) {
       <button class="button secondary" type="button" data-action="copy-no">复制回执编号</button>
       <button class="button secondary" type="button" data-action="copy-code">复制核验码</button>
       <button class="button secondary" type="button" data-action="correct">基于本回执发起更正（生成新办理记录）</button>
-      ${revoked ? '' : '<button class="button danger" type="button" data-action="revoke">撤销本回执</button>'}
-    </div>
+      ${revoked ? '' : '<button class="button secondary" type="button" data-action="batch">创建多方复核批次</button>'}
+      ${revoked ? '' : '<button class="button danger" type="button" data-action="revoke">撤销本回执</button>'}    </div>
     <p class="muted small">
       回执内容在签发时已固定保存，包含各步已确认信息、各步确认时间和最终完成时间；
       刷新页面、重新登录或服务重启后看到的都是同一份回执。已完成的回执不能退回修改或被覆盖。
@@ -688,6 +802,7 @@ function renderReceipt(receipt = state.receipt) {
   els.receiptPanel.querySelector('[data-action="copy-no"]').addEventListener('click', () => copyText(receipt.receiptNo, '回执编号已复制'));
   els.receiptPanel.querySelector('[data-action="copy-code"]').addEventListener('click', () => copyText(receipt.code, '核验码已复制'));
   els.receiptPanel.querySelector('[data-action="correct"]').addEventListener('click', () => startCorrection(receipt.receiptNo));
+  els.receiptPanel.querySelector('[data-action="batch"]')?.addEventListener('click', () => openBatchBuilder(receipt.receiptNo));
   if (!revoked) {
     els.receiptPanel.querySelector('[data-action="revoke"]').addEventListener('click', () => revokeCurrentReceipt(receipt));
   }
@@ -1150,6 +1265,411 @@ function randomId() {
 function readCookie(name) {
   return document.cookie.split('; ').reduce((value, part) => part.startsWith(`${name}=`) ? decodeURIComponent(part.slice(name.length + 1)) : value, '');
 }
+
+// ---------------------------------------------------------------------------
+// 多方复核批次（办理人侧）
+// ---------------------------------------------------------------------------
+
+async function ensureBatchFieldOptions() {
+  if (state.batchFieldOptions.length) return;
+  try {
+    const result = await api('GET', '/api/review-batches/field-options');
+    state.batchFieldOptions = result.fields || [];
+    state.batchMaxInvitations = result.maxInvitations || 5;
+  } catch {
+    state.batchFieldOptions = [];
+  }
+}
+
+function currentBatchReceiptNo() {
+  return state.receipt?.receiptNo || state.viewingReceipt?.receiptNo;
+}
+
+function renderBatchPanel() {
+  const panel = els.batchPanel;
+  if (!panel) return;
+  const receiptNo = currentBatchReceiptNo();
+  if (!receiptNo) {
+    panel.classList.add('hidden');
+    panel.innerHTML = '';
+    return;
+  }
+  panel.classList.remove('hidden');
+  const batches = (state.reviewBatches || []).filter((batch) => batch.receiptNo === receiptNo);
+  panel.innerHTML = `
+    <div class="receipt-head">
+      <h2>多方复核批次</h2>
+      <button class="button secondary" type="button" data-action="new-batch">创建复核批次（2-5 方）</button>
+    </div>
+    <p class="muted small">
+      为同一份回执创建包含 2-5 个限时、一次性邀请的复核批次，逐字段配置接受/驳回阈值；
+      全部邀请完成校验后批次才进入复核，复核人只能查看并评价各自被授权的脱敏字段。
+    </p>
+    <div data-batch-builder></div>
+    <div class="batch-list"></div>
+  `;
+  panel.querySelector('[data-action="new-batch"]').addEventListener('click', () => openBatchBuilder(receiptNo));
+  const list = panel.querySelector('.batch-list');
+  if (!batches.length) {
+    list.innerHTML = '<p class="muted small">尚无复核批次。</p>';
+    return;
+  }
+  batches.forEach((batch) => list.append(renderBatchCard(batch)));
+}
+
+function renderBatchCard(batch) {
+  const card = document.createElement('div');
+  card.className = `objection-item batch-card ${batch.status}`;
+  const statusText = {
+    collecting: '邀请校验中', in_review: '复核中', completed: '已完成决议', cancelled: '已取消',
+  }[batch.status] || batch.status;
+  const statusCls = {
+    collecting: 'current', in_review: 'confirmed', completed: 'confirmed', cancelled: 'invalidated',
+  }[batch.status] || 'current';
+  const invites = batch.invitations.map((inv) => {
+    const invStatus = { active: '待使用', used: '已校验', revoked: '已撤销', expired: '已过期' }[inv.status] || inv.status;
+    const linkBtn = inv.status === 'active'
+      ? `<button class="link-button" type="button" data-copy="${escapeHtml(inv.id)}">复制链接</button>
+         <button class="link-button danger-link" type="button" data-revoke-invite="${escapeHtml(inv.id)}">撤销</button>`
+      : '';
+    return `<li class="muted small">
+      <b>${escapeHtml(inv.label)}</b> · ${invStatus} · 授权字段：${inv.fields.map((f) => escapeHtml(f.label)).join('、')}
+      <span class="record-actions">${linkBtn}</span>
+    </li>`;
+  }).join('');
+  const fields = batch.fields.map((field) => {
+    const opinions = field.opinions.map((o) => `
+      <li class="batch-opinion">
+        <div class="record-main"><b>${escapeHtml(o.reviewerLabel)}</b><span class="muted small">${formatTime(o.submittedAt)}</span></div>
+        <div class="small">${escapeHtml(o.reason)}</div>
+      </li>`).join('');
+    const badge = field.decision === 'accepted'
+      ? '<span class="badge confirmed">已接受</span>'
+      : field.decision === 'rejected'
+        ? '<span class="badge invalidated">已驳回</span>'
+        : '<span class="badge current">待决议</span>';
+    const corr = field.correctionReceiptNo
+      ? ` → <span class="mono">${escapeHtml(field.correctionReceiptNo)}</span>`
+      : field.decision === 'rejected'
+        ? `<div class="small">驳回理由：${escapeHtml(field.decisionReason || '—')}</div>`
+        : '';
+    const actions = (!field.decision && batch.status === 'in_review')
+      ? `<span class="record-actions">
+           <button class="link-button" type="button" data-accept="${escapeHtml(field.id)}">接受（阈值 ${field.acceptThreshold}）</button>
+           <button class="link-button muted-link" type="button" data-reject="${escapeHtml(field.id)}">驳回（阈值 ${field.rejectThreshold}）</button>
+         </span>`
+      : '';
+    return `<li class="batch-field ${field.decision || 'pending'}">
+      <div class="record-main">
+        <b>${escapeHtml(field.label)}</b>
+        <span class="muted small">接受≥${field.acceptThreshold} / 驳回≥${field.rejectThreshold} · ${field.opinionCount} 份意见</span>
+        ${badge}
+      </div>
+      <ul class="batch-opinion-list">${opinions || '<li class="muted small">暂无意见</li>'}</ul>
+      ${corr}${actions}
+    </li>`;
+  }).join('');
+  card.innerHTML = `
+    <div class="record-main">
+      <span>批次 <span class="mono small">${escapeHtml(batch.id.slice(0, 12))}…</span></span>
+      <span class="badge ${statusCls}">${statusText} · ${batch.validatedCount}/${batch.invitationCount}</span>
+    </div>
+    <div class="muted small">有效期至 ${formatTime(batch.expiresAt)}${batch.note ? ` · 备注：${escapeHtml(batch.note)}` : ''}</div>
+    <ul class="batch-invite-list">${invites}</ul>
+    <ul class="batch-field-list">${fields}</ul>
+    <div class="record-actions">
+      ${batch.status === 'collecting' ? `
+        <button class="link-button" type="button" data-start>进入复核（需全部校验）</button>
+        <button class="link-button danger-link" type="button" data-cancel>取消批次</button>` : ''}
+    </div>
+  `;
+  card.querySelectorAll('[data-copy]').forEach((btn) => {
+    btn.addEventListener('click', () => copyBatchLink(batch, btn.dataset.copy));
+  });
+  card.querySelectorAll('[data-revoke-invite]').forEach((btn) => {
+    btn.addEventListener('click', () => revokeBatchInvitation(btn.dataset.revokeInvite));
+  });
+  card.querySelectorAll('[data-accept]').forEach((btn) => {
+    btn.addEventListener('click', () => acceptBatchField(batch.id, btn.dataset.accept));
+  });
+  card.querySelectorAll('[data-reject]').forEach((btn) => {
+    btn.addEventListener('click', () => rejectBatchField(batch.id, btn.dataset.reject));
+  });
+  card.querySelector('[data-start]')?.addEventListener('click', () => startBatch(batch.id));
+  card.querySelector('[data-cancel]')?.addEventListener('click', () => cancelBatch(batch.id));
+  return card;
+}
+
+async function openBatchBuilder(receiptNo) {
+  if (state.busy) return;
+  await ensureBatchFieldOptions();
+  const panel = els.batchPanel.querySelector('[data-batch-builder]');
+  if (!panel) return;
+  const fieldOptions = state.batchFieldOptions;
+  panel.innerHTML = `
+    <div class="batch-builder card-inner">
+      <h3>配置多方复核批次</h3>
+      <label>统一有效期（分钟，5-10080）
+        <input type="number" id="bbTtl" value="60" min="5" max="10080">
+      </label>
+      <label>批次备注（可选）
+        <input type="text" id="bbNote" maxlength="200" placeholder="例如：财务+人事联合复核">
+      </label>
+      <div class="bb-section">
+        <strong>① 选择纳入编排的字段与阈值</strong>
+        <p class="muted small">每个字段分别设置“接受阈值”（多少位复核人提出意见即可接受）与“驳回阈值”（多少位复核人未提出异议即可驳回），范围 1-邀请数。</p>
+        <div class="bb-fields"></div>
+      </div>
+      <div class="bb-section">
+        <strong>② 配置 2-5 个复核邀请</strong>
+        <div class="form-actions">
+          <button class="button secondary" type="button" data-add-invite>增加一个邀请</button>
+          <span class="muted small">每个邀请独立的一次性链接与字段授权。</span>
+        </div>
+        <div class="bb-invites"></div>
+      </div>
+      <div id="bbError" class="alert error hidden"></div>
+      <div class="form-actions">
+        <button class="button primary" type="button" data-create>创建批次并生成一次性链接</button>
+        <button class="button secondary" type="button" data-close>取消</button>
+      </div>
+    </div>`;
+
+  const fieldsBox = panel.querySelector('.bb-fields');
+  fieldOptions.forEach((option) => {
+    const label = document.createElement('label');
+    label.className = 'bb-field-row';
+    label.innerHTML = `
+      <span class="bb-field-name">
+        <input type="checkbox" data-key="${escapeHtml(option.step + '.' + option.field)}">
+        ${escapeHtml(option.label)} <span class="muted small">（${escapeHtml(option.step + 1 + ' 步 · ' + option.step + '.' + option.field)}）</span>
+      </span>
+      <span class="bb-thresholds">
+        接受≥<input type="number" min="1" max="5" value="1" data-accept="${escapeHtml(option.step + '.' + option.field)}" disabled>
+        驳回≥<input type="number" min="1" max="5" value="1" data-reject="${escapeHtml(option.step + '.' + option.field)}" disabled>
+      </span>`;
+    fieldsBox.append(label);
+  });
+  fieldsBox.addEventListener('change', () => {
+    fieldsBox.querySelectorAll('input[type=checkbox]').forEach((box) => {
+      const key = box.dataset.key;
+      fieldsBox.querySelector(`[data-accept="${CSS.escape(key)}"]`).disabled = !box.checked;
+      fieldsBox.querySelector(`[data-reject="${CSS.escape(key)}"]`).disabled = !box.checked;
+    });
+  });
+
+  const invitesBox = panel.querySelector('.bb-invites');
+  let inviteCount = 0;
+  function addInviteRow() {
+    if (inviteCount >= state.batchMaxInvitations) {
+      showAlert(`一个批次最多 ${state.batchMaxInvitations} 个邀请。`, 'warning');
+      return;
+    }
+    inviteCount += 1;
+    const div = document.createElement('div');
+    div.className = 'bb-invite';
+    div.innerHTML = `
+      <div class="record-main">
+        <b>复核人 ${inviteCount}</b>
+        <button class="link-button danger-link" type="button" data-remove>移除</button>
+      </div>
+      <input type="text" maxlength="60" placeholder="邀请名称（如：财务复核）" data-label>
+      <div class="bb-scope"></div>`;
+    const scope = div.querySelector('.bb-scope');
+    const renderScope = () => {
+      const selected = [...fieldsBox.querySelectorAll('input[type=checkbox]:checked')].map((b) => b.dataset.key);
+      scope.innerHTML = selected.length
+        ? selected.map((key) => {
+          const meta = fieldOptions.find((f) => (f.step + '.' + f.field) === key);
+          return `<label class="bb-scope-field"><input type="checkbox" data-scope-key="${escapeHtml(key)}" checked> ${escapeHtml(meta.label)}</label>`;
+        }).join('')
+        : '<span class="muted small">请先在上方勾选纳入编排的字段</span>';
+    };
+    fieldsBox.addEventListener('change', renderScope);
+    renderScope();
+    div.querySelector('[data-remove]').addEventListener('click', () => {
+      div.remove();
+      inviteCount -= 1;
+    });
+    invitesBox.append(div);
+  }
+  panel.querySelector('[data-add-invite]').addEventListener('click', addInviteRow);
+  addInviteRow();
+  addInviteRow();
+
+  panel.querySelector('[data-close]').addEventListener('click', () => { panel.innerHTML = ''; });
+  panel.querySelector('[data-create]').addEventListener('click', async () => {
+    const ttlMinutes = Number(panel.querySelector('#bbTtl').value);
+    const note = panel.querySelector('#bbNote').value;
+    const fields = [...fieldsBox.querySelectorAll('input[type=checkbox]:checked')].map((box) => {
+      const key = box.dataset.key;
+      return {
+        key,
+        acceptThreshold: Number(fieldsBox.querySelector(`[data-accept="${CSS.escape(key)}"]`).value),
+        rejectThreshold: Number(fieldsBox.querySelector(`[data-reject="${CSS.escape(key)}"]`).value),
+      };
+    });
+    const invitations = [...invitesBox.querySelectorAll('.bb-invite')].map((div) => ({
+      label: div.querySelector('[data-label]').value || '',
+      fields: [...div.querySelectorAll('[data-scope-key]:checked')].map((b) => b.dataset.scopeKey),
+    }));
+    try {
+      const result = await api('POST', '/api/review-batches', { receiptNo, ttlMinutes, note, fields, invitations });
+      state.reviewBatches = result.reviewBatches || state.reviewBatches;
+      state.timeline = result.timeline || state.timeline;
+      panel.innerHTML = '';
+      showBatchLinks(result);
+      showAlert('多方复核批次已创建。请把每个一次性链接分别发给对应复核人（链接只展示这一次）。', 'success');
+      render();
+    } catch (error) {
+      const err = panel.querySelector('#bbError');
+      err.textContent = error.message || '创建失败';
+      err.classList.remove('hidden');
+    }
+  });
+}
+
+function showBatchLinks(result) {
+  const list = result.links.map((link) => `
+    <li class="bb-link">
+      <div class="record-main"><b>${escapeHtml(link.label)}</b>
+        <button class="link-button" type="button" data-copy-link="${escapeHtml(link.invitationId)}">复制该复核人链接</button>
+      </div>
+      <code class="mono small selectable" data-link-url="${escapeHtml(link.invitationId)}">${escapeHtml(location.origin + link.url)}</code>
+    </li>`).join('');
+  showAlert(`批次已创建：${result.links.length} 个一次性链接如下，请逐个复制发送（离开后仅可在批次未使用前重新复制）：`, 'success');
+  const holder = document.createElement('div');
+  holder.className = 'card batch-links-dialog';
+  holder.innerHTML = `
+    <div class="receipt-head"><h3>批次一次性邀请链接（仅本次完整展示）</h3><button class="button secondary" type="button" data-close-links>知道了</button></div>
+    <ul class="batch-link-list">${list}</ul>`;
+  holder.querySelectorAll('[data-copy-link]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const link = result.links.find((l) => l.invitationId === btn.dataset.copyLink);
+      copyText(location.origin + link.url, '链接已复制');
+    });
+  });
+  holder.querySelector('[data-close-links]').addEventListener('click', () => holder.remove());
+  els.batchPanel.prepend(holder);
+}
+
+async function copyBatchLink(batch, invitationId) {
+  // 完整令牌只在创建当次返回；此处无令牌时无法重建链接，明确提示
+  showAlert('出于安全设计，完整邀请链接只在创建批次当次展示；如链接丢失，请撤销该邀请后重新创建批次。', 'warning');
+}
+
+// 单个复核邀请同样只在创建当次返回完整链接（数据库仅存哈希）
+async function copyReviewLink(invitationId) {
+  showAlert('出于安全设计，完整邀请链接只在创建当次展示；如链接丢失，请撤销该邀请后重新创建。', 'warning');
+}
+
+async function startBatch(batchId) {
+  if (state.busy) return;
+  try {
+    const result = await api('POST', `/api/review-batches/${encodeURIComponent(batchId)}/start`, {});
+    state.reviewBatches = result.reviewBatches || state.reviewBatches;
+    state.timeline = result.timeline || state.timeline;
+    showAlert('批次已进入复核，复核人可开始提交字段意见。', 'success');
+    render();
+  } catch (error) {
+    if (error.body?.batch) {
+      state.reviewBatches = state.reviewBatches.map((b) => (b.id === error.body.batch.id ? error.body.batch : b));
+      render();
+    }
+    showAlert(`进入复核失败：${error.message}`, 'error');
+  }
+}
+
+async function cancelBatch(batchId) {
+  const reason = window.prompt('取消后所有未使用邀请立即失效，已提交意见留档但批次终止。请输入取消原因（可留空）：', '');
+  if (reason === null || state.busy) return;
+  state.busy = true;
+  try {
+    const result = await api('POST', `/api/review-batches/${encodeURIComponent(batchId)}/cancel`, { reason });
+    state.reviewBatches = result.reviewBatches || state.reviewBatches;
+    state.timeline = result.timeline || state.timeline;
+    showAlert('批次已取消。', 'warning');
+    render();
+  } catch (error) {
+    showAlert(`取消失败：${error.message}`, 'error');
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function revokeBatchInvitation(invitationId) {
+  const ok = window.confirm('撤销后该邀请链接立即失效；若批次仍在校验阶段，需取消批次后重建才能补齐复核人。确定撤销吗？');
+  if (!ok || state.busy) return;
+  state.busy = true;
+  try {
+    const result = await api('POST', `/api/review-batches/invitations/${encodeURIComponent(invitationId)}/revoke`, {});
+    state.reviewBatches = result.reviewBatches || state.reviewBatches;
+    showAlert('邀请已撤销。', 'warning');
+    await boot();
+  } catch (error) {
+    showAlert(`撤销失败：${error.message}`, 'error');
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function acceptBatchField(batchId, fieldId) {
+  const ok = window.confirm(
+    '接受该字段的全部意见后，它们将进入同一份新的更正办理（复用进行中的同源更正）：\n\n'
+    + '· 接受意见数必须达到批次配置的接受阈值；\n'
+    + '· 原回执保持冻结，不会被覆盖；\n'
+    + '· 更正完成后生成新回执，时间线展示来源关系。',
+  );
+  if (!ok || state.busy) return;
+  state.busy = true;
+  try {
+    const result = await api('POST', `/api/review-batches/${encodeURIComponent(batchId)}/fields/${encodeURIComponent(fieldId)}/accept`, {});
+    state.reviewBatches = result.reviewBatches || state.reviewBatches;
+    state.timeline = result.timeline || state.timeline;
+    state.correction = result.correction || state.correction;
+    showAlert(result.createdCorrection
+      ? '已接受意见并创建新的更正办理记录（关联全部意见），可在更正预览中修改后逐步确认。'
+      : '已接受意见，已关联到当前进行中的同源更正办理。', 'success');
+    await boot();
+  } catch (error) {
+    if (error.body?.alreadyDecided && error.body?.field) {
+      showAlert('该字段已被另一个页面决议，重复决议被拒绝，已刷新为同一结果。', 'warning');
+    } else {
+      showAlert(`接受失败：${error.message}`, 'error');
+    }
+    await boot();
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function rejectBatchField(batchId, fieldId) {
+  const reason = window.prompt('请填写驳回理由（2-200 字）。驳回需要未提出异议的复核人数达到批次配置的驳回阈值。', '');
+  if (reason === null || state.busy) return;
+  const trimmed = String(reason).trim();
+  if (trimmed.length < 2 || trimmed.length > 200) {
+    showAlert('驳回理由需为 2-200 个字符。', 'error');
+    return;
+  }
+  state.busy = true;
+  try {
+    const result = await api('POST', `/api/review-batches/${encodeURIComponent(batchId)}/fields/${encodeURIComponent(fieldId)}/reject`, { reason: trimmed });
+    state.reviewBatches = result.reviewBatches || state.reviewBatches;
+    state.timeline = result.timeline || state.timeline;
+    showAlert(result.batchCompleted ? '该字段已驳回，全部字段决议完成，批次结束。' : '该字段已驳回，理由已保存。', 'warning');
+    await boot();
+  } catch (error) {
+    if (error.body?.alreadyDecided) {
+      showAlert('该字段已被另一个页面决议，重复决议被拒绝，已刷新为同一结果。', 'warning');
+    } else {
+      showAlert(`驳回失败：${error.message}`, 'error');
+    }
+    await boot();
+  } finally {
+    state.busy = false;
+  }
+}
+
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',

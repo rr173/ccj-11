@@ -10,6 +10,7 @@ import {
   createCorrectionWorkflow,
   createReviewInvitation,
   createSession,
+  deleteBatchSession,
   deleteReviewSession,
   deleteSession,
   findReceiptRowByNo,
@@ -39,6 +40,17 @@ import {
   snapshotOfReceiptRow,
   submitReviewObjection,
   userQueries,
+  createReviewBatch,
+  listBatchesForOwner,
+  getBatchForOwner,
+  startReviewBatch,
+  cancelReviewBatch,
+  revokeBatchInvitation,
+  consumeBatchInvitation,
+  getValidBatchSession,
+  getBatchReviewerContext,
+  submitBatchOpinion,
+  decideBatchField,
 } from './db.js';
 import { validateDraft, validateStepPayload } from './validation.js';
 import { stableStringify } from './crypto.js';
@@ -55,6 +67,7 @@ import {
   CODE_PATTERN,
 } from './receipts.js';
 import { INVITATION_ERRORS, isValidTtlMinutes } from './reviews.js';
+import { parseBatchCreateInput, BATCH_ERRORS, BATCH_SESSION_COOKIE, BATCH_CSRF_COOKIE, ALL_BATCH_FIELDS, BATCH_MAX_INVITATIONS } from './batchReviews.js';
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -70,6 +83,22 @@ const server = createServer(async (req, res) => {
     // 回执复核：免登录复核人页面与接口（一次性邀请校验后凭复核会话访问）
     if (url.pathname === '/review' && req.method === 'GET') {
       return serveStaticFile(req, res, '/review.html');
+    }
+    // 多方复核批次：免登录复核人页面与接口
+    if (url.pathname === '/batch-review' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/batch-review.html');
+    }
+    if (url.pathname === '/api/batch-review/validate' && req.method === 'POST') {
+      return batchReviewValidate(req, res);
+    }
+    if (url.pathname === '/api/batch-review/logout' && req.method === 'POST') {
+      return batchReviewLogout(req, res);
+    }
+    if (url.pathname === '/api/batch-review/context' && req.method === 'GET') {
+      return batchReviewContext(req, res);
+    }
+    if (url.pathname === '/api/batch-review/opinions' && req.method === 'POST') {
+      return batchReviewSubmit(req, res);
     }
     if (url.pathname === '/api/review/validate' && req.method === 'POST') {
       return reviewValidate(req, res);
@@ -205,6 +234,44 @@ async function handleApi(req, res, url) {
   const objectionRejectMatch = /^\/api\/reviews\/objections\/([^/]+)\/reject$/.exec(url.pathname);
   if (objectionRejectMatch && req.method === 'POST') {
     return resolveObjection(req, res, user, 'reject', objectionRejectMatch[1]);
+  }
+
+  // 多方复核批次（办理人）
+  if (url.pathname === '/api/review-batches' && req.method === 'POST') {
+    return createBatch(req, res, user);
+  }
+  if (url.pathname === '/api/review-batches' && req.method === 'GET') {
+    const receiptNo = url.searchParams.get('receiptNo') || '';
+    return sendJson(res, 200, { batches: listBatchesForOwner(user.id, { receiptNo }) });
+  }
+  if (/^\/api\/review-batches\/field-options$/.test(url.pathname) && req.method === 'GET') {
+    return sendJson(res, 200, { fields: ALL_BATCH_FIELDS, maxInvitations: BATCH_MAX_INVITATIONS });
+  }
+  const batchGetMatch = /^\/api\/review-batches\/([^/]+)$/.exec(url.pathname);
+  if (batchGetMatch && req.method === 'GET') {
+    const batchId = decodeURIComponent(batchGetMatch[1]);
+    if (!/^[A-Za-z0-9_-]{20,200}$/.test(batchId)) {
+      return sendJson(res, 400, { error: { code: 'INVALID_BATCH_ID' } });
+    }
+    const batch = getBatchForOwner({ userId: user.id, batchId });
+    if (!batch) return sendJson(res, 404, { error: { code: 'BATCH_NOT_FOUND', message: '复核批次不存在' } });
+    return sendJson(res, 200, { batch });
+  }
+  const batchStartMatch = /^\/api\/review-batches\/([^/]+)\/start$/.exec(url.pathname);
+  if (batchStartMatch && req.method === 'POST') {
+    return startBatch(req, res, user, batchStartMatch[1]);
+  }
+  const batchCancelMatch = /^\/api\/review-batches\/([^/]+)\/cancel$/.exec(url.pathname);
+  if (batchCancelMatch && req.method === 'POST') {
+    return cancelBatch(req, res, user, batchCancelMatch[1]);
+  }
+  const batchInviteRevokeMatch = /^\/api\/review-batches\/invitations\/([^/]+)\/revoke$/.exec(url.pathname);
+  if (batchInviteRevokeMatch && req.method === 'POST') {
+    return revokeBatchInvite(req, res, user, batchInviteRevokeMatch[1]);
+  }
+  const batchFieldDecideMatch = /^\/api\/review-batches\/([^/]+)\/fields\/([^/]+)\/(accept|reject)$/.exec(url.pathname);
+  if (batchFieldDecideMatch && req.method === 'POST') {
+    return decideBatchFieldRoute(req, res, user, batchFieldDecideMatch[1], batchFieldDecideMatch[2], batchFieldDecideMatch[3]);
   }
 
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
@@ -541,8 +608,287 @@ async function resolveObjection(req, res, user, action, rawId) {
 }
 
 // ---------------------------------------------------------------------------
-// 回执复核协作：复核人侧（免登录，先完成一次性邀请校验）
+// 多方复核批次：办理人侧
 // ---------------------------------------------------------------------------
+
+async function createBatch(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const receiptNo = formatReceiptNoInput(String(body.receiptNo || ''));
+  if (!RECEIPT_NO_PATTERN.test(receiptNo)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_RECEIPT_NO', message: '回执编号格式不正确' } });
+  }
+  const maxMinutes = Math.floor(config.reviewInviteMaxTtlMs / 60000);
+  const minMinutes = Math.max(1, Math.ceil(config.reviewInviteMinTtlMs / 60000));
+  const parsed = parseBatchCreateInput(body, { minMinutes, maxMinutes });
+  if (parsed.error) {
+    return sendJson(res, 400, { error: parsed.error });
+  }
+  const receiptRow = findReceiptRowByNo(receiptNo);
+  if (!receiptRow || receiptRow.user_id !== user.id) {
+    return sendJson(res, 404, { error: { code: 'RECEIPT_NOT_FOUND', message: '回执不存在或不属于当前账号' } });
+  }
+  if (receiptRow.status === 'revoked') {
+    return sendJson(res, 409, { error: { code: 'RECEIPT_REVOKED', message: '已撤销的回执不能创建复核批次' } });
+  }
+  const result = createReviewBatch({
+    userId: user.id,
+    receipt: receiptRow,
+    config: parsed.value,
+    ttlMs: parsed.value.ttlMinutes * 60000,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '创建复核批次失败' },
+    });
+  }
+  const batch = getBatchForOwner({ userId: user.id, batchId: result.batchId });
+  // 每个邀请的完整令牌只在创建当次返回一次（与核验码同等对待）
+  const links = result.invitations.map((invite) => ({
+    invitationId: invite.id,
+    label: invite.label,
+    token: invite.token,
+    url: `/batch-review?t=${encodeURIComponent(invite.token)}`,
+  }));
+  return sendJson(res, 200, {
+    ok: true,
+    batch,
+    links,
+    timeline: getTimelineForUser(user.id),
+    reviewBatches: listBatchesForOwner(user.id),
+  });
+}
+
+async function startBatch(req, res, user, rawBatchId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const batchId = decodeURIComponent(rawBatchId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(batchId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_BATCH_ID' } });
+  }
+  const result = startReviewBatch({ userId: user.id, batchId });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '进入复核失败' },
+      batch: result.batch || null,
+      pending: result.pending || null,
+    });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    batch: result.batch,
+    timeline: getTimelineForUser(user.id),
+    reviewBatches: listBatchesForOwner(user.id),
+  });
+}
+
+async function cancelBatch(req, res, user, rawBatchId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const batchId = decodeURIComponent(rawBatchId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(batchId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_BATCH_ID' } });
+  }
+  const result = cancelReviewBatch({ userId: user.id, batchId, reason: String(body.reason || '') });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '取消批次失败' },
+      batch: result.batch || null,
+    });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    batch: result.batch,
+    timeline: getTimelineForUser(user.id),
+    reviewBatches: listBatchesForOwner(user.id),
+  });
+}
+
+async function revokeBatchInvite(req, res, user, rawInvitationId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const invitationId = decodeURIComponent(rawInvitationId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(invitationId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_INVITATION_ID' } });
+  }
+  const result = revokeBatchInvitation({ userId: user.id, invitationId });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '撤销邀请失败' },
+      invitation: result.invitation || null,
+    });
+  }
+  return sendJson(res, 200, { ok: true, invitation: result.invitation, reviewBatches: listBatchesForOwner(user.id) });
+}
+
+async function decideBatchFieldRoute(req, res, user, rawBatchId, rawFieldId, action) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const batchId = decodeURIComponent(rawBatchId);
+  const batchFieldId = decodeURIComponent(rawFieldId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(batchId) || !/^[A-Za-z0-9_-]{20,200}$/.test(batchFieldId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const result = decideBatchField({
+    userId: user.id,
+    batchId,
+    batchFieldId,
+    action,
+    reason: String(body.reason || ''),
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '决议失败' },
+      field: result.field || null,
+      batch: result.batch || null,
+      workflow: result.workflow || null,
+      alreadyDecided: result.code === 'BATCH_FIELD_ALREADY_DECIDED',
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    field: result.field,
+    workflow: result.workflow || null,
+    createdCorrection: Boolean(result.created),
+    batchCompleted: Boolean(result.batchCompleted),
+    batch: result.batch,
+    records: state.records,
+    timeline: state.timeline,
+    reviewBatches: state.reviewBatches,
+    correction: state.correction,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 多方复核批次：复核人侧（免登录，先完成一次性邀请校验）
+// ---------------------------------------------------------------------------
+
+function batchCookies(req) {
+  return parseCookies(req.headers.cookie);
+}
+
+function batchSessionFromReq(req) {
+  const cookies = batchCookies(req);
+  if (!cookies[BATCH_SESSION_COOKIE]) return null;
+  return getValidBatchSession(cookies[BATCH_SESSION_COOKIE]);
+}
+
+function setBatchSessionCookies(res, { sessionToken, csrf, expiresAt }) {
+  const secure = config.cookieSecure ? '; Secure' : '';
+  const maxAge = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+  res.setHeader('Set-Cookie', [
+    `${BATCH_SESSION_COOKIE}=${sessionToken}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`,
+    `${BATCH_CSRF_COOKIE}=${csrf}; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`,
+  ]);
+}
+
+function clearBatchSessionCookies(res) {
+  res.setHeader('Set-Cookie', [
+    `${BATCH_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`,
+    `${BATCH_CSRF_COOKIE}=; SameSite=Lax; Path=/; Max-Age=0`,
+  ]);
+}
+
+function checkBatchCsrf(req, review) {
+  const header = req.headers['x-csrf-token'];
+  const cookies = batchCookies(req);
+  const secret = review.session.csrf_secret;
+  return Boolean(header && cookies[BATCH_CSRF_COOKIE] && header === secret && timingSafeEqualBuffer(header, secret));
+}
+
+async function batchReviewValidate(req, res) {
+  const clientIp = req.socket.remoteAddress || 'unknown';
+  const limitKey = `batch-review-validate:${clientIp}`;
+  const rate = { windowMs: config.verifyRateWindowMs, max: config.verifyRateMax };
+  const preview = peekRateLimit(limitKey, rate);
+  if (!preview.allowed) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(preview.retryAfterMs / 1000))));
+    return sendJson(res, 429, { error: { code: 'TOO_MANY_REQUESTS', message: '校验尝试过于频繁，请稍后再试' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const token = String(body.token || '').trim();
+  if (!/^[A-Za-z0-9_-]{20,512}$/.test(token)) {
+    recordFailure(limitKey, rate);
+    return sendJson(res, 400, { error: { code: 'INVALID_INVITATION', message: BATCH_ERRORS.BATCH_INVITATION_NOT_FOUND } });
+  }
+  const result = consumeBatchInvitation({ rawToken: token, clientIp });
+  if (!result.ok) {
+    recordFailure(limitKey, rate);
+    return sendJson(res, result.status, {
+      error: { code: result.code, message: BATCH_ERRORS[result.code] || '邀请校验失败' },
+    });
+  }
+  setBatchSessionCookies(res, { sessionToken: result.sessionToken, csrf: result.csrf, expiresAt: result.expiresAt });
+  return sendJson(res, 200, {
+    ok: true,
+    batchId: result.batchId,
+    receiptNo: result.receiptNo,
+    label: result.label,
+    csrfToken: result.csrf,
+    expiresAt: result.expiresAt,
+    autoStarted: result.autoStarted,
+  });
+}
+
+async function batchReviewLogout(req, res) {
+  const cookies = batchCookies(req);
+  if (cookies[BATCH_SESSION_COOKIE]) deleteBatchSession(cookies[BATCH_SESSION_COOKIE]);
+  clearBatchSessionCookies(res);
+  return sendJson(res, 200, { ok: true });
+}
+
+function requireBatchSession(req, res, { write = false } = {}) {
+  const review = batchSessionFromReq(req);
+  if (!review) {
+    sendJson(res, 401, { error: { code: 'BATCH_SESSION_REQUIRED', message: BATCH_ERRORS.BATCH_SESSION_REQUIRED } });
+    return null;
+  }
+  if (write && !checkBatchCsrf(req, review)) {
+    sendJson(res, 403, { error: { code: 'BATCH_CSRF_INVALID', message: BATCH_ERRORS.BATCH_CSRF_INVALID } });
+    return null;
+  }
+  return review;
+}
+
+async function batchReviewContext(req, res) {
+  const review = requireBatchSession(req, res);
+  if (!review) return;
+  const context = getBatchReviewerContext(review);
+  if (!context) {
+    clearBatchSessionCookies(res);
+    return sendJson(res, 404, { error: { code: 'BATCH_NOT_FOUND', message: BATCH_ERRORS.BATCH_NOT_FOUND } });
+  }
+  return sendJson(res, 200, { ok: true, csrfToken: review.session.csrf_secret, context });
+}
+
+async function batchReviewSubmit(req, res) {
+  const review = requireBatchSession(req, res, { write: true });
+  if (!review) return;
+  const body = await readJson(req, res);
+  if (!body) return;
+  const key = String(body.key || `${body.step ?? ''}.${body.field || ''}`);
+  const reason = String(body.reason || '');
+  const idempotencyKey = String(body.idempotencyKey || '');
+  if (!/^[A-Za-z0-9_-]{8,100}$/.test(idempotencyKey)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_IDEMPOTENCY_KEY', message: '提交编号格式不正确' } });
+  }
+  // 只能用于本批次绑定的那一份回执
+  if (body.receiptNo !== undefined && formatReceiptNoInput(String(body.receiptNo)) !== review.session.receipt_no) {
+    return sendJson(res, 403, { error: { code: 'BATCH_RECEIPT_MISMATCH', message: BATCH_ERRORS.BATCH_RECEIPT_MISMATCH } });
+  }
+  const requestHash = requestFingerprint({ key, reason });
+  const result = submitBatchOpinion({ review, key, reason, idempotencyKey, requestHash });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || BATCH_ERRORS[result.code] || '提交失败' },
+    });
+  }
+  return sendJson(res, 200, { ok: true, replay: Boolean(result.replay), opinion: result.opinion });
+}
+
+
 
 function reviewCookies(req) {
   return parseCookies(req.headers.cookie);
