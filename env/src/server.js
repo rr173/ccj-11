@@ -4,17 +4,20 @@ import path from 'node:path';
 import { config } from './config.js';
 import { timingSafeEqualBuffer } from './crypto.js';
 import {
+  abandonCorrectionWorkflow,
   confirmStep,
   createCorrectionWorkflow,
   createSession,
   deleteSession,
   findReceiptRowByNo,
   findUserByLogin,
+  getCorrectionPreviewForUser,
   getOrCreateWorkflow,
   getReceiptForOwner,
   getReceiptForWorkflow,
   getStateForUser,
   getSteps,
+  getTimelineForUser,
   getValidSession,
   issueToken,
   listReceiptsForUser,
@@ -127,7 +130,17 @@ async function handleApi(req, res, url) {
     return revokeOwnerReceipt(req, res, user, receiptMatch[1]);
   }
   if (url.pathname === '/api/corrections' && req.method === 'POST') {
+    if (url.searchParams.get('action') === 'abandon') {
+      return abandonCorrection(req, res, user);
+    }
     return startCorrection(req, res, user);
+  }
+  if (url.pathname === '/api/corrections/preview' && req.method === 'GET') {
+    const correction = getCorrectionPreviewForUser(user.id);
+    if (!correction) {
+      return sendJson(res, 404, { error: { code: 'NO_CORRECTION_IN_PROGRESS', message: '当前没有进行中的更正' } });
+    }
+    return sendJson(res, 200, { correction });
   }
 
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
@@ -331,16 +344,33 @@ async function startCorrection(req, res, user) {
   }
   const result = createCorrectionWorkflow({ userId: user.id, sourceReceiptNo });
   if (!result.ok) {
+    // 并发发起只放行一个：失败响应携带最新办理与时间线，调用方据此重新读取最新状态
     return sendJson(res, result.status || 409, {
       error: { code: result.code, message: result.message || '无法发起更正' },
       workflow: result.workflow || null,
+      timeline: getTimelineForUser(user.id),
+      correction: getCorrectionPreviewForUser(user.id),
     });
   }
   return sendJson(res, 200, {
     ok: true,
     workflow: envelopeOf(result.workflow).workflow,
     records: listReceiptsForUser(user.id),
+    timeline: getTimelineForUser(user.id),
+    correction: getCorrectionPreviewForUser(user.id),
   });
+}
+
+// 放弃更正：只关闭更正产生的新办理记录，原回执内容、状态与核验结果保持不变
+async function abandonCorrection(req, res, user) {
+  const result = abandonCorrectionWorkflow({ userId: user.id });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '无法放弃更正' },
+      timeline: getTimelineForUser(user.id),
+    });
+  }
+  return sendJson(res, 200, { ok: true, sourceReceiptNo: result.sourceReceiptNo, ...getStateForUser(user.id) });
 }
 
 // 免登录核验：编号 + 核验码两者都正确才返回结果；按来源 IP 对失败尝试限流

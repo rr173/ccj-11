@@ -11,12 +11,14 @@ import {
   receiptSummary,
   RECEIPT_NO_PATTERN,
 } from './receipts.js';
+import { buildCorrectionDiff } from './corrections.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
 export const db = new Database(config.dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('busy_timeout = 5000');
+db.pragma('foreign_keys = ON');
 
 function columnInfo(table) {
   try {
@@ -146,6 +148,12 @@ db.exec(`
   ON workflows(user_id) WHERE status = 'open';
 `);
 
+// 同一份回执至多一条进行中的更正（与上一索引叠加，兜底并发与异常路径）
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_workflows_one_open_correction_per_receipt
+  ON workflows(source_receipt_no) WHERE status = 'open' AND source_receipt_no <> '';
+`);
+
 if (legacyWorkflows) {
   db.transaction(() => {
     db.exec(`
@@ -270,21 +278,25 @@ export function getActiveWorkflow(userId) {
   `).get(userId) || null;
 }
 
-// 基于一份已签发回执发起更正：原回执与原办理冻结不变，另开一条新的办理记录
+// 基于一份已签发回执发起更正：原回执与原办理冻结不变，另开一条新的办理记录；
+// 新记录的各步草稿用原回执快照预填，办理人在此基础上修改，更正预览据此计算差异。
 export function createCorrectionWorkflow({ userId, sourceReceiptNo }) {
   return immediateTransaction(() => {
     const source = db.prepare(`
       SELECT * FROM receipts WHERE receipt_no = ? AND user_id = ?
     `).get(sourceReceiptNo, userId);
-    if (!source) return { ok: false, status: 404, code: 'RECEIPT_NOT_FOUND' };
+    if (!source) return { ok: false, status: 404, code: 'RECEIPT_NOT_FOUND', message: '回执不存在或不属于当前账号' };
 
     const existingOpen = getActiveWorkflow(userId);
     if (existingOpen) {
+      const sameReceipt = existingOpen.source_receipt_no === source.receipt_no;
       return {
         ok: false,
         status: 409,
-        code: 'OPEN_WORKFLOW_EXISTS',
-        message: '已有进行中的办理，请先完成后再发起更正',
+        code: sameReceipt ? 'CORRECTION_IN_PROGRESS' : 'OPEN_WORKFLOW_EXISTS',
+        message: sameReceipt
+          ? '该回执已存在一份进行中的更正，不能重复发起；请继续当前更正，或先放弃后再重新发起'
+          : '已有进行中的办理，请先完成或放弃后再发起更正',
         workflow: publicWorkflow(existingOpen, getSteps(existingOpen.id)),
       };
     }
@@ -292,18 +304,55 @@ export function createCorrectionWorkflow({ userId, sourceReceiptNo }) {
     const ts = now();
     const maxSeq = db.prepare('SELECT COALESCE(MAX(sequence), 0) AS max_seq FROM workflows WHERE user_id = ?').get(userId).max_seq;
     const id = cryptoId();
-    db.prepare(`
-      INSERT INTO workflows (id, user_id, sequence, status, source_receipt_no, progress, version, completed_at, created_at, updated_at)
-      VALUES (?, ?, ?, 'open', ?, 0, 0, NULL, ?, ?)
-    `).run(id, userId, maxSeq + 1, source.receipt_no, ts, ts);
+    const sourceSnapshot = JSON.parse(source.snapshot_json);
+    try {
+      db.prepare(`
+        INSERT INTO workflows (id, user_id, sequence, status, source_receipt_no, progress, version, completed_at, created_at, updated_at)
+        VALUES (?, ?, ?, 'open', ?, 0, 0, NULL, ?, ?)
+      `).run(id, userId, maxSeq + 1, source.receipt_no, ts, ts);
+    } catch (error) {
+      // 两个页面同时发起：唯一索引只放行一个，另一个明确失败并重新读取最新状态
+      if (String(error?.message || '').includes('UNIQUE')) {
+        return {
+          ok: false,
+          status: 409,
+          code: 'CORRECTION_IN_PROGRESS',
+          message: '该回执的更正已由另一个页面发起，请重新读取最新状态',
+        };
+      }
+      throw error;
+    }
     STEPS.forEach((_, step) => {
+      const data = sourceSnapshot.steps?.[step]?.data;
       db.prepare(`
         INSERT INTO workflow_steps (workflow_id, step, draft_json, confirmed_json, confirmed_at, updated_at)
-        VALUES (?, ?, NULL, NULL, NULL, ?)
-      `).run(id, step, ts);
+        VALUES (?, ?, ?, NULL, NULL, ?)
+      `).run(id, step, data ? JSON.stringify(data) : null, ts);
     });
     addEvent(id, 'workflow.created', null, { sequence: maxSeq + 1, correctionOf: source.receipt_no });
     return { ok: true, workflow: db.prepare('SELECT * FROM workflows WHERE id = ?').get(id) };
+  });
+}
+
+// 放弃进行中的更正：只删除更正产生的新办理记录及其草稿/令牌/提交，
+// 原回执（冻结快照、状态、核验码）与原办理记录完全不受影响。
+export function abandonCorrectionWorkflow({ userId }) {
+  return immediateTransaction(() => {
+    const workflow = getActiveWorkflow(userId);
+    if (!workflow) {
+      return { ok: false, status: 404, code: 'NO_OPEN_WORKFLOW', message: '当前没有进行中的办理' };
+    }
+    if (!workflow.source_receipt_no) {
+      return { ok: false, status: 409, code: 'NOT_A_CORRECTION', message: '当前进行中的办理不是更正，不能通过放弃更正关闭' };
+    }
+    const sourceReceiptNo = workflow.source_receipt_no;
+    addEvent(workflow.id, 'correction.abandoned', null, { sourceReceiptNo });
+    // 显式清理子表（同时有外键级联兜底）
+    db.prepare('DELETE FROM submissions WHERE workflow_id = ?').run(workflow.id);
+    db.prepare('DELETE FROM tokens WHERE workflow_id = ?').run(workflow.id);
+    db.prepare('DELETE FROM workflow_steps WHERE workflow_id = ?').run(workflow.id);
+    db.prepare('DELETE FROM workflows WHERE id = ?').run(workflow.id);
+    return { ok: true, sourceReceiptNo };
   });
 }
 
@@ -721,9 +770,92 @@ export function stateEnvelope(workflow) {
   return { workflow: publicView, receipt };
 }
 
+// ---------------------------------------------------------------------------
+// 回执版本时间线：按办理顺序（sequence 升序）展示每次办理产生的回执、
+// 正在进行中的更正草稿，以及它们之间的来源关系（更正自哪份回执 / 被哪份更正）。
+// 关系完全由 workflows.source_receipt_no 派生，该字段创建后不再改变，
+// 因此新回执签发不会改变旧回执在时间线中的位置与关系。
+// ---------------------------------------------------------------------------
+export function getTimelineForUser(userId) {
+  const workflows = db.prepare(`
+    SELECT * FROM workflows WHERE user_id = ? ORDER BY sequence ASC, created_at ASC
+  `).all(userId);
+  const receipts = db.prepare('SELECT * FROM receipts WHERE user_id = ?').all(userId);
+  const receiptByWorkflow = new Map(receipts.map((row) => [row.workflow_id, row]));
+
+  const entries = [];
+  for (const workflow of workflows) {
+    const receipt = receiptByWorkflow.get(workflow.id);
+    if (receipt) {
+      entries.push({
+        kind: 'receipt',
+        sequence: workflow.sequence,
+        receiptNo: receipt.receipt_no,
+        status: receipt.status,
+        issuedAt: receipt.issued_at,
+        completedAt: workflow.completed_at,
+        revokedAt: receipt.revoked_at || null,
+        sourceReceiptNo: workflow.source_receipt_no || '',
+        correctedBy: [],
+      });
+    } else if (workflow.status === 'open') {
+      entries.push({
+        kind: workflow.source_receipt_no ? 'correction' : 'initial',
+        sequence: workflow.sequence,
+        workflowId: workflow.id,
+        status: 'in_progress',
+        progress: workflow.progress,
+        totalSteps: STEPS.length,
+        startedAt: workflow.created_at,
+        sourceReceiptNo: workflow.source_receipt_no || '',
+      });
+    }
+  }
+
+  // 挂接来源关系：每个更正条目记录到被更正回执的 correctedBy 上
+  const receiptEntries = new Map(entries.filter((e) => e.kind === 'receipt').map((e) => [e.receiptNo, e]));
+  for (const entry of entries) {
+    if (!entry.sourceReceiptNo) continue;
+    const source = receiptEntries.get(entry.sourceReceiptNo);
+    if (!source) continue;
+    source.correctedBy.push(entry.kind === 'receipt'
+      ? { kind: 'receipt', receiptNo: entry.receiptNo, status: entry.status }
+      : { kind: 'correction', workflowId: entry.workflowId, status: 'in_progress' });
+  }
+  return entries;
+}
+
+// 更正预览：原回执冻结快照 vs 当前更正草稿的字段级差异。
+// 敏感字段（证件号码、详细地址）在服务端遮罩后才下发。
+export function getCorrectionPreviewForUser(userId) {
+  const workflow = getActiveWorkflow(userId);
+  if (!workflow || !workflow.source_receipt_no) return null;
+  const source = db.prepare('SELECT * FROM receipts WHERE receipt_no = ? AND user_id = ?')
+    .get(workflow.source_receipt_no, userId);
+  if (!source) return null;
+  const snapshot = JSON.parse(source.snapshot_json);
+  const drafts = getSteps(workflow.id).map((row) => {
+    if (row.draft_json) return JSON.parse(row.draft_json);
+    if (row.confirmed_json) return JSON.parse(row.confirmed_json);
+    return {};
+  });
+  return {
+    workflowId: workflow.id,
+    sourceReceiptNo: source.receipt_no,
+    sourceStatus: source.status,
+    sourceIssuedAt: source.issued_at,
+    startedAt: workflow.created_at,
+    progress: workflow.progress,
+    totalSteps: STEPS.length,
+    diff: buildCorrectionDiff(snapshot, drafts),
+  };
+}
+
 export function getStateForUser(userId) {
   const workflow = getOrCreateWorkflow(userId);
   const envelope = stateEnvelope(workflow);
   envelope.records = listReceiptsForUser(userId);
+  envelope.timeline = getTimelineForUser(userId);
+  envelope.correction = getCorrectionPreviewForUser(userId);
   return envelope;
 }

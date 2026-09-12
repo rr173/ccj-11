@@ -124,9 +124,30 @@ COOKIE_SECURE: "1"
 
 - 原回执与原办理记录**原样冻结**（快照、确认时间、编号都不变）；
 - 创建 `sequence + 1` 的新办理记录（`source_receipt_no` 指回原回执，并有审计事件），需要重新逐步确认四步；
+- 新记录的各步草稿**用原回执内容预填**，办理人在此基础上修改；
 - 新流程完成后生成**新的回执编号与核验码**；
-- 每人至多一条进行中的办理（部分唯一索引 + 事务），并发发起更正不会产生两条；
+- 每人至多一条进行中的办理、**同一回执至多一条进行中的更正**（两个部分唯一索引 + 事务）：两个页面同时发起时只有一个成功，另一个收到 `409 CORRECTION_IN_PROGRESS`，响应中携带最新办理与时间线，前端随即重新读取最新状态；
 - “我的回执”列表永久保留历次记录，可分别查看/下载。
+
+### 8. 回执版本时间线
+
+`GET /api/state` 与更正相关接口的响应都携带 `timeline`：按办理顺序（`sequence` 升序）列出每次办理产生的回执、正在进行中的更正草稿，以及来源关系——
+
+- 回执条目：`receiptNo`、`status`（`issued`/`revoked`）、`sourceReceiptNo`（更正自哪份回执）、`correctedBy`（被哪份回执/更正草稿更正）；
+- 更正草稿条目：`kind: 'correction'`、`status: 'in_progress'`、当前步骤与 `sourceReceiptNo`；
+- 关系完全由 `workflows.source_receipt_no` 派生，该字段创建后不再改变，因此**新回执签发后，旧回执的内容、核验结果与时间线关系都保持不变**。
+
+### 9. 更正预览（字段级差异，敏感字段遮罩）
+
+发起更正后、提交任何新步骤前，页面都会展示原回执与当前草稿的字段级差异（`GET /api/corrections/preview`，也随 `/api/state` 的 `correction` 字段下发）：
+
+- 每个字段标注 **新增 / 修改 / 删除 / 未变更**，并附汇总计数；
+- 差异在服务端计算；**证件号码与详细地址只下发遮罩内容**（如 `ID*********23`、`西湖******`），原始值不出现在任何预览响应中；
+- 草稿每次保存、每一步确认后预览自动刷新；草稿持久化在 SQLite 中，刷新、重新登录或服务重启后更正草稿与预览差异都保留。
+
+### 10. 放弃更正
+
+`POST /api/corrections?action=abandon`：删除更正产生的新办理记录及其草稿/令牌/提交，**原回执的内容、状态与核验结果完全不受影响**；放弃后可基于原回执重新发起更正。非更正的首次办理不能通过该接口关闭（`NOT_A_CORRECTION`）。
 
 ## 关键安全语义（原流程）
 
@@ -159,7 +180,7 @@ COOKIE_SECURE: "1"
 | --- | --- | --- | --- |
 | POST | `/api/login` | 否 | 登录，创建 HttpOnly 会话和 CSRF Cookie |
 | POST | `/api/logout` | 是 | 退出 |
-| GET | `/api/state` | 是 | 当前办理（工作流+回执）与历史回执清单 |
+| GET | `/api/state` | 是 | 当前办理（工作流+回执）、历史回执清单、版本时间线与更正预览 |
 | POST | `/api/tokens` | 是 | 为当前步骤领取一次性令牌 |
 | POST | `/api/drafts` | 是 | 保存当前步骤草稿 |
 | POST | `/api/submissions` | 是 | 校验令牌并原子确认当前步骤（末步签回执） |
@@ -168,7 +189,9 @@ COOKIE_SECURE: "1"
 | GET | `/api/receipts/{no}` | 是 | 回执完整数据（本人） |
 | GET | `/api/receipts/{no}/print` | 是 | 完整可打印回执 HTML |
 | POST | `/api/receipts/{no}?action=revoke` | 是 | 撤销回执（只改状态、留档） |
-| POST | `/api/corrections` | 是 | 基于某回执发起更正（新建办理记录） |
+| POST | `/api/corrections` | 是 | 基于某回执发起更正（新建办理记录，草稿用原回执预填） |
+| GET | `/api/corrections/preview` | 是 | 原回执 vs 当前更正草稿的字段级差异（敏感字段遮罩） |
+| POST | `/api/corrections?action=abandon` | 是 | 放弃进行中的更正（原回执不受影响） |
 | POST | `/api/verify` | 否 | 编号+核验码核验，仅返回脱敏结果，按 IP 限流 |
 | GET | `/api/public/receipts/{no}/print?code=` | 否 | 脱敏可打印回执文档 |
 | GET | `/verify` | 否 | 免登录核验页面 |
@@ -177,7 +200,7 @@ COOKIE_SECURE: "1"
 
 ## 存储模型
 
-- `workflows`：多条记录（`sequence`、`status`、`source_receipt_no`），部分唯一索引保证每人至多一条 `open`
+- `workflows`：多条记录（`sequence`、`status`、`source_receipt_no`），部分唯一索引保证每人至多一条 `open`、同一回执至多一条进行中的更正
 - `workflow_steps.draft_json / confirmed_json / confirmed_at`：草稿与服务端确认
 - `receipts`：回执编号（唯一）、固定快照、状态（`issued`/`revoked`）、撤销时间与原因
 - `tokens`：令牌哈希、绑定维度、过期、使用、撤销状态

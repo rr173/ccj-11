@@ -40,7 +40,7 @@ const els = {
   loginView: $('#loginView'), appView: $('#appView'), loginForm: $('#loginForm'), loginError: $('#loginError'),
   userBox: $('#userBox'), userName: $('#userName'), logoutBtn: $('#logoutBtn'), stepList: $('#stepList'),
   stateVersion: $('#stateVersion'), currentStepLabel: $('#currentStepLabel'), globalAlert: $('#globalAlert'),
-  stepForm: $('#stepForm'), receiptPanel: $('#receiptPanel'),
+  stepForm: $('#stepForm'), receiptPanel: $('#receiptPanel'), correctionPanel: $('#correctionPanel'),
   recordsPanel: $('#recordsPanel'), recordsList: $('#recordsList'),
 };
 
@@ -50,6 +50,8 @@ const state = {
   receipt: null,
   viewingReceipt: null,
   records: [],
+  timeline: [],
+  correction: null,
   user: null,
   pageId: getPageId(),
   token: null,
@@ -93,6 +95,8 @@ function applyState(result) {
   state.workflow = result.workflow;
   state.receipt = result.receipt || null;
   state.records = Array.isArray(result.records) ? result.records : [];
+  state.timeline = Array.isArray(result.timeline) ? result.timeline : [];
+  state.correction = result.correction || null;
 }
 
 async function login(event) {
@@ -118,6 +122,8 @@ async function logout() {
     state.workflow = null;
     state.receipt = null;
     state.records = [];
+    state.timeline = [];
+    state.correction = null;
     showLogin();
   }
 }
@@ -142,7 +148,8 @@ function render() {
   renderProgress();
   els.stateVersion.textContent = state.workflow.version;
 
-  renderRecords();
+  renderTimeline();
+  renderCorrectionPanel();
   if (state.workflow.completed) {
     renderReceipt(state.receipt || state.viewingReceipt || null);
     return;
@@ -153,43 +160,148 @@ function render() {
   renderCurrentStep();
 }
 
-function renderRecords() {
-  if (!state.records.length) {
+// 回执版本时间线：按办理顺序展示原始回执、更正中的草稿与后续回执，
+// 以及它们之间的来源关系（更正自哪份回执、被哪份回执/草稿更正）和当前状态。
+function renderTimeline() {
+  const entries = state.timeline.length
+    ? state.timeline
+    : state.records.map((r) => ({ kind: 'receipt', ...r, correctedBy: [] })).reverse();
+  if (!entries.length) {
     els.recordsPanel.classList.add('hidden');
     els.recordsList.innerHTML = '';
     return;
   }
   els.recordsPanel.classList.remove('hidden');
   els.recordsList.innerHTML = '';
-  state.records.forEach((record) => {
+  entries.forEach((entry) => {
     const li = document.createElement('li');
-    li.className = `record-item ${record.status}`;
-    const statusText = record.status === 'revoked' ? '已撤销' : '有效';
-    li.innerHTML = `
-      <div class="record-main">
-        <span class="mono">${escapeHtml(record.receiptNo)}</span>
-        <span class="badge ${record.status === 'revoked' ? 'invalidated' : 'confirmed'}">${statusText}</span>
-      </div>
-      <div class="muted small">第 ${record.sequence} 次办理 · 完成于 ${formatTime(record.completedAt)}</div>
-      <div class="record-actions"></div>
-    `;
-    const actions = li.querySelector('.record-actions');
-    const viewBtn = document.createElement('button');
-    viewBtn.type = 'button';
-    viewBtn.className = 'link-button';
-    viewBtn.textContent = '查看 / 打印回执';
-    viewBtn.addEventListener('click', () => openReceiptDoc(record.receiptNo));
-    actions.append(viewBtn);
-    if (record.workflowId !== state.workflow?.id) {
+    if (entry.kind === 'receipt') {
+      li.className = `record-item ${entry.status}`;
+      const statusText = entry.status === 'revoked' ? '已撤销' : '有效';
+      const relations = [];
+      if (entry.sourceReceiptNo) relations.push(`更正自 <span class="mono">${escapeHtml(entry.sourceReceiptNo)}</span>`);
+      (entry.correctedBy || []).forEach((next) => {
+        relations.push(next.kind === 'receipt'
+          ? `被 <span class="mono">${escapeHtml(next.receiptNo)}</span> 更正`
+          : '有一份更正正在进行中');
+      });
+      li.innerHTML = `
+        <div class="record-main">
+          <span class="mono">${escapeHtml(entry.receiptNo)}</span>
+          <span class="badge ${entry.status === 'revoked' ? 'invalidated' : 'confirmed'}">${statusText}</span>
+        </div>
+        <div class="muted small">第 ${entry.sequence} 次办理 · 完成于 ${formatTime(entry.completedAt)}</div>
+        ${relations.length ? `<div class="timeline-relations small">${relations.map((r) => `<div>↳ ${r}</div>`).join('')}</div>` : ''}
+        <div class="record-actions"></div>
+      `;
+      const actions = li.querySelector('.record-actions');
+      const viewBtn = document.createElement('button');
+      viewBtn.type = 'button';
+      viewBtn.className = 'link-button';
+      viewBtn.textContent = '查看 / 打印回执';
+      viewBtn.addEventListener('click', () => openReceiptDoc(entry.receiptNo));
+      actions.append(viewBtn);
       const detailBtn = document.createElement('button');
       detailBtn.type = 'button';
       detailBtn.className = 'link-button muted-link';
       detailBtn.textContent = '加载完整内容';
-      detailBtn.addEventListener('click', () => loadReceipt(record.receiptNo));
+      detailBtn.addEventListener('click', () => loadReceipt(entry.receiptNo));
       actions.append(detailBtn);
+      const correctBtn = document.createElement('button');
+      correctBtn.type = 'button';
+      correctBtn.className = 'link-button muted-link';
+      correctBtn.textContent = '基于本回执发起更正';
+      correctBtn.addEventListener('click', () => startCorrection(entry.receiptNo));
+      actions.append(correctBtn);
+    } else {
+      const isCorrection = entry.kind === 'correction';
+      li.className = 'record-item in-progress';
+      li.innerHTML = `
+        <div class="record-main">
+          <span>${isCorrection ? '更正草稿' : '首次办理'}</span>
+          <span class="badge current">进行中 · 第 ${entry.progress + 1 > entry.totalSteps ? entry.totalSteps : entry.progress + 1}/${entry.totalSteps} 步</span>
+        </div>
+        <div class="muted small">第 ${entry.sequence} 次办理 · 开始于 ${formatTime(entry.startedAt)}</div>
+        ${isCorrection ? `<div class="timeline-relations small"><div>↳ 更正自 <span class="mono">${escapeHtml(entry.sourceReceiptNo)}</span>，完成后将生成新回执</div></div>` : ''}
+        <div class="record-actions"></div>
+      `;
+      if (isCorrection) {
+        const abandonBtn = document.createElement('button');
+        abandonBtn.type = 'button';
+        abandonBtn.className = 'link-button';
+        abandonBtn.textContent = '放弃本次更正（不影响原回执）';
+        abandonBtn.addEventListener('click', () => abandonCorrection());
+        li.querySelector('.record-actions').append(abandonBtn);
+      }
     }
     els.recordsList.append(li);
   });
+}
+
+// 更正预览：在提交任何新步骤前，展示原回执与当前草稿的字段级差异，
+// 新增 / 修改 / 删除分别标注；证件号码与详细地址由服务端遮罩后下发。
+function renderCorrectionPanel() {
+  const correction = state.correction;
+  if (!correction || !state.workflow || state.workflow.completed) {
+    els.correctionPanel.classList.add('hidden');
+    els.correctionPanel.innerHTML = '';
+    return;
+  }
+  els.correctionPanel.classList.remove('hidden');
+  const { diff } = correction;
+  const changeMeta = {
+    added: { text: '新增', cls: 'added' },
+    modified: { text: '修改', cls: 'modified' },
+    deleted: { text: '删除', cls: 'deleted' },
+    unchanged: { text: '未变更', cls: 'unchanged' },
+  };
+  const rows = diff.fields.map((field) => {
+    const meta = changeMeta[field.change];
+    const display = (v) => (v === '' ? '<span class="muted">（空）</span>' : escapeHtml(v));
+    return `
+      <tr class="diff-row ${meta.cls}">
+        <td>${escapeHtml(field.stepTitle)}</td>
+        <td>${escapeHtml(field.label)}${field.masked ? ' <span class="mask-tag" title="敏感字段，仅显示遮罩内容">已遮罩</span>' : ''}</td>
+        <td>${display(field.before)}</td>
+        <td>${display(field.after)}</td>
+        <td><span class="badge diff-${meta.cls}">${meta.text}</span></td>
+      </tr>`;
+  }).join('');
+  els.correctionPanel.innerHTML = `
+    <div class="receipt-head">
+      <h2>更正预览（第 ${correction.progress + 1 > correction.totalSteps ? correction.totalSteps : correction.progress + 1}/${correction.totalSteps} 步进行中）</h2>
+      <span class="badge current">更正中</span>
+    </div>
+    <p class="muted small">
+      本预览对比原回执 <span class="mono">${escapeHtml(correction.sourceReceiptNo)}</span> 与当前更正草稿的字段级差异；
+      提交任何新步骤前请先核对。证件号码与详细地址仅显示遮罩内容。
+    </p>
+    <p class="diff-summary">
+      <span class="badge diff-added">新增 ${diff.summary.added}</span>
+      <span class="badge diff-modified">修改 ${diff.summary.modified}</span>
+      <span class="badge diff-deleted">删除 ${diff.summary.deleted}</span>
+      <span class="badge diff-unchanged">未变更 ${diff.summary.unchanged}</span>
+    </p>
+    <table class="diff-table">
+      <thead><tr><th>步骤</th><th>字段</th><th>原回执</th><th>当前草稿</th><th>变更</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="form-actions">
+      <button class="button secondary" type="button" data-action="abandon">放弃本次更正（原回执不受影响）</button>
+    </div>
+  `;
+  els.correctionPanel.querySelector('[data-action="abandon"]').addEventListener('click', () => abandonCorrection());
+}
+
+async function refreshCorrectionPreview() {
+  if (!state.workflow || state.workflow.completed || !state.workflow.sourceReceiptNo) return;
+  try {
+    const result = await api('GET', '/api/corrections/preview');
+    state.correction = result.correction || null;
+  } catch (error) {
+    if (error.status === 404) state.correction = null;
+  }
+  renderCorrectionPanel();
 }
 
 function renderProgress() {
@@ -336,8 +448,12 @@ async function submitStep(event) {
       : result.receipt
         ? '全部四步已确认成功，电子回执已生成并固定保存。'
         : `第 ${step + 1} 步已由服务端确认。`, result.replay ? 'warning' : 'success');
-    if (result.receipt) void refreshRecords();
-    render();
+    if (result.receipt) {
+      await boot(); // 完成后重新读取：时间线出现新回执，更正预览关闭
+    } else {
+      await refreshCorrectionPreview();
+      render();
+    }
   } catch (error) {
     if (error.body?.workflow) state.workflow = error.body.workflow;
     state.pendingIdempotencyKey = null;
@@ -402,6 +518,7 @@ async function saveDraft(manual) {
     els.stateVersion.textContent = result.version;
     if (manual) showAlert('草稿已保存到服务端。', 'success');
     updateTokenStatus();
+    void refreshCorrectionPreview();
   } catch (error) {
     if (error.body?.workflow) state.workflow = error.body.workflow;
     showAlert(`草稿保存失败：${explainConflict(error.body?.error?.code)} 已重新读取最新进度。`, 'error');
@@ -522,7 +639,8 @@ async function startCorrection(receiptNo) {
   const ok = window.confirm(
     '将基于该回执发起一次更正办理：\n\n'
     + '· 原回执与原办理记录固定保留，不会被修改或覆盖；\n'
-    + '· 系统会创建一条全新的办理记录，需要重新逐步确认四步；\n'
+    + '· 系统会创建一条全新的办理记录，各步草稿用原回执内容预填；\n'
+    + '· 提交每一步前都可以查看与原回执的字段级差异预览；\n'
     + '· 新流程全部完成后会生成新的回执编号与核验码。\n\n'
     + '确定发起更正吗？',
   );
@@ -534,14 +652,42 @@ async function startCorrection(receiptNo) {
     state.receipt = null;
     state.viewingReceipt = null;
     state.records = result.records || state.records;
+    state.timeline = result.timeline || state.timeline;
+    state.correction = result.correction || null;
     state.pendingIdempotencyKey = null;
     clearToken();
-    showAlert('已创建新的更正办理记录，请从第 1 步开始重新确认。原回执保持不变。', 'warning');
+    showAlert('已创建新的更正办理记录，各步草稿已用原回执内容预填。提交每一步前请先在上方“更正预览”核对与原回执的差异。', 'warning');
     render();
   } catch (error) {
-    if (error.body?.workflow) state.workflow = error.body.workflow;
-    showAlert(`发起更正失败：${error.message || explainConflict(error.body?.error?.code)}`, 'error');
+    // 同一回执不能同时存在两份进行中的更正：并发发起只放行一个，
+    // 失败方明确提示并重新读取服务端最新状态。
+    showAlert(`发起更正失败：${error.message || explainConflict(error.body?.error?.code)} 已重新读取最新状态。`, 'error');
+    await boot();
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function abandonCorrection() {
+  const ok = window.confirm(
+    '确定放弃本次更正吗？\n\n'
+    + '· 更正产生的新办理记录与草稿将被删除；\n'
+    + '· 原回执的内容、状态与核验结果完全不受影响；\n'
+    + '· 放弃后可以重新基于原回执再次发起更正。',
+  );
+  if (!ok || state.busy) return;
+  state.busy = true;
+  try {
+    const result = await api('POST', '/api/corrections?action=abandon', {});
+    applyState(result);
+    state.viewingReceipt = null;
+    state.pendingIdempotencyKey = null;
+    clearToken();
+    showAlert('已放弃本次更正，原回执保持不变。', 'warning');
     render();
+  } catch (error) {
+    showAlert(`放弃更正失败：${error.message || explainConflict(error.body?.error?.code)} 已重新读取最新状态。`, 'error');
+    await boot();
   } finally {
     state.busy = false;
   }
@@ -611,18 +757,14 @@ function explainConflict(code) {
     WORKFLOW_VERSION_CONFLICT: '进度已在其他页面变化。',
     SUBMISSION_ALREADY_PROCESSED: '提交已处理或其确认已失效，拒绝重复使用。',
     WORKFLOW_COMPLETED: '办理已完成，回执不能退回修改或覆盖；如需更正请发起新的办理记录。',
-    OPEN_WORKFLOW_EXISTS: '已有进行中的办理，请先完成后再发起更正。',
+    OPEN_WORKFLOW_EXISTS: '已有进行中的办理，请先完成或放弃后再发起更正。',
+    CORRECTION_IN_PROGRESS: '该回执已存在一份进行中的更正，不能重复发起。',
+    NOT_A_CORRECTION: '当前进行中的办理不是更正，不能通过放弃更正关闭。',
+    NO_OPEN_WORKFLOW: '当前没有进行中的办理。',
+    NO_CORRECTION_IN_PROGRESS: '当前没有进行中的更正。',
     RECEIPT_NOT_FOUND: '回执不存在或不属于当前账号。',
     RECEIPT_ALREADY_REVOKED: '该回执已经处于撤销状态。',
   }[code] || '请求被服务端拒绝。';
-}
-
-async function refreshRecords() {
-  try {
-    const result = await api('GET', '/api/receipts');
-    state.records = result.receipts || [];
-    renderRecords();
-  } catch { /* 列表刷新失败不影响主流程 */ }
 }
 
 function showStepError(message) {

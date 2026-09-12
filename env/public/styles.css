@@ -78,6 +78,26 @@ a.button { display: inline-block; text-decoration: none; }
 .record-actions { display: flex; gap: 12px; margin-top: 6px; flex-wrap: wrap; }
 .muted-link { color: #647084 !important; }
 
+/* 回执版本时间线 */
+.record-item.in-progress { border-color: #366aeb; background: #eef4ff; }
+.timeline-relations { margin-top: 6px; color: #475467; display: grid; gap: 2px; }
+.timeline-relations .mono { font-size: 11px; }
+
+/* 更正预览：字段级差异 */
+.diff-summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+.diff-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.diff-table th, .diff-table td { border: 1px solid #d8dee9; padding: 7px 10px; text-align: left; vertical-align: top; }
+.diff-table thead th { background: #f5f7fb; font-weight: 600; white-space: nowrap; }
+.diff-row.unchanged { color: #98a2b3; }
+.diff-row.added { background: #ecfdf3; }
+.diff-row.modified { background: #fffaeb; }
+.diff-row.deleted { background: #fef3f2; }
+.badge.diff-added { background: #d1fadf; color: #05603a; }
+.badge.diff-modified { background: #fef0c7; color: #93370d; }
+.badge.diff-deleted { background: #fee4e2; color: #b42318; }
+.badge.diff-unchanged { background: #e4e7ec; color: #475467; }
+.mask-tag { font-size: 11px; color: #1849a9; background: #d1e0ff; border-radius: 4px; padding: 1px 5px; white-space: nowrap; }
+
 /* 免登录核验页 */
 .verify-shell { max-width: 720px; }
 .verify-head { text-align: center; margin: 30px 0 22px; }

@@ -44,14 +44,15 @@
           </div>
         </div>
         <div class="records-panel card hidden" id="recordsPanel">
-          <h2>我的回执 / 办理记录</h2>
+          <h2>回执版本时间线</h2>
           <ul id="recordsList" class="records-list"></ul>
-          <p class="muted small">回执内容固定保存；后续更正会产生新的办理记录与新回执，原回执不被覆盖。</p>
+          <p class="muted small">按办理顺序展示每份回执、更正中的草稿及其来源关系。回执内容固定保存；更正会产生新的办理记录与新回执，原回执不被覆盖。</p>
         </div>
       </div>
 
       <div class="work-panel">
         <div id="globalAlert" class="alert hidden"></div>
+        <section id="correctionPanel" class="card hidden"></section>
         <form id="stepForm" class="card"></form>
         <section id="receiptPanel" class="card hidden"></section>
       </div>
