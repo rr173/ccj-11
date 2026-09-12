@@ -18,6 +18,10 @@ export const config = {
   // 免登录核验接口的限流（按来源 IP 的滑动窗口）
   verifyRateWindowMs: Number(process.env.VERIFY_RATE_WINDOW_MS || 15 * 60 * 1000),
   verifyRateMax: Number(process.env.VERIFY_RATE_MAX || 20),
+  // 回执复核邀请：限时（默认最长 7 天）、链接只能使用一次；复核人免登录
+  reviewInviteDefaultTtlMs: Number(process.env.REVIEW_INVITE_TTL_MS || 3 * 24 * 60 * 60 * 1000),
+  reviewInviteMaxTtlMs: Number(process.env.REVIEW_INVITE_MAX_TTL_MS || 7 * 24 * 60 * 60 * 1000),
+  reviewInviteMinTtlMs: Number(process.env.REVIEW_INVITE_MIN_TTL_MS || 5 * 60 * 1000),
   // 核验码由 HMAC 确定性派生：数据库不存核验码。
   // 优先使用 RECEIPT_SECRET；否则在数据目录生成 0600 权限的密钥文件（随 Docker volume 持久化）。
   receiptSecret: process.env.RECEIPT_SECRET || '',

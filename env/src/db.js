@@ -12,6 +12,7 @@ import {
   RECEIPT_NO_PATTERN,
 } from './receipts.js';
 import { buildCorrectionDiff } from './corrections.js';
+import { buildReviewView, reviewFieldDef, reviewTextValue } from './reviews.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -139,6 +140,76 @@ CREATE TABLE IF NOT EXISTS events (
   step INTEGER,
   detail_json TEXT NOT NULL,
   created_at INTEGER NOT NULL
+);
+
+-- 回执复核：办理人发起的限时、一次性、绑定单份回执的复核邀请
+CREATE TABLE IF NOT EXISTS review_invitations (
+  id TEXT PRIMARY KEY,
+  receipt_no TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash BLOB NOT NULL UNIQUE,
+  note TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'used', 'revoked', 'expired')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER,
+  used_ip TEXT NOT NULL DEFAULT '',
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_review_invitations_receipt ON review_invitations(receipt_no, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_invitations_user ON review_invitations(user_id, created_at);
+
+-- 复核会话：邀请校验成功（一次性消费）后为该复核人生成，免登录；
+-- 原始令牌只存在浏览器 Cookie 中，数据库仅存哈希。
+CREATE TABLE IF NOT EXISTS review_sessions (
+  id TEXT PRIMARY KEY,
+  invitation_id TEXT NOT NULL REFERENCES review_invitations(id) ON DELETE CASCADE,
+  receipt_no TEXT NOT NULL,
+  token_hash BLOB NOT NULL UNIQUE,
+  csrf_secret TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_sessions_invitation ON review_sessions(invitation_id);
+
+-- 字段级异议：状态、提交时间、处理人、处理结果与后续更正来源全部持久化
+CREATE TABLE IF NOT EXISTS review_objections (
+  id TEXT PRIMARY KEY,
+  invitation_id TEXT NOT NULL REFERENCES review_invitations(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES review_sessions(id) ON DELETE CASCADE,
+  receipt_no TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  field_label TEXT NOT NULL DEFAULT '',
+  value_snapshot TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'accepted', 'rejected')),
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  request_hash TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  resolved_at INTEGER,
+  resolved_by_user_id TEXT,
+  resolve_reason TEXT NOT NULL DEFAULT '',
+  correction_workflow_id TEXT,
+  correction_receipt_no TEXT NOT NULL DEFAULT '',
+  lock_session_id TEXT,
+  locked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_review_objections_receipt ON review_objections(receipt_no, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_objections_user ON review_objections(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_objections_workflow ON review_objections(correction_workflow_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_objections_idempotency
+  ON review_objections(session_id, idempotency_key) WHERE idempotency_key <> '';
+
+-- 接受的异议与因此进入的更正办理（多对多：一次更正可回应多条异议）
+CREATE TABLE IF NOT EXISTS correction_objections (
+  workflow_id TEXT NOT NULL,
+  objection_id TEXT NOT NULL REFERENCES review_objections(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (workflow_id, objection_id)
 );
 `);
 
@@ -281,57 +352,64 @@ export function getActiveWorkflow(userId) {
 // 基于一份已签发回执发起更正：原回执与原办理冻结不变，另开一条新的办理记录；
 // 新记录的各步草稿用原回执快照预填，办理人在此基础上修改，更正预览据此计算差异。
 export function createCorrectionWorkflow({ userId, sourceReceiptNo }) {
-  return immediateTransaction(() => {
-    const source = db.prepare(`
-      SELECT * FROM receipts WHERE receipt_no = ? AND user_id = ?
-    `).get(sourceReceiptNo, userId);
-    if (!source) return { ok: false, status: 404, code: 'RECEIPT_NOT_FOUND', message: '回执不存在或不属于当前账号' };
+  try {
+    return immediateTransaction(() => {
+      const source = db.prepare(`
+        SELECT * FROM receipts WHERE receipt_no = ? AND user_id = ?
+      `).get(sourceReceiptNo, userId);
+      if (!source) return { ok: false, status: 404, code: 'RECEIPT_NOT_FOUND', message: '回执不存在或不属于当前账号' };
 
-    const existingOpen = getActiveWorkflow(userId);
-    if (existingOpen) {
-      const sameReceipt = existingOpen.source_receipt_no === source.receipt_no;
-      return {
-        ok: false,
-        status: 409,
-        code: sameReceipt ? 'CORRECTION_IN_PROGRESS' : 'OPEN_WORKFLOW_EXISTS',
-        message: sameReceipt
-          ? '该回执已存在一份进行中的更正，不能重复发起；请继续当前更正，或先放弃后再重新发起'
-          : '已有进行中的办理，请先完成或放弃后再发起更正',
-        workflow: publicWorkflow(existingOpen, getSteps(existingOpen.id)),
-      };
-    }
-
-    const ts = now();
-    const maxSeq = db.prepare('SELECT COALESCE(MAX(sequence), 0) AS max_seq FROM workflows WHERE user_id = ?').get(userId).max_seq;
-    const id = cryptoId();
-    const sourceSnapshot = JSON.parse(source.snapshot_json);
-    try {
-      db.prepare(`
-        INSERT INTO workflows (id, user_id, sequence, status, source_receipt_no, progress, version, completed_at, created_at, updated_at)
-        VALUES (?, ?, ?, 'open', ?, 0, 0, NULL, ?, ?)
-      `).run(id, userId, maxSeq + 1, source.receipt_no, ts, ts);
-    } catch (error) {
-      // 两个页面同时发起：唯一索引只放行一个，另一个明确失败并重新读取最新状态
-      if (String(error?.message || '').includes('UNIQUE')) {
+      const existingOpen = getActiveWorkflow(userId);
+      if (existingOpen) {
+        const sameReceipt = existingOpen.source_receipt_no === source.receipt_no;
         return {
           ok: false,
           status: 409,
-          code: 'CORRECTION_IN_PROGRESS',
-          message: '该回执的更正已由另一个页面发起，请重新读取最新状态',
+          code: sameReceipt ? 'CORRECTION_IN_PROGRESS' : 'OPEN_WORKFLOW_EXISTS',
+          message: sameReceipt
+            ? '该回执已存在一份进行中的更正，不能重复发起；请继续当前更正，或先放弃后再重新发起'
+            : '已有进行中的办理，请先完成或放弃后再发起更正',
+          workflow: publicWorkflow(existingOpen, getSteps(existingOpen.id)),
         };
       }
-      throw error;
-    }
-    STEPS.forEach((_, step) => {
-      const data = sourceSnapshot.steps?.[step]?.data;
-      db.prepare(`
-        INSERT INTO workflow_steps (workflow_id, step, draft_json, confirmed_json, confirmed_at, updated_at)
-        VALUES (?, ?, ?, NULL, NULL, ?)
-      `).run(id, step, data ? JSON.stringify(data) : null, ts);
+
+      return { ok: true, workflow: insertCorrectionWorkflowTx(source) };
     });
-    addEvent(id, 'workflow.created', null, { sequence: maxSeq + 1, correctionOf: source.receipt_no });
-    return { ok: true, workflow: db.prepare('SELECT * FROM workflows WHERE id = ?').get(id) };
+  } catch (error) {
+    // 两个页面同时发起：唯一索引只放行一个，另一个明确失败并重新读取最新状态
+    if (String(error?.message || '').includes('UNIQUE')) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'CORRECTION_IN_PROGRESS',
+        message: '该回执的更正已由另一个页面发起，请重新读取最新状态',
+      };
+    }
+    throw error;
+  }
+}
+
+// 事务内调用：为指定回执创建 sequence+1 的更正办理，草稿用原回执预填。
+// 调用方负责完成归属校验、进行中办理冲突等前置检查。
+function insertCorrectionWorkflowTx(source) {
+  const ts = now();
+  const maxSeq = db.prepare('SELECT COALESCE(MAX(sequence), 0) AS max_seq FROM workflows WHERE user_id = ?')
+    .get(source.user_id).max_seq;
+  const id = cryptoId();
+  db.prepare(`
+    INSERT INTO workflows (id, user_id, sequence, status, source_receipt_no, progress, version, completed_at, created_at, updated_at)
+    VALUES (?, ?, ?, 'open', ?, 0, 0, NULL, ?, ?)
+  `).run(id, source.user_id, maxSeq + 1, source.receipt_no, ts, ts);
+  const sourceSnapshot = JSON.parse(source.snapshot_json);
+  STEPS.forEach((_, step) => {
+    const data = sourceSnapshot.steps?.[step]?.data;
+    db.prepare(`
+      INSERT INTO workflow_steps (workflow_id, step, draft_json, confirmed_json, confirmed_at, updated_at)
+      VALUES (?, ?, ?, NULL, NULL, ?)
+    `).run(id, step, data ? JSON.stringify(data) : null, ts);
   });
+  addEvent(id, 'workflow.created', null, { sequence: maxSeq + 1, correctionOf: source.receipt_no });
+  return db.prepare('SELECT * FROM workflows WHERE id = ?').get(id);
 }
 
 // 放弃进行中的更正：只删除更正产生的新办理记录及其草稿/令牌/提交，
@@ -347,6 +425,29 @@ export function abandonCorrectionWorkflow({ userId }) {
     }
     const sourceReceiptNo = workflow.source_receipt_no;
     addEvent(workflow.id, 'correction.abandoned', null, { sourceReceiptNo });
+    // 随该更正进入办理的已接受异议：更正被放弃，异议回到待处理，可再次处理
+    const linked = db.prepare(`
+      SELECT id FROM review_objections
+      WHERE correction_workflow_id = ? AND status = 'accepted'
+    `).all(workflow.id);
+    if (linked.length > 0) {
+      db.prepare(`
+        UPDATE review_objections
+        SET status = 'open',
+            correction_workflow_id = NULL,
+            correction_receipt_no = '',
+            resolved_at = NULL,
+            resolved_by_user_id = NULL,
+            resolve_reason = '',
+            lock_session_id = NULL,
+            locked_at = NULL
+        WHERE correction_workflow_id = ? AND status = 'accepted'
+      `).run(workflow.id);
+      db.prepare('DELETE FROM correction_objections WHERE workflow_id = ?').run(workflow.id);
+      for (const item of linked) {
+        addReviewEvent(workflow.user_id, sourceReceiptNo, 'review.objection.reopened', { objectionId: item.id });
+      }
+    }
     // 显式清理子表（同时有外键级联兜底）
     db.prepare('DELETE FROM submissions WHERE workflow_id = ?').run(workflow.id);
     db.prepare('DELETE FROM tokens WHERE workflow_id = ?').run(workflow.id);
@@ -522,6 +623,19 @@ export function confirmStep({ workflowId, userId, sessionId, pageId, step, token
       const completed = db.prepare('SELECT * FROM workflows WHERE id = ?').get(workflowId);
       receipt = issueReceiptForWorkflow(completed);
       addEvent(workflowId, 'receipt.issued', step, { receiptNo: receipt.receiptNo });
+      // 若本次更正由已接受的复核异议进入，把新回执编号回填到异议与时间线来源关系上
+      const linkedObjections = db.prepare(`
+        SELECT id FROM review_objections WHERE correction_workflow_id = ?
+      `).all(workflowId);
+      if (linkedObjections.length > 0 && workflow.source_receipt_no) {
+        db.prepare(`
+          UPDATE review_objections SET correction_receipt_no = ? WHERE correction_workflow_id = ?
+        `).run(receipt.receiptNo, workflowId);
+        addReviewEvent(userId, workflow.source_receipt_no, 'review.correction.completed', {
+          receiptNo: receipt.receiptNo,
+          objectionIds: linkedObjections.map((item) => item.id),
+        });
+      }
     }
     addEvent(workflowId, isFinal ? 'workflow.completed' : 'step.confirmed', step, { submissionId });
 
@@ -727,6 +841,427 @@ export function revokeReceipt({ userId, receiptNo, reason }) {
 }
 
 // ---------------------------------------------------------------------------
+// 回执复核协作：限时一次性邀请、免登录复核会话、字段级异议与处理结果
+// ---------------------------------------------------------------------------
+
+const OBJECTION_REASON_MIN = 2;
+const OBJECTION_REASON_MAX = 500;
+export const OBJECTION_LOCK_TTL_MS = 60 * 1000;
+
+function reviewEventWorkflowId(receiptNo) {
+  const row = db.prepare('SELECT workflow_id FROM receipts WHERE receipt_no = ?').get(receiptNo);
+  return row?.workflow_id || null;
+}
+
+// 复核事件写入回执对应办理记录的审计时间线；回执刚被撤销等极端情况下也不阻塞主流程
+function addReviewEvent(userId, receiptNo, type, detail) {
+  const workflowId = reviewEventWorkflowId(receiptNo);
+  if (!workflowId) return;
+  db.prepare(`
+    INSERT INTO events (workflow_id, type, step, detail_json, created_at)
+    VALUES (?, ?, NULL, ?, ?)
+  `).run(workflowId, type, JSON.stringify({ receiptNo, ...detail }), now());
+}
+
+function effectiveInvitationStatus(row) {
+  if (row.status === 'active' && row.expires_at <= now()) {
+    db.prepare("UPDATE review_invitations SET status = 'expired' WHERE id = ? AND status = 'active'").run(row.id);
+    return 'expired';
+  }
+  return row.status;
+}
+
+export function createReviewInvitation({ userId, receiptNo, ttlMs, note }) {
+  return immediateTransaction(() => {
+    const receipt = db.prepare('SELECT * FROM receipts WHERE receipt_no = ? AND user_id = ?').get(receiptNo, userId);
+    if (!receipt) return { ok: false, status: 404, code: 'RECEIPT_NOT_FOUND', message: '回执不存在或不属于当前账号' };
+    if (receipt.status === 'revoked') {
+      return { ok: false, status: 409, code: 'RECEIPT_REVOKED', message: '已撤销的回执不能发起复核邀请' };
+    }
+    const raw = tokenUrlSafe();
+    const ts = now();
+    const id = cryptoId();
+    db.prepare(`
+      INSERT INTO review_invitations
+        (id, receipt_no, workflow_id, user_id, token_hash, note, status, created_at, expires_at, used_at, used_ip, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, '', NULL)
+    `).run(id, receipt.receipt_no, receipt.workflow_id, userId, sha256(raw), String(note || '').slice(0, 200), ts, ts + ttlMs);
+    addReviewEvent(userId, receipt.receipt_no, 'review.invitation.created', { invitationId: id, expiresAt: ts + ttlMs });
+    return { ok: true, invitation: getInvitationForOwnerTx(id), token: raw };
+  });
+}
+
+export function revokeReviewInvitation({ userId, invitationId }) {
+  return immediateTransaction(() => {
+    const row = db.prepare('SELECT * FROM review_invitations WHERE id = ? AND user_id = ?').get(invitationId, userId);
+    if (!row) return { ok: false, status: 404, code: 'INVITATION_NOT_FOUND', message: '复核邀请不存在' };
+    const status = effectiveInvitationStatus(row);
+    if (status === 'revoked') {
+      return { ok: false, status: 409, code: 'INVITATION_ALREADY_REVOKED', message: '邀请已处于撤销状态', invitation: getInvitationForOwnerTx(row.id) };
+    }
+    if (row.used_at) {
+      return { ok: false, status: 409, code: 'INVITATION_ALREADY_USED', message: '邀请链接已被使用，不能撤销；复核人已持有的复核会话将同步失效', invitation: getInvitationForOwnerTx(row.id) };
+    }
+    const ts = now();
+    db.prepare("UPDATE review_invitations SET status = 'revoked', revoked_at = ? WHERE id = ?").run(ts, row.id);
+    // 邀请撤销：该邀请尚未产生会话；若有残留会话（理论上不会）一并失效
+    db.prepare('DELETE FROM review_sessions WHERE invitation_id = ?').run(row.id);
+    addReviewEvent(userId, row.receipt_no, 'review.invitation.revoked', { invitationId: row.id });
+    return { ok: true, invitation: getInvitationForOwnerTx(row.id) };
+  });
+}
+
+// 邀请校验：一次性消费，成功后创建免登录复核会话（只绑定这一份回执）
+export function consumeReviewInvitation({ rawToken, clientIp }) {
+  return immediateTransaction(() => {
+    const invite = db.prepare('SELECT * FROM review_invitations WHERE token_hash = ?').get(sha256(rawToken));
+    if (!invite) {
+      return { ok: false, status: 404, code: 'INVITATION_NOT_FOUND' };
+    }
+    if (invite.status === 'revoked' || invite.revoked_at) {
+      return { ok: false, status: 410, code: 'INVITATION_REVOKED' };
+    }
+    if (invite.used_at || invite.status === 'used') {
+      return { ok: false, status: 410, code: 'INVITATION_ALREADY_USED' };
+    }
+    if (invite.expires_at <= now()) {
+      db.prepare("UPDATE review_invitations SET status = 'expired' WHERE id = ?").run(invite.id);
+      return { ok: false, status: 410, code: 'INVITATION_EXPIRED' };
+    }
+    const receipt = db.prepare('SELECT * FROM receipts WHERE receipt_no = ?').get(invite.receipt_no);
+    if (!receipt) {
+      return { ok: false, status: 404, code: 'RECEIPT_NOT_FOUND' };
+    }
+    if (receipt.status === 'revoked') {
+      return { ok: false, status: 410, code: 'RECEIPT_REVOKED' };
+    }
+
+    const ts = now();
+    db.prepare(`
+      UPDATE review_invitations
+      SET status = 'used', used_at = ?, used_ip = ?
+      WHERE id = ? AND used_at IS NULL
+    `).run(ts, String(clientIp || '').slice(0, 64), invite.id);
+
+    const sessionRaw = tokenUrlSafe();
+    const sessionId = cryptoId();
+    const csrf = tokenUrlSafe();
+    db.prepare(`
+      INSERT INTO review_sessions
+        (id, invitation_id, receipt_no, token_hash, csrf_secret, created_at, expires_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(sessionId, invite.id, receipt.receipt_no, sha256(sessionRaw), csrf, ts, invite.expires_at, ts);
+
+    addReviewEvent(invite.user_id, receipt.receipt_no, 'review.invitation.consumed', {
+      invitationId: invite.id,
+    });
+    return {
+      ok: true,
+      sessionToken: sessionRaw,
+      sessionId,
+      csrf,
+      receiptNo: receipt.receipt_no,
+      expiresAt: invite.expires_at,
+    };
+  });
+}
+
+export function getValidReviewSession(rawToken) {
+  if (!rawToken) return null;
+  const session = db.prepare('SELECT * FROM review_sessions WHERE token_hash = ?').get(sha256(rawToken));
+  if (!session || session.expires_at <= now()) return null;
+  const invite = db.prepare('SELECT * FROM review_invitations WHERE id = ?').get(session.invitation_id);
+  if (!invite) return null;
+  // 办理人撤销邀请后，已发出的复核会话立即失效；邀请过期同理
+  if (invite.status === 'revoked' || invite.revoked_at) return null;
+  if (invite.expires_at <= now() || effectiveInvitationStatus(invite) === 'expired') return null;
+  db.prepare('UPDATE review_sessions SET last_seen_at = ? WHERE id = ?').run(now(), session.id);
+  return { session, invite };
+}
+
+export function deleteReviewSession(rawToken) {
+  if (!rawToken) return;
+  const session = db.prepare('SELECT * FROM review_sessions WHERE token_hash = ?').get(sha256(rawToken));
+  if (session) db.prepare('DELETE FROM review_sessions WHERE id = ?').run(session.id);
+}
+
+// 复核人上下文：只能拿到会话绑定的这一份回执的脱敏内容与本人提交的异议
+export function getReviewerContext(reviewSession) {
+  const { session, invite } = reviewSession;
+  const receipt = db.prepare('SELECT * FROM receipts WHERE receipt_no = ?').get(session.receipt_no);
+  if (!receipt) return null;
+  if (receipt.status === 'revoked') {
+    return {
+      receiptNo: receipt.receipt_no,
+      status: 'revoked',
+      revokedAt: receipt.revoked_at,
+      expiresAt: Math.min(session.expires_at, invite.expires_at),
+      view: null,
+      objections: [],
+    };
+  }
+  const snapshot = JSON.parse(receipt.snapshot_json);
+  return {
+    receiptNo: receipt.receipt_no,
+    status: receipt.status,
+    issuedAt: receipt.issued_at,
+    completedAt: snapshot.completedAt,
+    expiresAt: Math.min(session.expires_at, invite.expires_at),
+    view: buildReviewView(snapshot),
+    objections: listObjectionsForReviewerTx(session.id),
+  };
+}
+
+function objectionPublic(row, { forOwner = false } = {}) {
+  const out = {
+    id: row.id,
+    receiptNo: row.receipt_no,
+    step: row.step,
+    field: row.field,
+    fieldLabel: row.field_label,
+    valueSnapshot: row.value_snapshot,
+    reason: row.reason,
+    status: row.status,
+    submittedAt: row.created_at,
+    resolvedAt: row.resolved_at || null,
+    resolveReason: row.resolve_reason || '',
+    correctionWorkflowId: row.correction_workflow_id || null,
+    correctionReceiptNo: row.correction_receipt_no || '',
+  };
+  if (forOwner) {
+    const handler = row.resolved_by_user_id ? userQueries.findById(row.resolved_by_user_id) : null;
+    out.resolvedBy = handler ? handler.display_name : '';
+    out.invitationId = row.invitation_id;
+    out.locked = Boolean(row.lock_session_id && row.status === 'open' && now() - row.locked_at < OBJECTION_LOCK_TTL_MS);
+  }
+  return out;
+}
+
+function listObjectionsForReviewerTx(sessionId) {
+  return db.prepare(`
+    SELECT * FROM review_objections WHERE session_id = ? ORDER BY created_at ASC
+  `).all(sessionId).map((row) => objectionPublic(row));
+}
+
+// 办理人视角：异议列表（默认全部，可按回执过滤）
+export function listObjectionsForOwner(userId, { receiptNo = '' } = {}) {
+  const rows = receiptNo
+    ? db.prepare('SELECT * FROM review_objections WHERE user_id = ? AND receipt_no = ? ORDER BY created_at ASC').all(userId, receiptNo)
+    : db.prepare('SELECT * FROM review_objections WHERE user_id = ? ORDER BY created_at ASC').all(userId);
+  return rows.map((row) => objectionPublic(row, { forOwner: true }));
+}
+
+export function submitReviewObjection({ reviewSession, step, field, reason, idempotencyKey, requestHash }) {
+  return immediateTransaction(() => {
+    const { session, invite } = reviewSession;
+    if (invite.status === 'revoked' || invite.revoked_at) {
+      return { ok: false, status: 410, code: 'INVITATION_REVOKED' };
+    }
+    if (invite.expires_at <= now()) {
+      return { ok: false, status: 410, code: 'INVITATION_EXPIRED' };
+    }
+    const receipt = db.prepare('SELECT * FROM receipts WHERE receipt_no = ?').get(session.receipt_no);
+    if (!receipt) return { ok: false, status: 404, code: 'RECEIPT_NOT_FOUND' };
+    if (receipt.status === 'revoked') return { ok: false, status: 410, code: 'RECEIPT_REVOKED' };
+
+    if (!Number.isInteger(step) || step < 0 || step >= STEPS.length) {
+      return { ok: false, status: 400, code: 'INVALID_FIELD', message: '异议字段不存在' };
+    }
+    const fieldInfo = reviewFieldDef(step, String(field || ''));
+    if (!fieldInfo) return { ok: false, status: 400, code: 'INVALID_FIELD', message: '异议字段不存在' };
+    const text = String(reason || '').trim();
+    if (text.length < OBJECTION_REASON_MIN || text.length > OBJECTION_REASON_MAX) {
+      return {
+        ok: false,
+        status: 400,
+        code: 'INVALID_REASON',
+        message: `异议说明需为 ${OBJECTION_REASON_MIN}-${OBJECTION_REASON_MAX} 个字符`,
+      };
+    }
+
+    // 网络重试：同一幂等键 + 同一请求指纹返回同一结果；换内容重放明确失败
+    const prior = db.prepare(`
+      SELECT * FROM review_objections WHERE session_id = ? AND idempotency_key = ?
+    `).get(session.id, idempotencyKey);
+    if (prior) {
+      if (prior.request_hash !== requestHash) {
+        return { ok: false, status: 409, code: 'OBJECTION_DUPLICATE_KEY', message: '该提交编号已用于其他内容' };
+      }
+      return { ok: true, replay: true, objection: objectionPublic(prior) };
+    }
+
+    const snapshot = JSON.parse(receipt.snapshot_json);
+    const rawValue = snapshot.steps?.[step]?.data?.[field];
+    const valueSnapshot = reviewTextValue(field, rawValue);
+    const ts = now();
+    const id = cryptoId();
+    db.prepare(`
+      INSERT INTO review_objections
+        (id, invitation_id, session_id, receipt_no, user_id, step, field, field_label,
+         value_snapshot, reason, status, idempotency_key, request_hash, created_at,
+         resolved_at, resolved_by_user_id, resolve_reason, correction_workflow_id,
+         correction_receipt_no, lock_session_id, locked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, NULL, NULL, '', NULL, '', NULL, NULL)
+    `).run(
+      id, invite.id, session.id, receipt.receipt_no, invite.user_id,
+      step, field, fieldInfo.rule.label, valueSnapshot, text,
+      idempotencyKey, requestHash, ts,
+    );
+    addReviewEvent(invite.user_id, receipt.receipt_no, 'review.objection.submitted', {
+      invitationId: invite.id, objectionId: id, step, field,
+    });
+    return { ok: true, objection: objectionPublic(db.prepare('SELECT * FROM review_objections WHERE id = ?').get(id)) };
+  });
+}
+
+// 办理人打开处理框时尝试加锁：防止两个页面同时处理同一条异议（咨询锁，最终以状态为准）
+export function lockObjectionForUser({ userId, objectionId, loginSessionId }) {
+  return immediateTransaction(() => {
+    const row = db.prepare('SELECT * FROM review_objections WHERE id = ? AND user_id = ?').get(objectionId, userId);
+    if (!row) return { ok: false, status: 404, code: 'OBJECTION_NOT_FOUND', message: '异议不存在' };
+    if (row.status !== 'open') {
+      return {
+        ok: false,
+        status: 409,
+        code: 'OBJECTION_ALREADY_HANDLED',
+        message: `该异议已处理：${row.status === 'accepted' ? '已接受' : '已驳回'}`,
+        objection: objectionPublic(row, { forOwner: true }),
+      };
+    }
+    if (row.lock_session_id && row.lock_session_id !== loginSessionId && now() - row.locked_at < OBJECTION_LOCK_TTL_MS) {
+      return { ok: false, status: 409, code: 'OBJECTION_LOCKED_BY_OTHER', message: '另一个页面正在处理该异议，请稍后刷新查看结果', objection: objectionPublic(row, { forOwner: true }) };
+    }
+    db.prepare('UPDATE review_objections SET lock_session_id = ?, locked_at = ? WHERE id = ?').run(loginSessionId, now(), row.id);
+    return { ok: true, objection: objectionPublic(db.prepare('SELECT * FROM review_objections WHERE id = ?').get(row.id), { forOwner: true }) };
+  });
+}
+
+function handledConflict(row) {
+  return {
+    ok: false,
+    status: 409,
+    code: 'OBJECTION_ALREADY_HANDLED',
+    message: `该异议已处理：${row.status === 'accepted' ? '已接受并进入更正办理' : '已驳回'}，重复提交返回同一结果`,
+    objection: objectionPublic(row, { forOwner: true }),
+  };
+}
+
+// 接受异议：必须进入一次新的更正办理（复用进行中的同源更正，或当场新建）
+export function acceptObjection({ userId, objectionId, loginSessionId }) {
+  try {
+    return immediateTransaction(() => {
+      const row = db.prepare('SELECT * FROM review_objections WHERE id = ? AND user_id = ?').get(objectionId, userId);
+      if (!row) return { ok: false, status: 404, code: 'OBJECTION_NOT_FOUND', message: '异议不存在' };
+      if (row.status !== 'open') return handledConflict(row);
+
+      const source = db.prepare('SELECT * FROM receipts WHERE receipt_no = ? AND user_id = ?').get(row.receipt_no, userId);
+      if (!source) return { ok: false, status: 404, code: 'RECEIPT_NOT_FOUND', message: '原回执不存在' };
+
+      let workflow = getActiveWorkflow(userId);
+      if (workflow && workflow.source_receipt_no !== source.receipt_no) {
+        return {
+          ok: false,
+          status: 409,
+          code: 'OPEN_WORKFLOW_EXISTS',
+          message: '已有进行中的其他办理，请先完成或放弃后再接受异议',
+          workflow: publicWorkflow(workflow, getSteps(workflow.id)),
+        };
+      }
+      let created = false;
+      if (!workflow) {
+        workflow = insertCorrectionWorkflowTx(source);
+        created = true;
+      }
+
+      const ts = now();
+      db.prepare(`
+        UPDATE review_objections
+        SET status = 'accepted', resolved_at = ?, resolved_by_user_id = ?, resolve_reason = '',
+            correction_workflow_id = ?, lock_session_id = NULL, locked_at = NULL
+        WHERE id = ? AND status = 'open'
+      `).run(ts, userId, workflow.id, row.id);
+      db.prepare(`
+        INSERT OR IGNORE INTO correction_objections (workflow_id, objection_id, created_at)
+        VALUES (?, ?, ?)
+      `).run(workflow.id, row.id, ts);
+      addReviewEvent(userId, source.receipt_no, 'review.objection.accepted', {
+        objectionId: row.id, workflowId: workflow.id, created,
+      });
+      const updated = db.prepare('SELECT * FROM review_objections WHERE id = ?').get(row.id);
+      return {
+        ok: true,
+        created,
+        objection: objectionPublic(updated, { forOwner: true }),
+        workflow: publicWorkflow(workflow, getSteps(workflow.id)),
+      };
+    });
+  } catch (error) {
+    if (String(error?.message || '').includes('UNIQUE')) {
+      const row = db.prepare('SELECT * FROM review_objections WHERE id = ?').get(objectionId);
+      if (row && row.status !== 'open') return handledConflict(row);
+    }
+    throw error;
+  }
+}
+
+// 驳回异议：必须保留理由
+export function rejectObjection({ userId, objectionId, loginSessionId, reason }) {
+  const text = String(reason || '').trim();
+  if (text.length < OBJECTION_REASON_MIN || text.length > 200) {
+    return { ok: false, status: 400, code: 'REJECT_REASON_REQUIRED', message: `驳回理由需为 ${OBJECTION_REASON_MIN}-200 个字符` };
+  }
+  return immediateTransaction(() => {
+    const row = db.prepare('SELECT * FROM review_objections WHERE id = ? AND user_id = ?').get(objectionId, userId);
+    if (!row) return { ok: false, status: 404, code: 'OBJECTION_NOT_FOUND', message: '异议不存在' };
+    if (row.status !== 'open') return handledConflict(row);
+    const ts = now();
+    db.prepare(`
+      UPDATE review_objections
+      SET status = 'rejected', resolved_at = ?, resolved_by_user_id = ?, resolve_reason = ?,
+          lock_session_id = NULL, locked_at = NULL
+      WHERE id = ? AND status = 'open'
+    `).run(ts, userId, text, row.id);
+    addReviewEvent(userId, row.receipt_no, 'review.objection.rejected', { objectionId: row.id });
+    return { ok: true, objection: objectionPublic(db.prepare('SELECT * FROM review_objections WHERE id = ?').get(row.id), { forOwner: true }) };
+  });
+}
+
+function getInvitationForOwnerTx(invitationId) {
+  const row = db.prepare('SELECT * FROM review_invitations WHERE id = ?').get(invitationId);
+  return ownerInvitation(row);
+}
+
+function ownerInvitation(row) {
+  if (!row) return null;
+  const status = row.status === 'active' && row.expires_at <= now() ? 'expired' : row.status;
+  const objections = db.prepare(`
+    SELECT * FROM review_objections WHERE invitation_id = ? ORDER BY created_at ASC
+  `).all(row.id).map((item) => objectionPublic(item, { forOwner: true }));
+  const counts = { open: 0, accepted: 0, rejected: 0 };
+  for (const item of objections) counts[item.status] += 1;
+  return {
+    id: row.id,
+    receiptNo: row.receipt_no,
+    note: row.note || '',
+    status,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    usedAt: row.used_at || null,
+    revokedAt: row.revoked_at || null,
+    objectionCount: objections.length,
+    counts,
+    objections,
+  };
+}
+
+export function listInvitationsForOwner(userId, { receiptNo = '' } = {}) {
+  const rows = receiptNo
+    ? db.prepare('SELECT * FROM review_invitations WHERE user_id = ? AND receipt_no = ? ORDER BY created_at DESC').all(userId, receiptNo)
+    : db.prepare('SELECT * FROM review_invitations WHERE user_id = ? ORDER BY created_at DESC').all(userId);
+  return rows.map((row) => ownerInvitation(row));
+}
+
+// ---------------------------------------------------------------------------
 // 对外视图
 // ---------------------------------------------------------------------------
 
@@ -822,7 +1357,56 @@ export function getTimelineForUser(userId) {
       ? { kind: 'receipt', receiptNo: entry.receiptNo, status: entry.status }
       : { kind: 'correction', workflowId: entry.workflowId, status: 'in_progress' });
   }
-  return entries;
+
+  // 复核协作条目：紧跟在对应回执之后，展示邀请与字段级异议的处理结果，
+  // 以及“接受异议 → 更正办理 → 新回执”的来源关系。
+  const invitations = db.prepare(`
+    SELECT * FROM review_invitations WHERE user_id = ? ORDER BY created_at ASC
+  `).all(userId);
+  const objectionsByReceipt = new Map();
+  for (const item of db.prepare('SELECT * FROM review_objections WHERE user_id = ? ORDER BY created_at ASC').all(userId)) {
+    if (!objectionsByReceipt.has(item.receipt_no)) objectionsByReceipt.set(item.receipt_no, []);
+    objectionsByReceipt.get(item.receipt_no).push(item);
+  }
+  const withReviews = [];
+  for (const entry of entries) {
+    withReviews.push(entry);
+    if (entry.kind !== 'receipt') continue;
+    const invs = invitations.filter((inv) => inv.receipt_no === entry.receiptNo);
+    for (const inv of invs) {
+      const invStatus = inv.status === 'active' && inv.expires_at <= now() ? 'expired' : inv.status;
+      const objs = (objectionsByReceipt.get(inv.receipt_no) || []).filter((o) => o.invitation_id === inv.id);
+      withReviews.push({
+        kind: 'review',
+        sequence: entry.sequence,
+        receiptNo: entry.receiptNo,
+        invitationId: inv.id,
+        status: invStatus,
+        createdAt: inv.created_at,
+        expiresAt: inv.expires_at,
+        usedAt: inv.used_at || null,
+        revokedAt: inv.revoked_at || null,
+        objectionCount: objs.length,
+        openCount: objs.filter((o) => o.status === 'open').length,
+        acceptedCount: objs.filter((o) => o.status === 'accepted').length,
+        rejectedCount: objs.filter((o) => o.status === 'rejected').length,
+        objections: objs.map((o) => ({
+          id: o.id,
+          step: o.step,
+          field: o.field,
+          fieldLabel: o.field_label,
+          reason: o.reason,
+          status: o.status,
+          submittedAt: o.created_at,
+          resolvedAt: o.resolved_at || null,
+          resolveReason: o.resolve_reason || '',
+          correctionReceiptNo: o.correction_receipt_no || '',
+          correctionInProgress: Boolean(o.correction_workflow_id && !o.correction_receipt_no),
+        })),
+      });
+    }
+  }
+  return withReviews;
 }
 
 // 更正预览：原回执冻结快照 vs 当前更正草稿的字段级差异。
@@ -857,5 +1441,9 @@ export function getStateForUser(userId) {
   envelope.records = listReceiptsForUser(userId);
   envelope.timeline = getTimelineForUser(userId);
   envelope.correction = getCorrectionPreviewForUser(userId);
+  envelope.reviews = {
+    invitations: listInvitationsForOwner(userId),
+    objections: listObjectionsForOwner(userId),
+  };
   return envelope;
 }

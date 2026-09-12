@@ -41,6 +41,7 @@ const els = {
   userBox: $('#userBox'), userName: $('#userName'), logoutBtn: $('#logoutBtn'), stepList: $('#stepList'),
   stateVersion: $('#stateVersion'), currentStepLabel: $('#currentStepLabel'), globalAlert: $('#globalAlert'),
   stepForm: $('#stepForm'), receiptPanel: $('#receiptPanel'), correctionPanel: $('#correctionPanel'),
+  reviewPanel: $('#reviewPanel'),
   recordsPanel: $('#recordsPanel'), recordsList: $('#recordsList'),
 };
 
@@ -52,6 +53,7 @@ const state = {
   records: [],
   timeline: [],
   correction: null,
+  reviews: { invitations: [], objections: [] },
   user: null,
   pageId: getPageId(),
   token: null,
@@ -97,6 +99,7 @@ function applyState(result) {
   state.records = Array.isArray(result.records) ? result.records : [];
   state.timeline = Array.isArray(result.timeline) ? result.timeline : [];
   state.correction = result.correction || null;
+  state.reviews = result.reviews || { invitations: [], objections: [] };
 }
 
 async function login(event) {
@@ -124,6 +127,7 @@ async function logout() {
     state.records = [];
     state.timeline = [];
     state.correction = null;
+    state.reviews = { invitations: [], objections: [] };
     showLogin();
   }
 }
@@ -152,11 +156,19 @@ function render() {
   renderCorrectionPanel();
   if (state.workflow.completed) {
     renderReceipt(state.receipt || state.viewingReceipt || null);
+    renderReviewPanel();
+    return;
+  }
+  if (state.viewingReceipt) {
+    renderReceipt(state.viewingReceipt);
+    renderReviewPanel();
     return;
   }
   state.viewingReceipt = null;
   els.receiptPanel.classList.add('hidden');
   els.receiptPanel.innerHTML = '';
+  els.reviewPanel.classList.add('hidden');
+  els.reviewPanel.innerHTML = '';
   renderCurrentStep();
 }
 
@@ -213,6 +225,81 @@ function renderTimeline() {
       correctBtn.textContent = '基于本回执发起更正';
       correctBtn.addEventListener('click', () => startCorrection(entry.receiptNo));
       actions.append(correctBtn);
+      const reviewBtn = document.createElement('button');
+      reviewBtn.type = 'button';
+      reviewBtn.className = 'link-button muted-link';
+      reviewBtn.textContent = '发起复核邀请';
+      reviewBtn.addEventListener('click', () => createReviewInvitation(entry.receiptNo));
+      actions.append(reviewBtn);
+    } else if (entry.kind === 'review') {
+      li.className = 'record-item review-item';
+      const statusMap = {
+        active: ['待使用', 'current'], used: ['已使用', 'confirmed'],
+        revoked: ['已撤销', 'invalidated'], expired: ['已过期', 'invalidated'],
+      };
+      const [statusText, statusCls] = statusMap[entry.status] || [entry.status, 'current'];
+      li.innerHTML = `
+        <div class="record-main">
+          <span>复核邀请</span>
+          <span class="badge ${statusCls}">${statusText}</span>
+        </div>
+        <div class="muted small">
+          发起于 ${formatTime(entry.createdAt)} · 有效期至 ${formatTime(entry.expiresAt)}
+          ${entry.usedAt ? `· 使用于 ${formatTime(entry.usedAt)}` : ''}
+        </div>
+        <div class="muted small">针对回执 <span class="mono">${escapeHtml(entry.receiptNo)}</span> ·
+          异议 ${entry.objectionCount} 条（待处理 ${entry.openCount} / 已接受 ${entry.acceptedCount} / 已驳回 ${entry.rejectedCount}）
+        </div>
+        <div class="review-objections"></div>
+        <div class="record-actions"></div>
+      `;
+      const objBox = li.querySelector('.review-objections');
+      (entry.objections || []).forEach((obj) => {
+        const div = document.createElement('div');
+        div.className = `review-obj ${obj.status}`;
+        const badge = { open: '待处理', accepted: '已接受', rejected: '已驳回' }[obj.status];
+        let result = '';
+        if (obj.status === 'accepted') {
+          result = obj.correctionReceiptNo
+            ? `→ 更正回执 <span class="mono">${escapeHtml(obj.correctionReceiptNo)}</span>`
+            : '→ 已进入更正办理（进行中）';
+        } else if (obj.status === 'rejected') {
+          result = `驳回理由：${escapeHtml(obj.resolveReason || '—')}`;
+        }
+        div.innerHTML = `
+          <div class="record-main">
+            <span>${escapeHtml(obj.fieldLabel)}（提交于 ${formatTime(obj.submittedAt)}）</span>
+            <span class="badge ${obj.status === 'open' ? 'current' : obj.status === 'accepted' ? 'confirmed' : 'invalidated'}">${badge}</span>
+          </div>
+          <div class="small">${escapeHtml(obj.reason)}</div>
+          ${result ? `<div class="small review-obj-result">${result}</div>` : ''}
+          <div class="review-obj-actions"></div>`;
+        const objActions = div.querySelector('.review-obj-actions');
+        if (obj.status === 'open') {
+          const acceptBtn = document.createElement('button');
+          acceptBtn.type = 'button';
+          acceptBtn.className = 'link-button';
+          acceptBtn.textContent = '接受（进入更正办理）';
+          acceptBtn.addEventListener('click', () => acceptObjection(obj.id));
+          objActions.append(acceptBtn);
+          const rejectBtn = document.createElement('button');
+          rejectBtn.type = 'button';
+          rejectBtn.className = 'link-button muted-link';
+          rejectBtn.textContent = '驳回（填写理由）';
+          rejectBtn.addEventListener('click', () => rejectObjection(obj.id));
+          objActions.append(rejectBtn);
+        }
+        objBox.append(div);
+      });
+      const actions = li.querySelector('.record-actions');
+      if (entry.status === 'active') {
+        const revokeBtn = document.createElement('button');
+        revokeBtn.type = 'button';
+        revokeBtn.className = 'link-button danger-link';
+        revokeBtn.textContent = '撤销邀请（立即失效）';
+        revokeBtn.addEventListener('click', () => revokeInvitation(entry.invitationId));
+        actions.append(revokeBtn);
+      }
     } else {
       const isCorrection = entry.kind === 'correction';
       li.className = 'record-item in-progress';
@@ -619,8 +706,10 @@ async function loadReceipt(receiptNo) {
   try {
     const result = await api('GET', `/api/receipts/${encodeURIComponent(receiptNo)}`);
     state.viewingReceipt = result.receipt;
+    if (result.reviews) state.reviews = result.reviews;
     renderReceipt(result.receipt);
-    els.receiptPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    renderReviewPanel();
+    els.reviewPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch (error) {
     showAlert(error.message || '回执加载失败', 'error');
   }
@@ -719,6 +808,237 @@ async function revokeCurrentReceipt(receipt) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 回执复核协作（办理人侧）
+// ---------------------------------------------------------------------------
+
+// 当前回执的复核邀请与异议（仅完成视图下展示）
+function renderReviewPanel() {
+  const panel = els.reviewPanel;
+  if (!panel) return;
+  const receiptNo = state.receipt?.receiptNo || state.viewingReceipt?.receiptNo;
+  if (!receiptNo) {
+    panel.classList.add('hidden');
+    panel.innerHTML = '';
+    return;
+  }
+  panel.classList.remove('hidden');
+  const invitations = (state.reviews.invitations || []).filter((inv) => inv.receiptNo === receiptNo);
+  const objections = (state.reviews.objections || []).filter((obj) => obj.receiptNo === receiptNo);
+  if (!invitations.length && !objections.length) {
+    panel.innerHTML = `
+      <div class="receipt-head"><h2>回执复核协作</h2></div>
+      <p class="muted small">尚未发起复核邀请。办理人可创建一个限时、只能使用一次的复核链接；复核人无需登录，完成邀请校验后只能查看这一份回执的脱敏内容，并针对具体字段提交异议。</p>
+      <div class="receipt-actions">
+        <button class="button secondary" type="button" data-action="new-review">创建限时复核邀请</button>
+      </div>`;
+    panel.querySelector('[data-action="new-review"]')?.addEventListener('click', () => createReviewInvitation(receiptNo));
+    return;
+  }
+
+  const counts = { open: 0, accepted: 0, rejected: 0 };
+  objections.forEach((o) => { counts[o.status] += 1; });
+  const invHtml = invitations.map((inv) => {
+    const badge = {
+      active: ['待使用', 'current'], used: ['已使用', 'confirmed'],
+      revoked: ['已撤销', 'invalidated'], expired: ['已过期', 'invalidated'],
+    }[inv.status] || [inv.status, 'current'];
+    return `
+      <li class="review-invite ${inv.status}">
+        <div class="record-main">
+          <span>邀请 · 有效期至 ${formatTime(inv.expiresAt)}</span>
+          <span class="badge ${badge[1]}">${badge[0]}</span>
+        </div>
+        <div class="muted small">发起于 ${formatTime(inv.createdAt)}${inv.usedAt ? ` · 使用于 ${formatTime(inv.usedAt)}` : ''} · 异议 ${inv.objectionCount} 条</div>
+        <div class="record-actions" data-invite="${escapeHtml(inv.id)}"></div>
+      </li>`;
+  }).join('');
+  const objHtml = objections.map((obj) => {
+    const badge = { open: ['待处理', 'current'], accepted: ['已接受', 'confirmed'], rejected: ['已驳回', 'invalidated'] }[obj.status];
+    let result = '';
+    if (obj.status === 'accepted') {
+      result = obj.correctionReceiptNo
+        ? `已进入更正办理，新回执：<b class="mono">${escapeHtml(obj.correctionReceiptNo)}</b>`
+        : '已接受，更正办理进行中';
+    } else if (obj.status === 'rejected') {
+      result = `驳回理由：${escapeHtml(obj.resolveReason || '—')}`;
+    }
+    return `
+      <li class="objection-item ${obj.status}" data-objection="${escapeHtml(obj.id)}">
+        <div class="record-main">
+          <b>${escapeHtml(obj.fieldLabel)}</b>
+          <span class="badge ${badge[1]}">${badge[0]}</span>
+        </div>
+        <div class="muted small">提交于 ${formatTime(obj.submittedAt)} · 提交时脱敏值：${escapeHtml(obj.valueSnapshot || '—')}</div>
+        <div>${escapeHtml(obj.reason)}</div>
+        ${result ? `<div class="small review-obj-result">${result}${obj.resolvedAt ? ` · 处理于 ${formatTime(obj.resolvedAt)}` : ''}</div>` : ''}
+        <div class="record-actions" data-obj-actions="${escapeHtml(obj.id)}"></div>
+      </li>`;
+  }).join('');
+  panel.innerHTML = `
+    <div class="receipt-head">
+      <h2>回执复核协作</h2>
+      <span class="badge current">待处理 ${counts.open} · 已接受 ${counts.accepted} · 已驳回 ${counts.rejected}</span>
+    </div>
+    <div class="receipt-actions">
+      <button class="button secondary" type="button" data-action="new-review">创建限时复核邀请</button>
+    </div>
+    <h3>复核邀请（限时、一次性）</h3>
+    <ul class="objection-list">${invHtml || '<li class="muted small">无</li>'}</ul>
+    <h3>字段异议与处理结果</h3>
+    <ul class="objection-list">${objHtml || '<li class="muted small">暂无异议</li>'}</ul>`;
+  panel.querySelector('[data-action="new-review"]')?.addEventListener('click', () => createReviewInvitation(receiptNo));
+  invitations.forEach((inv) => {
+    const box = panel.querySelector(`[data-invite="${cssEscape(inv.id)}"]`);
+    if (!box) return;
+    if (inv.status === 'active') {
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'link-button';
+      copyBtn.textContent = '复制邀请链接';
+      copyBtn.addEventListener('click', () => copyReviewLink(inv.id));
+      box.append(copyBtn);
+      const revokeBtn = document.createElement('button');
+      revokeBtn.type = 'button';
+      revokeBtn.className = 'link-button danger-link';
+      revokeBtn.textContent = '撤销邀请';
+      revokeBtn.addEventListener('click', () => revokeInvitation(inv.id));
+      box.append(revokeBtn);
+    }
+  });
+  objections.forEach((obj) => {
+    if (obj.status !== 'open') return;
+    const box = panel.querySelector(`[data-obj-actions="${cssEscape(obj.id)}"]`);
+    if (!box) return;
+    const acceptBtn = document.createElement('button');
+    acceptBtn.type = 'button';
+    acceptBtn.className = 'link-button';
+    acceptBtn.textContent = '接受（进入新的更正办理）';
+    acceptBtn.addEventListener('click', () => acceptObjection(obj.id));
+    box.append(acceptBtn);
+    const rejectBtn = document.createElement('button');
+    rejectBtn.type = 'button';
+    rejectBtn.className = 'link-button muted-link';
+    rejectBtn.textContent = '驳回（保留理由）';
+    rejectBtn.addEventListener('click', () => rejectObjection(obj.id));
+    box.append(rejectBtn);
+  });
+}
+
+function cssEscape(value) {
+  if (window.CSS && CSS.escape) return CSS.escape(value);
+  return value.replace(/["\\]/g, '\\$&');
+}
+
+async function createReviewInvitation(receiptNo) {
+  const input = window.prompt('复核邀请有效期（小时，1-168，默认 72）：', '72');
+  if (input === null) return;
+  let hours = Number(String(input).trim() || '72');
+  if (!Number.isFinite(hours) || hours < 1 / 60 || hours > 168) {
+    showAlert('有效期需在 1 小时到 168 小时（7 天）之间。', 'error');
+    return;
+  }
+  const note = window.prompt('给本次复核的备注（可留空）：', '') || '';
+  if (note === null || state.busy) return;
+  state.busy = true;
+  try {
+    const result = await api('POST', '/api/reviews/invitations', {
+      receiptNo,
+      ttlMinutes: Math.round(hours * 60),
+      note: String(note).slice(0, 200),
+    });
+    state.reviews.invitations = [result.invitation, ...(state.reviews.invitations || [])];
+    const link = `${location.origin}${result.url}`;
+    await copyText(link, '复核邀请链接已复制（只能使用一次）');
+    showAlert('复核邀请已创建，链接已复制：' + link, 'success');
+    render();
+  } catch (error) {
+    showAlert(`创建复核邀请失败：${error.message || '请稍后重试'}`, 'error');
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function revokeInvitation(invitationId) {
+  const ok = window.confirm('撤销后该邀请链接立即失效，复核人即使打开过页面也不能继续查看或提交异议。确定撤销吗？');
+  if (!ok || state.busy) return;
+  state.busy = true;
+  try {
+    const result = await api('POST', `/api/reviews/invitations/${encodeURIComponent(invitationId)}/revoke`, {});
+    if (result.reviews) state.reviews = result.reviews;
+    showAlert('复核邀请已撤销。', 'warning');
+    await boot();
+  } catch (error) {
+    showAlert(`撤销失败：${error.message || '请稍后重试'}`, 'error');
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function acceptObjection(objectionId) {
+  const ok = window.confirm(
+    '接受该异议后将立即进入一次新的更正办理：\n\n'
+    + '· 原回执内容保持冻结，不会被覆盖；\n'
+    + '· 系统创建新的办理记录并以原回执预填草稿；\n'
+    + '· 新流程完成后生成新回执，时间线会展示来源关系。',
+  );
+  if (!ok || state.busy) return;
+  state.busy = true;
+  try {
+    // 先尝试加锁，避免两个页面同时处理
+    try {
+      await api('POST', `/api/reviews/objections/${encodeURIComponent(objectionId)}/lock`, {});
+    } catch { /* 锁失败时由最终接受接口判定 */ }
+    const result = await api('POST', `/api/reviews/objections/${encodeURIComponent(objectionId)}/accept`, {});
+    state.reviews = result.reviews || state.reviews;
+    state.records = result.records || state.records;
+    state.timeline = result.timeline || state.timeline;
+    state.correction = result.correction || null;
+    showAlert(result.createdCorrection
+      ? '已接受异议并创建新的更正办理记录，可在更正预览中修改内容后逐步确认。'
+      : '已接受异议，已关联到当前进行中的同源更正办理。', 'success');
+    await boot();
+  } catch (error) {
+    if (error.body?.alreadyHandled && error.body.objection) {
+      showAlert(`该异议已被另一个页面处理（状态：${error.body.objection.status === 'accepted' ? '已接受' : '已驳回'}），刷新后展示同一结果。`, 'warning');
+    } else {
+      showAlert(`接受失败：${error.message || explainConflict(error.body?.error?.code)}`, 'error');
+    }
+    await boot();
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function rejectObjection(objectionId) {
+  const reason = window.prompt('请填写驳回理由（2-200 字，将保留并展示给办理人侧留档）：', '');
+  if (reason === null || state.busy) return;
+  const trimmed = String(reason).trim();
+  if (trimmed.length < 2 || trimmed.length > 200) {
+    showAlert('驳回理由需为 2-200 个字符。', 'error');
+    return;
+  }
+  state.busy = true;
+  try {
+    try {
+      await api('POST', `/api/reviews/objections/${encodeURIComponent(objectionId)}/lock`, {});
+    } catch { /* ignore */ }
+    const result = await api('POST', `/api/reviews/objections/${encodeURIComponent(objectionId)}/reject`, { reason: trimmed });
+    state.reviews = result.reviews || state.reviews;
+    showAlert('异议已驳回，理由已保留。', 'warning');
+    render();
+  } catch (error) {
+    if (error.body?.alreadyHandled && error.body.objection) {
+      showAlert(`该异议已被另一个页面处理（状态：${error.body.objection.status === 'accepted' ? '已接受' : '已驳回'}），刷新后展示同一结果。`, 'warning');
+    } else {
+      showAlert(`驳回失败：${error.message || '请稍后重试'}`, 'error');
+    }
+    await boot();
+  } finally {
+    state.busy = false;
+  }
+}
+
 function updateTokenStatus(prefix = '') {
   const el = els.stepForm?.querySelector('[data-token-status]');
   if (!el) return;
@@ -764,6 +1084,12 @@ function explainConflict(code) {
     NO_CORRECTION_IN_PROGRESS: '当前没有进行中的更正。',
     RECEIPT_NOT_FOUND: '回执不存在或不属于当前账号。',
     RECEIPT_ALREADY_REVOKED: '该回执已经处于撤销状态。',
+    OBJECTION_ALREADY_HANDLED: '该异议已被处理，重复提交返回同一结果。',
+    OBJECTION_LOCKED_BY_OTHER: '另一个页面正在处理该异议，请稍后刷新查看结果。',
+    OBJECTION_NOT_FOUND: '异议不存在。',
+    OPEN_WORKFLOW_EXISTS: '已有进行中的办理，请先完成或放弃后再接受异议。',
+    INVITATION_ALREADY_USED: '邀请链接已被使用，不能撤销。',
+    INVITATION_ALREADY_REVOKED: '邀请已处于撤销状态。',
   }[code] || '请求被服务端拒绝。';
 }
 

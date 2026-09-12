@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>回执复核</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell narrow-shell">
+    <header class="topbar">
+      <div>
+        <h1>回执复核</h1>
+        <p class="subtitle">复核人无需登录，但必须先通过一次性邀请校验；仅可查看本邀请绑定回执的脱敏内容</p>
+      </div>
+    </header>
+
+    <section id="validateView" class="card">
+      <h2>邀请校验</h2>
+      <p class="muted small">点击办理人发来的复核链接即可自动校验。链接只能使用一次，过期或被撤销后将明确失败。</p>
+      <form id="validateForm">
+        <label>邀请令牌（也可粘贴完整链接）
+          <textarea name="token" rows="3" required placeholder="/review?t=……"></textarea>
+        </label>
+        <div id="validateError" class="alert error hidden"></div>
+        <button class="button primary" type="submit">完成校验并查看复核内容</button>
+      </form>
+    </section>
+
+    <section id="reviewView" class="hidden">
+      <div id="reviewAlert" class="alert hidden"></div>
+
+      <section class="card">
+        <div class="receipt-head">
+          <h2>复核回执（脱敏）</h2>
+          <span id="reviewStatus" class="status-pill completed"></span>
+        </div>
+        <div class="receipt-meta">
+          <div><span class="muted">回执编号</span><b id="receiptNo" class="mono selectable"></b></div>
+          <div><span class="muted">最终完成时间</span><b id="completedAt"></b></div>
+          <div><span class="muted">复核会话截止</span><b id="expiresAt"></b></div>
+        </div>
+        <p class="muted small">
+          以下为脱敏后的回执内容：姓名、手机号、证件号码与详细地址均已遮罩；
+          本页面只能查看这一份回执，不能通过任何链接参数查看其他回执。
+        </p>
+        <div id="reviewFields"></div>
+      </section>
+
+      <section class="card">
+        <h2>提交字段异议</h2>
+        <p class="muted small">请针对具体字段填写异议与说明，提交后会记录提交时间与处理结果；同一条提交的网络重试不会产生第二条异议。</p>
+        <form id="objectionForm">
+          <label>有异议的字段
+            <select name="field" id="objectionField" required></select>
+          </label>
+          <label>异议说明（2-500 字）
+            <textarea name="reason" rows="4" required minlength="2" maxlength="500" placeholder="请说明该字段存在的问题及正确情况（请勿填写完整证件号码等敏感信息）"></textarea>
+          </label>
+          <div id="objectionError" class="alert error hidden"></div>
+          <button class="button primary" type="submit">提交异议</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>我提交的异议与处理结果</h2>
+        <ul id="objectionList" class="objection-list"></ul>
+      </section>
+
+      <div class="form-actions">
+        <button class="button secondary" id="exitReview" type="button">退出复核（清除本机会话）</button>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="/review.js"></script>
+</body>
+</html>

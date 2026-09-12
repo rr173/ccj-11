@@ -111,6 +111,29 @@ a.button { display: inline-block; text-decoration: none; }
 .status-line { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
 .verify-foot { max-width: 560px; margin: 24px auto 0; text-align: center; font-size: 12px; line-height: 1.7; }
 
+/* 回执复核协作 */
+.narrow-shell { max-width: 860px; }
+.record-item.review-item { border-color: #7a5af8; background: #f5f3ff; }
+.review-objections { display: grid; gap: 6px; margin-top: 8px; }
+.review-obj { border: 1px solid #ddd6fe; border-radius: 8px; padding: 6px 10px; background: #fff; }
+.review-obj.accepted { border-color: #1d8a53; background: #f6fef9; }
+.review-obj.rejected { border-color: #fecdca; background: #fffbfa; }
+.review-obj-result { color: #475467; margin-top: 2px; }
+.objection-list { list-style: none; margin: 8px 0 14px; padding: 0; display: grid; gap: 10px; }
+.objection-item { border: 1px solid #dce2ec; border-radius: 10px; padding: 10px 12px; background: #f8fafc; }
+.objection-item.accepted { border-color: #1d8a53; background: #f6fef9; }
+.objection-item.rejected { border-color: #fecdca; background: #fffbfa; }
+.objection-reason { margin: 6px 0; }
+.objection-result { margin-top: 6px; font-size: 13px; }
+.objection-result.accepted { color: #05603a; }
+.objection-result.rejected { color: #b42318; }
+.objection-result.pending { color: #647084; }
+.review-invite.used { opacity: .85; }
+.review-invite.revoked, .review-invite.expired { opacity: .7; }
+.review-table td:last-child { width: 1%; white-space: nowrap; text-align: right; }
+.review-step { padding: 10px 12px; }
+.danger-link { color: #b42318 !important; }
+
 .hidden { display: none !important; }
 @media (max-width: 760px) { .app { grid-template-columns: 1fr; } .topbar { align-items: flex-start; } .receipt-meta { grid-template-columns: 1fr; } .top-actions { flex-direction: column; align-items: flex-end; } }
 @media print {

@@ -40,6 +40,7 @@ docker compose up -d --build
 - 会话、一次性令牌的已使用/已撤销/过期状态
 - 提交幂等记录和审计事件
 - **全部电子回执（固定快照、状态、撤销留档）**
+- **复核邀请、免登录复核会话、字段异议与处理结果、异议→更正→新回执来源关系**
 - **回执核验码密钥 `receipt-secret.key`（核验能力依赖它，务必随数据卷备份）**
 
 默认监听 3000。若由反向代理终止 HTTPS，请设置：
@@ -149,6 +150,58 @@ COOKIE_SECURE: "1"
 
 `POST /api/corrections?action=abandon`：删除更正产生的新办理记录及其草稿/令牌/提交，**原回执的内容、状态与核验结果完全不受影响**；放弃后可基于原回执重新发起更正。非更正的首次办理不能通过该接口关闭（`NOT_A_CORRECTION`）。
 
+若被放弃的更正回应了已接受的复核异议，这些异议会自动回到“待处理”，可再次接受或驳回。
+
+## 回执复核协作
+
+办理人可在**已签发回执**上发起限时、一次性的复核邀请；复核人**无需登录**，完成邀请校验后只能查看链接绑定的那一份回执的**脱敏内容**，并针对具体字段提交异议。办理人逐条接受或驳回：接受必须进入一次新的更正办理，驳回必须保留理由。
+
+### 1. 限时、一次性、强绑定单份回执的邀请
+
+- `POST /api/reviews/invitations { receiptNo, ttlMinutes }`（登录态）只允许回执本人创建；有效期默认 1 小时～7 天（`REVIEW_INVITE_MIN_TTL_MS` / `REVIEW_INVITE_MAX_TTL_MS`，默认 3 天）。
+- 邀请令牌为 256 位随机值，数据库只存 SHA-256 哈希；链接形如 `/review?t=…`，完整令牌只在创建当次返回一次（与核验码同等对待）。
+- **只能使用一次**：`POST /api/review/validate` 在一个 `BEGIN IMMEDIATE` 事务中把邀请置为 `used` 并创建复核会话；再次使用同链接明确失败：
+
+| 情况 | HTTP | 错误码 |
+| --- | --- | --- |
+| 令牌不存在/格式错误 | 404/400 | `INVITATION_NOT_FOUND` / `INVALID_INVITATION` |
+| 邀请已过期 | 410 | `INVITATION_EXPIRED` |
+| 邀请已被办理人撤销 | 410 | `INVITATION_REVOKED` |
+| 链接已被使用过（重复校验） | 410 | `INVITATION_ALREADY_USED` |
+| 回执已撤销 | 410 | `RECEIPT_REVOKED` |
+| 校验尝试过频 | 429 | `TOO_MANY_REQUESTS` |
+
+- 办理人可在邀请使用前撤销（`POST /api/reviews/invitations/{id}/revoke`）；撤销后即使复核人已打开页面，后续查看与提交也立即失效。已使用的邀请不能撤销（`INVITATION_ALREADY_USED`）。
+- 校验接口按来源 IP 滑动窗口限流（复用核验限流参数）。
+
+### 2. 免登录复核会话：只看这一份回执的脱敏内容
+
+- 校验成功后下发 HttpOnly 会话 Cookie（`rid`，数据库仅存哈希）与独立 CSRF Cookie（`rcsrf`），有效期不超过邀请有效期；刷新页面、重新打开浏览器、服务重启后会话仍保留（持久化在 SQLite）。
+- `GET /api/review/context` 只返回**会话绑定的那一份回执**的脱敏视图：姓名/手机号/证件号码/详细地址全部遮罩（脱敏在服务端完成，响应中不出现原值）；没有会话或会话随邀请过期/撤销时一律 `401 REVIEW_SESSION_REQUIRED`。
+- 复核会话无法用于查看其他回执：任何提交若携带其他回执编号，返回 `403 REVIEW_RECEIPT_MISMATCH`；系统本身不提供任何按编号查询他人/他份回执的免登录接口。
+- 写接口（提交异议）要求复核会话自带的双提交 CSRF，缺失返回 `403 REVIEW_CSRF_INVALID`。
+
+### 3. 字段级异议：状态、提交时间、处理人与处理结果全部留档
+
+- `POST /api/review/objections { step, field, reason, idempotencyKey }`：字段必须是该回执真实步骤中的字段（否则 `INVALID_FIELD`），说明 2-500 字（`INVALID_REASON`）；提交时记录脱敏字段值快照、提交时间。
+- 网络重试复用同一 `idempotencyKey` 且请求指纹一致时返回同一条异议（`replay: true`）；同一编号换内容重放返回 `409 OBJECTION_DUPLICATE_KEY`。
+- 异议状态机：`open → accepted | rejected`，记录 `resolvedAt`、处理人（`resolvedBy`）、处理结果；驳回理由（2-200 字）持久化保存（`REJECT_REASON_REQUIRED`）。
+- **同一条异议不能被两个页面同时处理**：处理前可先 `POST …/lock` 取得 60 秒咨询锁（另一会话得到 `OBJECTION_LOCKED_BY_OTHER`）；终局的接受/驳回在写事务中以 `status='open'` 为唯一判定条件，两个会话并发终局决定只有一个成功，另一个得到 `409 OBJECTION_ALREADY_HANDLED` 并返回**同一条已存在的结果**，前端明确显示“已处理”。
+
+### 4. 接受异议必须进入新的更正办理，原回执不被覆盖
+
+- 接受（`POST …/{id}/accept`）在同一事务内：异议置为 `accepted` + 复用既有“同源进行中更正”或创建一条 `source_receipt_no` 指向该回执的新更正办理（草稿用原回执预填），并通过 `correction_objections` 留下来源关联。
+- 已有进行中的**其他**办理时接受明确失败（`409 OPEN_WORKFLOW_EXISTS`）。
+- 更正完成签发新回执时，新回执编号回填到异议（`correctionReceiptNo`）；原回执快照、核验码、核验结果始终不变。
+- 放弃更正会把关联的已接受异议重新置为 `open`，可再次处理。
+
+### 5. 持久化与时间线
+
+- 邀请、复核会话、异议、处理结果与关联全部存入 SQLite（`review_invitations` / `review_sessions` / `review_objections` / `correction_objections`），刷新、重新登录或服务重启后保留；审计事件（`review.invitation.created/consumed/revoked`、`review.objection.submitted/accepted/rejected/reopened`、`review.correction.completed`）写入回执对应办理记录。
+- `/api/state` 时间线在对应回执之后插入 `kind: 'review'` 条目：邀请状态（待使用/已使用/已撤销/已过期）、异议数量、每条异议的字段、说明、提交时间、处理结果，以及“接受异议 → 更正办理 → 新回执”的来源关系；更正完成后条目直接展示新回执编号。
+- 办理人界面：回执卡片下方“回执复核协作”面板可创建邀请、复制/撤销链接、逐条接受/驳回；时间线条目内也可直接处理。复核人界面：`GET /review` 展示脱敏字段（每个字段可一键发起异议）、异议提交表单与本人异议的处理结果。
+
+
 ## 关键安全语义（原流程）
 
 ### 服务端以当前进度为准
@@ -191,10 +244,22 @@ COOKIE_SECURE: "1"
 | POST | `/api/receipts/{no}?action=revoke` | 是 | 撤销回执（只改状态、留档） |
 | POST | `/api/corrections` | 是 | 基于某回执发起更正（新建办理记录，草稿用原回执预填） |
 | GET | `/api/corrections/preview` | 是 | 原回执 vs 当前更正草稿的字段级差异（敏感字段遮罩） |
-| POST | `/api/corrections?action=abandon` | 是 | 放弃进行中的更正（原回执不受影响） |
+| POST | `/api/corrections?action=abandon` | 是 | 放弃进行中的更正（原回执不受影响；关联异议回到待处理） |
+| POST | `/api/reviews/invitations` | 是 | 创建限时、一次性的复核邀请（返回一次性链接） |
+| GET | `/api/reviews/invitations?receiptNo=` | 是 | 复核邀请清单（含各邀请下异议与处理结果） |
+| POST | `/api/reviews/invitations/{id}/revoke` | 是 | 撤销未使用的复核邀请（已使用不可撤销） |
+| GET | `/api/reviews/objections?receiptNo=` | 是 | 字段异议清单（状态、提交时间、处理人、处理结果） |
+| POST | `/api/reviews/objections/{id}/lock` | 是 | 咨询锁：占位处理该异议（60 秒） |
+| POST | `/api/reviews/objections/{id}/accept` | 是 | 接受异议：进入/复用同源更正办理 |
+| POST | `/api/reviews/objections/{id}/reject` | 是 | 驳回异议（必须提供理由） |
+| POST | `/api/review/validate` | 否 | 一次性邀请校验，成功后建立免登录复核会话 |
+| GET | `/api/review/context` | 否 | 当前复核会话绑定回执的脱敏内容与本人异议 |
+| POST | `/api/review/objections` | 否 | 复核人提交字段异议（需复核会话 + CSRF，幂等） |
+| POST | `/api/review/logout` | 否 | 退出并清除本机会话 |
 | POST | `/api/verify` | 否 | 编号+核验码核验，仅返回脱敏结果，按 IP 限流 |
 | GET | `/api/public/receipts/{no}/print?code=` | 否 | 脱敏可打印回执文档 |
 | GET | `/verify` | 否 | 免登录核验页面 |
+| GET | `/review` | 否 | 免登录复核页面（先完成邀请校验） |
 
 所有非 GET 的登录态接口要求 `X-CSRF-Token`。会话 Cookie 为 `HttpOnly; SameSite=Lax`，HTTPS 环境可启用 `Secure`。
 
@@ -203,9 +268,13 @@ COOKIE_SECURE: "1"
 - `workflows`：多条记录（`sequence`、`status`、`source_receipt_no`），部分唯一索引保证每人至多一条 `open`、同一回执至多一条进行中的更正
 - `workflow_steps.draft_json / confirmed_json / confirmed_at`：草稿与服务端确认
 - `receipts`：回执编号（唯一）、固定快照、状态（`issued`/`revoked`）、撤销时间与原因
+- `review_invitations`：复核邀请（令牌只存哈希、有效期、`active/used/revoked/expired` 状态、使用时间/来源）
+- `review_sessions`：免登录复核会话（只存令牌哈希、绑定邀请与单份回执、独立 CSRF、有效期）
+- `review_objections`：字段级异议（字段、脱敏值快照、说明、`open/accepted/rejected`、提交/处理时间、处理人、驳回理由、关联更正办理与新回执编号、咨询锁、幂等键）
+- `correction_objections`：已接受异议与因此进入的更正办理的多对多来源关系
 - `tokens`：令牌哈希、绑定维度、过期、使用、撤销状态
 - `submissions`：幂等键、请求指纹、提交和确认结果
-- `events`：创建、草稿、确认、退回、签发回执、撤销、更正创建等审计事件
+- `events`：创建、草稿、确认、退回、签发回执、撤销、更正创建、复核邀请/异议/处理等审计事件
 
 SQLite 启用 WAL 和外键；所有推进与回执签发都在同步 `BEGIN IMMEDIATE` 事务中完成。首次用新版启动旧版数据库时会自动迁移表结构并为已完成记录补签回执。
 
@@ -221,6 +290,9 @@ SQLite 启用 WAL 和外键；所有推进与回执签发都在同步 `BEGIN IMM
 | `DEMO_PASSWORD` | `password123` | 演示账号密码 |
 | `RECEIPT_SECRET` | 空 | 核验码 HMAC 密钥；空则用密钥文件 |
 | `RECEIPT_SECRET_PATH` | `data/receipt-secret.key` | 自动生成的密钥文件路径（0600） |
-| `VERIFY_RATE_MAX` | `20` | 单 IP 限流窗口内最大核验次数 |
-| `VERIFY_RATE_WINDOW_MS` | `900000` | 限流窗口长度 |
+| `VERIFY_RATE_MAX` | `20` | 单 IP 限流窗口内最大核验次数（复核邀请校验共用） |
+| `VERIFY_RATE_WINDOW_MS` | `900000` | 限流窗口长度（复核邀请校验共用） |
+| `REVIEW_INVITE_TTL_MS` | `259200000` | 复核邀请默认有效期（3 天） |
+| `REVIEW_INVITE_MIN_TTL_MS` | `300000` | 复核邀请允许的最短有效期（5 分钟） |
+| `REVIEW_INVITE_MAX_TTL_MS` | `604800000` | 复核邀请允许的最长有效期（7 天） |
 | `DISPLAY_TIMEZONE` | `Asia/Shanghai` | 回执文档时间展示时区 |
