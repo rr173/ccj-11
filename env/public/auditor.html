@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>审计归档查阅（审计员）</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <h1>审计归档查阅</h1>
+        <p class="subtitle">仅展示归档创建时角色授权的脱敏字段、来源关系与摘要链校验结果</p>
+      </div>
+      <div class="top-actions">
+        <span id="userName" class="user-box"></span>
+        <button id="logoutBtn" class="button secondary" type="button">退出</button>
+      </div>
+    </header>
+
+    <section id="loginView" class="card login-card">
+      <h2>审计员登录</h2>
+      <p class="muted">演示审计员账号：auditor1 / password123（auditor2 为未授权对照账号）</p>
+      <form id="loginForm">
+        <label>用户名<input name="username" autocomplete="username" required></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+        <div id="loginError" class="alert error hidden"></div>
+        <button class="button primary" type="submit">登录</button>
+      </form>
+    </section>
+
+    <section id="appView" class="app hidden">
+      <div id="globalAlert" class="alert hidden"></div>
+      <section class="card">
+        <h2>获授权归档（按各归档创建时的权限快照）</h2>
+        <div id="archiveList" class="archive-list"></div>
+      </section>
+      <section id="detailView" class="card hidden"></section>
+    </section>
+  </main>
+  <script type="module" src="/auditor.js"></script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>审计归档外部核验</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell narrow-shell">
+    <header class="topbar">
+      <div>
+        <h1>审计归档外部核验</h1>
+        <p class="subtitle">凭一次性核验码查看事件数量、时间范围、摘要链连续性与最终状态</p>
+      </div>
+      <div class="top-actions">
+        <a class="button secondary" href="/verify">回执核验</a>
+      </div>
+    </header>
+
+    <section class="card login-card">
+      <form id="verifyForm">
+        <label>一次性核验码
+          <input name="code" autocomplete="off" required placeholder="粘贴办理人提供的一次性核验码">
+        </label>
+        <input type="hidden" name="archiveId" id="archiveId">
+        <div id="verifyError" class="alert error hidden"></div>
+        <button class="button primary" type="submit">核验归档</button>
+        <p class="muted small">每个核验码只能使用一次；本页面不提供任何归档原文、证件号码或地址。</p>
+      </form>
+    </section>
+
+    <section id="resultView" class="card hidden">
+      <h2>核验结果</h2>
+      <div id="resultBox"></div>
+    </section>
+  </main>
+  <script type="module" src="/archive-verify.js"></script>
+</body>
+</html>

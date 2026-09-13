@@ -26,6 +26,15 @@ export const config = {
   // 优先使用 RECEIPT_SECRET；否则在数据目录生成 0600 权限的密钥文件（随 Docker volume 持久化）。
   receiptSecret: process.env.RECEIPT_SECRET || '',
   receiptSecretPath: process.env.RECEIPT_SECRET_PATH || path.join(path.dirname(dbPath), 'receipt-secret.key'),
+  // 审计归档导出：后台任务分块生成（每块事件数与处理间隔可经环境变量调小以便测试）
+  archiveExportChunkSize: Number(process.env.ARCHIVE_EXPORT_CHUNK_SIZE || 50),
+  // 已完成导出文件与一次性下载凭证的保留期（到期后台清理）
+  archiveExportTtlMs: Number(process.env.ARCHIVE_EXPORT_TTL_MS || 24 * 60 * 60 * 1000),
+  // 一次性下载凭证 / 外部核验码的有效期
+  archiveCredentialTtlMs: Number(process.env.ARCHIVE_CREDENTIAL_TTL_MS || 15 * 60 * 1000),
+  archiveExternalCodeTtlMs: Number(process.env.ARCHIVE_EXTERNAL_CODE_TTL_MS || 24 * 60 * 60 * 1000),
+  // 导出任务的后台扫描间隔（断点续传、过期清理；设 NO_ARCHIVE_SWEEP=1 关闭定时器）
+  archiveSweepMs: Number(process.env.ARCHIVE_SWEEP_MS || 1000),
 };
 
 config.isProduction = config.nodeEnv === 'production';

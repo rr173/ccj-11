@@ -88,6 +88,23 @@ import {
   listGroupablePackages,
   sweepCaseGroupTimeouts,
   recoverCaseGroupsOnStartup,
+  createAuditArchive,
+  getArchiveForOwner,
+  getArchiveForAuditor,
+  listArchivesForOwner,
+  listArchivesForAuditor,
+  listArchiveRejectionsForOwner,
+  issueExternalCode,
+  consumeExternalCode,
+  startArchiveExport,
+  getArchiveExportForOwner,
+  listArchiveExportsForOwner,
+  cancelArchiveExport,
+  issueDownloadCredential,
+  redeemDownloadCredential,
+  listCredentialsForOwner,
+  sweepArchiveExports,
+  recoverArchiveExportsOnStartup,
 } from './db.js';
 import { validateDraft, validateStepPayload } from './validation.js';
 import { stableStringify } from './crypto.js';
@@ -119,6 +136,13 @@ import {
   parseCaseGroupConfigInput,
   CASE_GROUP_ERRORS,
 } from './caseGroups.js';
+import {
+  parseArchiveCreateInput,
+  parseAuditorGrants,
+  ARCHIVE_ERRORS,
+  ARCHIVE_SOURCE_LABELS,
+  isValidArchiveSourceType,
+} from './archives.js';
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -150,6 +174,22 @@ const server = createServer(async (req, res) => {
     // 争议调解包第二层：免登录仲裁人页面与接口（第一层升级后才开放）
     if (url.pathname === '/arbitration-review' && req.method === 'GET') {
       return serveStaticFile(req, res, '/arbitration-review.html');
+    }
+    // 审计归档外部核验：免登录、一次性核验码页面
+    if (url.pathname === '/archive-verify' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/archive-verify.html');
+    }
+    // 审计员查阅页面（登录后按角色分流到脱敏归档视图）
+    if (url.pathname === '/auditor' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/auditor.html');
+    }
+    if (url.pathname === '/api/archives/external-verify' && req.method === 'POST') {
+      return archiveExternalVerify(req, res);
+    }
+    // 一次性下载凭证兑换文件（无需登录：凭证本身即授权，且只能使用一次）
+    const archiveDownloadMatch = /^\/api\/archives\/exports\/([^/]+)\/download$/.exec(url.pathname);
+    if (archiveDownloadMatch && req.method === 'GET') {
+      return archiveCredentialDownload(req, res, url, archiveDownloadMatch[1]);
     }
     if (url.pathname === '/api/appeal-review/validate' && req.method === 'POST') {
       return appealReviewValidate(req, res);
@@ -251,6 +291,14 @@ async function handleApi(req, res, url) {
 
   const user = userQueries.findById(session.user_id);
   if (!user) return sendJson(res, 401, { error: { code: 'UNAUTHENTICATED' } });
+
+  // 审计员角色只能访问归档脱敏视图，不能触发办理/回执/批次等任何业务接口
+  if (user.role === 'auditor') {
+    if (url.pathname === '/api/state' && req.method === 'GET') {
+      return sendJson(res, 200, { user: safeUser(user) });
+    }
+    return handleAuditorArchiveApi(req, res, user, url);
+  }
 
   if (url.pathname === '/api/state' && req.method === 'GET') {
     return sendJson(res, 200, { user: safeUser(user), ...getStateForUser(user.id) });
@@ -481,6 +529,81 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { caseGroup: group });
   }
 
+  // 可验证审计归档（办理人）
+  if (url.pathname === '/api/archives/auditors' && req.method === 'GET') {
+    return sendJson(res, 200, { auditors: userQueries.listByRole('auditor').map((item) => ({ username: item.username, displayName: item.display_name })) });
+  }
+  if (url.pathname === '/api/archives' && req.method === 'POST') {
+    return createArchiveRoute(req, res, user);
+  }
+  if (url.pathname === '/api/archives' && req.method === 'GET') {
+    const sourceType = url.searchParams.get('sourceType') || '';
+    const sourceId = url.searchParams.get('sourceId') || '';
+    if (sourceType && !isValidArchiveSourceType(sourceType)) {
+      return sendJson(res, 400, { error: { code: 'ARCHIVE_SOURCE_INVALID', message: ARCHIVE_ERRORS.ARCHIVE_SOURCE_INVALID } });
+    }
+    return sendJson(res, 200, {
+      archives: listArchivesForOwner(user.id, { sourceType, sourceId }),
+      rejections: listArchiveRejectionsForOwner(user.id),
+      exports: listArchiveExportsForOwner(user.id),
+    });
+  }
+  const archiveGetMatch = /^\/api\/archives\/([^/]+)$/.exec(url.pathname);
+  if (archiveGetMatch && req.method === 'GET') {
+    const archive = getArchiveForOwner({ userId: user.id, archiveId: decodeURIComponent(archiveGetMatch[1]) });
+    if (!archive) return sendJson(res, 404, { error: { code: 'ARCHIVE_NOT_FOUND', message: ARCHIVE_ERRORS.ARCHIVE_NOT_FOUND } });
+    const exportsList = listArchiveExportsForOwner(user.id, { archiveId: archive.id });
+    const credentialsByTask = {};
+    for (const task of exportsList) {
+      credentialsByTask[task.id] = listCredentialsForOwner({ userId: user.id, exportId: task.id }) || [];
+    }
+    return sendJson(res, 200, {
+      archive,
+      exports: exportsList,
+      credentialsByTask,
+    });
+  }
+  const archiveExternalCodeMatch = /^\/api\/archives\/([^/]+)\/external-code$/.exec(url.pathname);
+  if (archiveExternalCodeMatch && req.method === 'POST') {
+    return issueArchiveExternalCodeRoute(req, res, user, archiveExternalCodeMatch[1]);
+  }
+  const archiveExportsMatch = /^\/api\/archives\/([^/]+)\/exports$/.exec(url.pathname);
+  if (archiveExportsMatch && req.method === 'POST') {
+    return startArchiveExportRoute(req, res, user, archiveExportsMatch[1]);
+  }
+  const archiveExportMatch = /^\/api\/archives\/exports\/([^/]+)$/.exec(url.pathname);
+  if (archiveExportMatch && req.method === 'GET') {
+    const exportId = decodeURIComponent(archiveExportMatch[1]);
+    const task = getArchiveExportForOwner({ userId: user.id, exportId });
+    if (!task) return sendJson(res, 404, { error: { code: 'EXPORT_NOT_FOUND', message: ARCHIVE_ERRORS.EXPORT_NOT_FOUND } });
+    const credentials = listCredentialsForOwner({ userId: user.id, exportId }) || [];
+    return sendJson(res, 200, { task, credentials });
+  }
+  if (archiveExportMatch && req.method === 'POST') {
+    const action = url.searchParams.get('action') || '';
+    const exportId = decodeURIComponent(archiveExportMatch[1]);
+    if (action === 'cancel') return cancelArchiveExportRoute(req, res, user, exportId);
+    if (action === 'credential') return issueDownloadCredentialRoute(req, res, user, exportId);
+    if (action === 'redownload') return redownloadCredentialRoute(req, res, user, exportId);
+  }
+
+  return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
+}
+
+// 审计员侧：只能查看授权归档的脱敏视图、来源关系与摘要链校验结果
+function handleAuditorArchiveApi(req, res, user, url) {
+  if (url.pathname === '/api/auditor/archives' && req.method === 'GET') {
+    return sendJson(res, 200, { archives: listArchivesForAuditor(user.id) });
+  }
+  const match = /^\/api\/auditor\/archives\/([^/]+)$/.exec(url.pathname);
+  if (match && req.method === 'GET') {
+    const archive = getArchiveForAuditor({ userId: user.id, archiveId: decodeURIComponent(match[1]) });
+    if (!archive) return sendJson(res, 404, { error: { code: 'ARCHIVE_NOT_FOUND', message: ARCHIVE_ERRORS.ARCHIVE_NOT_FOUND } });
+    if (archive.forbidden) {
+      return sendJson(res, 403, { error: { code: 'ARCHIVE_VIEW_FORBIDDEN', message: ARCHIVE_ERRORS.ARCHIVE_VIEW_FORBIDDEN } });
+    }
+    return sendJson(res, 200, { archive });
+  }
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
 }
 
@@ -498,10 +621,12 @@ async function login(req, res) {
   }
   const session = createSession(user.id);
   setSessionCookies(res, session);
+  // 审计员不触发办理工作流创建，登录响应只携带身份与 CSRF
+  const extra = user.role === 'auditor' ? {} : getStateForUser(user.id);
   return sendJson(res, 200, {
     user: safeUser(user),
     csrfToken: session.csrf,
-    ...getStateForUser(user.id),
+    ...extra,
   });
 }
 
@@ -1367,6 +1492,181 @@ async function cancelCaseGroupRoute(req, res, user, rawGroupId) {
 }
 
 // ---------------------------------------------------------------------------
+// 可验证审计归档：办理人侧
+// ---------------------------------------------------------------------------
+
+async function createArchiveRoute(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseArchiveCreateInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const auditorUsers = userQueries.listByRole('auditor');
+  const grantsParsed = parseAuditorGrants(body, auditorUsers);
+  if (grantsParsed.error) return sendJson(res, 400, { error: grantsParsed.error });
+  const result = createAuditArchive({
+    userId: user.id,
+    sourceType: parsed.value.sourceType,
+    sourceId: parsed.value.sourceId,
+    note: parsed.value.note,
+    auditorGrants: grantsParsed.value,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '归档生成失败', detail: result.rejection || null },
+      rejection: result.rejection || null,
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    archive: result.archive,
+    archives: state.archives,
+    archiveRejections: state.archiveRejections,
+  });
+}
+
+async function issueArchiveExternalCodeRoute(req, res, user, rawArchiveId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const archiveId = decodeURIComponent(rawArchiveId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(archiveId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const result = issueExternalCode({ userId: user.id, archiveId });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, { error: { code: result.code, message: result.message || '核验码生成失败' } });
+  }
+  // 完整核验码只在创建当次返回一次（与回执核验码同等对待）
+  const url = `/archive-verify?a=${encodeURIComponent(archiveId)}`;
+  return sendJson(res, 200, { ok: true, code: result.code, url, expiresAt: result.expiresAt });
+}
+
+async function startArchiveExportRoute(req, res, user, rawArchiveId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const archiveId = decodeURIComponent(rawArchiveId);
+  const idempotencyKey = String(body.idempotencyKey || '');
+  if (!/^[A-Za-z0-9_-]{8,100}$/.test(archiveId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  if (!/^[A-Za-z0-9_-]{8,100}$/.test(idempotencyKey)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_IDEMPOTENCY_KEY', message: '导出必须携带 8-100 位幂等键' } });
+  }
+  const result = startArchiveExport({ userId: user.id, archiveId, idempotencyKey });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || ARCHIVE_ERRORS[result.code] || '启动导出失败' },
+      task: result.task || null,
+    });
+  }
+  // 后台任务由定时扫描推进（默认 1s 内开始），这里不做同步处理，
+  // 以保留“两个页面并发启动只有一个进入进行中”的真实竞态语义。
+  const task = getArchiveExportForOwner({ userId: user.id, exportId: result.task.id });
+  return sendJson(res, 200, { ok: true, replay: Boolean(result.replay), task });
+}
+
+async function cancelArchiveExportRoute(req, res, user, rawExportId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const exportId = decodeURIComponent(rawExportId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(exportId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const result = cancelArchiveExport({ userId: user.id, exportId });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || ARCHIVE_ERRORS[result.code] || '取消失败' },
+      task: result.task || null,
+    });
+  }
+  return sendJson(res, 200, { ok: true, task: result.task });
+}
+
+async function issueDownloadCredentialRoute(req, res, user, rawExportId) {
+  const exportId = decodeURIComponent(rawExportId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(exportId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const result = issueDownloadCredential({ userId: user.id, exportId });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || ARCHIVE_ERRORS[result.code] || '凭证生成失败' },
+    });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    credential: result.credential,
+    expiresAt: result.expiresAt,
+    fileVersion: result.fileVersion,
+    fileDigest: result.fileDigest,
+  });
+}
+
+// 重新下载：对已完成任务再签发一张新的一次性凭证（旧凭证是否已用不影响新凭证）
+async function redownloadCredentialRoute(req, res, user, rawExportId) {
+  const task = getArchiveExportForOwner({ userId: user.id, exportId: decodeURIComponent(rawExportId) });
+  if (!task) return sendJson(res, 404, { error: { code: 'EXPORT_NOT_FOUND', message: ARCHIVE_ERRORS.EXPORT_NOT_FOUND } });
+  if (task.status !== 'completed') {
+    return sendJson(res, 409, {
+      error: {
+        code: task.status === 'expired' ? 'EXPORT_TASK_EXPIRED' : 'EXPORT_NOT_COMPLETED',
+        message: task.status === 'expired' ? ARCHIVE_ERRORS.EXPORT_TASK_EXPIRED : ARCHIVE_ERRORS.EXPORT_NOT_COMPLETED,
+      },
+      task,
+    });
+  }
+  return issueDownloadCredentialRoute(req, res, user, rawExportId);
+}
+
+// 免登录外部核验：一次性核验码，只返回事件数量/时间范围/摘要链连续性/最终状态
+async function archiveExternalVerify(req, res) {
+  const clientIp = req.socket.remoteAddress || 'unknown';
+  const limitKey = `archive-external-verify:${clientIp}`;
+  const rate = { windowMs: config.verifyRateWindowMs, max: config.verifyRateMax };
+  const preview = peekRateLimit(limitKey, rate);
+  if (!preview.allowed) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(preview.retryAfterMs / 1000))));
+    return sendJson(res, 429, { error: { code: 'TOO_MANY_REQUESTS', message: '核验尝试过于频繁，请稍后再试' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const code = String(body.code || '').trim();
+  const archiveId = String(body.archiveId || '').trim();
+  if (!/^[A-Za-z0-9_-]{20,512}$/.test(code) || (archiveId && !/^[A-Za-z0-9_-]{8,200}$/.test(archiveId))) {
+    recordFailure(limitKey, rate);
+    return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '请输入格式正确的核验码' } });
+  }
+  const result = consumeExternalCode({ rawCode: code, expectedArchiveId: archiveId, clientIp });
+  if (!result.ok) {
+    recordFailure(limitKey, rate);
+    return sendJson(res, result.status, { error: { code: result.code, message: result.message || ARCHIVE_ERRORS[result.code] || '核验失败' } });
+  }
+  return sendJson(res, 200, { ok: true, archive: result.view });
+}
+
+// 一次性下载凭证兑换导出文件（GET，免登录；凭证本身即授权）
+async function archiveCredentialDownload(req, res, url, rawExportId) {
+  const exportId = decodeURIComponent(rawExportId);
+  const credential = String(url.searchParams.get('credential') || '').trim();
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(exportId) || !/^[A-Za-z0-9_-]{20,512}$/.test(credential)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '下载链接不完整' } });
+  }
+  const result = redeemDownloadCredential({ rawCode: credential, clientIp: req.socket.remoteAddress || 'unknown' });
+  if (!result.ok) {
+    return sendJson(res, result.status, { error: { code: result.code, message: result.message || ARCHIVE_ERRORS[result.code] || '下载被拒绝' } });
+  }
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.fileName)}`,
+    'X-File-Version': String(result.fileVersion),
+    'X-Content-Digest': `sha-256=${result.fileDigest}`,
+    ...securityHeaders(),
+  });
+  res.end(result.content);
+}
+
+// ---------------------------------------------------------------------------
 // 争议调解包：免登录调解人/仲裁人侧（第一层 mid/mcsrf，第二层 arb/accsrf2）
 // ---------------------------------------------------------------------------
 
@@ -1618,6 +1918,11 @@ function requireBatchSession(req, res, { write = false } = {}) {
 // 阶段超时后台扫描间隔：到点即落定，重复扫描幂等
 const BATCH_TIMEOUT_SWEEP_MS = Number(process.env.BATCH_TIMEOUT_SWEEP_MS || 5000);
 let batchSweepTimer = null;
+let archiveSweepTimer = null;
+function stopArchiveSweep() {
+  if (archiveSweepTimer) clearInterval(archiveSweepTimer);
+  archiveSweepTimer = null;
+}
 function startBatchTimeoutSweep() {
   if (batchSweepTimer || process.env.NO_BATCH_SWEEP === '1') return;
   // 启动时先恢复一次：服务在限时内重启后，到点的批次阶段/申诉回合/调解包层级/案件组仍会被落定
@@ -1625,6 +1930,8 @@ function startBatchTimeoutSweep() {
   try { sweepAppealTimeouts(); } catch { /* 同上 */ }
   try { sweepMediationTimeouts(); } catch { /* 同上 */ }
   try { recoverCaseGroupsOnStartup(); } catch { /* 案件组成员状态对齐 */ }
+  // 归档导出：未完成任务从持久化的分块进度继续，完成/过期状态重新对齐
+  try { recoverArchiveExportsOnStartup(); } catch { /* 归档导出恢复 */ }
   batchSweepTimer = setInterval(() => {
     try { sweepBatchTimeouts(); } catch (error) { console.error('batch timeout sweep failed', error); }
     try { sweepAppealTimeouts(); } catch (error) { console.error('appeal timeout sweep failed', error); }
@@ -1632,6 +1939,11 @@ function startBatchTimeoutSweep() {
     try { sweepCaseGroupTimeouts(); } catch (error) { console.error('case group timeout sweep failed', error); }
   }, BATCH_TIMEOUT_SWEEP_MS);
   batchSweepTimer.unref?.();
+  // 归档导出后台任务：分块推进、断点续传与过期清理（间隔可经 ARCHIVE_SWEEP_MS 调整）
+  archiveSweepTimer = setInterval(() => {
+    try { sweepArchiveExports(); } catch (error) { console.error('archive export sweep failed', error); }
+  }, config.archiveSweepMs);
+  archiveSweepTimer.unref?.();
 }
 
 async function batchReviewContext(req, res) {
@@ -2104,7 +2416,7 @@ function sendJson(res, status, body) {
 }
 
 function safeUser(user) {
-  return { id: user.id, username: user.username, displayName: user.display_name || user.displayName };
+  return { id: user.id, username: user.username, displayName: user.display_name || user.displayName, role: user.role || 'handler' };
 }
 
 async function serveStaticFile(req, res, pathname) {
@@ -2143,4 +2455,4 @@ if (process.env.NO_AUTO_LISTEN !== '1') {
   });
 }
 
-export { server, startBatchTimeoutSweep };
+export { server, startBatchTimeoutSweep, stopArchiveSweep as stopArchiveExportSweep };

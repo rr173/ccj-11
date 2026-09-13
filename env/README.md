@@ -8,6 +8,7 @@
 - `bob` / `password123`
 - `carol` / `password123`
 - `dave` / `erin`（回执功能测试账号，密码相同）
+- `auditor1` / `auditor2`（审计员角色账号，密码相同；`auditor2` 为未授权对照账号，只能看到显式授权的归档脱敏视图）
 
 可通过环境变量 `DEMO_PASSWORD` 修改演示密码。生产环境应替换为正式的用户目录、密码轮换和 HTTPS。
 
@@ -267,6 +268,35 @@ COOKIE_SECURE: "1"
 - **并发与原子更新**：成员包产生进行中更正、被取消或过期/失败时，组状态与剩余成员在同一事务内按冻结规则原子更新（成员置 `cancelled`/`failed` 并固化结果，其余成员按顺序重新门控）；组级超时由后台 5 秒扫描、启动恢复与接口惰性检查触发，以 `timeout_fired_at IS NULL` 条件更新为唯一判定，**重复扫描不产生第二份结果**。
 - **结果与审计持久化**：组完成或失败后保存每个成员的结果、冲突原因、处理顺序、邀请状态、倒计时（`result_json`）；时间线在锚点调解包条目之后插入 `kind: 'caseGroup'` 条目，事件类型为 `review.caseGroup.created/member.joined/member.rejected/configured/started/member.parked/member.arbitration.opened/member.arbitration.blocked/member.failed/timeout/completed/failed/cancelled`。刷新、重新登录、服务重启后组快照、成员关系、权限摘要、门控状态、超时结果与时间线保持一致。
 
+## 可验证审计归档（只读冻结 + 摘要链 + 分级查阅 + 后台导出）
+
+办理人可对**已经发生**的一段审计事件创建只读归档，来源可选：**原批次 / 申诉回合 / 调解包 / 案件组**（`POST /api/archives`，体：`sourceType/sourceId/note/auditorGrants`）。
+
+- **创建瞬间冻结**：单个 `BEGIN IMMEDIATE` 事务内完成“收集来源范围内已发生事件（`created_at <= freezeAt`）→ 一致性校验 → 复制冻结 → 计算摘要链”。冻结内容包括**事件顺序**（`ordinal`、原始 `events.id`、时间戳）、**来源关系**（批次→申诉→调解包→案件组→更正回执的链）、**状态摘要**（来源当前状态/配置/成员）、**脱敏规则**与**权限快照**。归档事件存独立副本（`audit_archive_events`），**创建后没有任何 UPDATE/DELETE 路径**，业务记录后续变化（新增事件、再次决议等）**不会改变已生成归档**；对同一来源重复归档产生 `version+1` 的新归档，旧版本原样保留。
+- **创建拒绝与留档**：以下三类问题在生成前校验，失败时不产生归档行而在 `audit_archive_rejections` 留档原因（`409`）：
+  - `ARCHIVE_EVENT_GAP` 事件缺口：根来源缺少起始事件（如无 `review.batch.created`）或所选范围没有任何已发生事件；
+  - `ARCHIVE_EVENT_ORDER_CONFLICT` 顺序冲突：事件自增序号不单调、事件时间倒退、同一具体来源出现两条创建事件、来源进入终态后又出现状态事件；
+  - `ARCHIVE_SOURCE_INCONSISTENT` 来源不一致：事件 detail 中的 `batchId/roundId/packageId/groupId` 在库中不存在或归属链对不上（如调解包不属于事件声称的回合）。
+- **可连续校验的摘要链**：`genesis = sha256("ARCHIVE-GENESIS-v1"|归档号|来源|版本)`，`hash_i = sha256(prev_hash | 规范化事件负载)`，最终摘要 `final_hash` 冻结在归档主行；每次查阅都重算，任何一处冻结副本被篡改都会使 `chain.continuous=false` 并给出断点（ordinal 与原因）。被篡改的归档**不能导出**（后台任务终检失败 `ARCHIVE_CHAIN_INVALID`），且没有任何“修复归档”接口——只能重新归档出新版本。
+
+### 三种分级视图（按归档创建时的权限快照，权限后变不扩大已生成归档）
+
+- **办理人视图** `GET /api/archives/{id}`：获准范围内的完整字段与操作人（actor 角色+标识）、状态摘要、来源关系、脱敏规则、逐事件负载与摘要。
+- **审计员视图**（`auditor` 角色，页面 `/auditor`，接口 `GET /api/auditor/archives[/{id}]`）：只有在该归档**创建时**被 `auditorGrants` 按用户名显式授权的审计员可见；只返回按冻结脱敏规则处理后的事件（剥离逐字意见/驳回理由/取消理由/IP/备注，遮罩邀请标签）、**来源关系**与**摘要链校验结果**；操作人统一只显示角色（`handler/reviewer/system`），不含身份。未授权审计员列表中看不到该归档，直接访问得 `403 ARCHIVE_VIEW_FORBIDDEN`；审计员不能访问办理人接口。演示账号 `auditor1`（授权对照）、`auditor2`（未授权对照）。
+- **外部核验视图**（免登录页面 `/archive-verify`，接口 `POST /api/archives/external-verify`）：办理人先 `POST /api/archives/{id}/external-code` 取得**一次性核验码**（只返回一次，默认 24 小时有效；同一归档新码作废旧码）；核验**只能看到 9 个字段**：归档号、来源类型、冻结时间、事件数量、时间范围、摘要链是否连续、最终状态。看不到任何事件原文、操作人、来源关系，也得不到证件号码/地址。核验码**只能使用一次**（重复 `410 EXTERNAL_CODE_USED`），作废/过期分别返回 `EXTERNAL_CODE_REVOKED/EXPIRED`。
+
+### 后台导出任务（幂等、断点续传、一次性凭证、过期清理）
+
+`POST /api/archives/{id}/exports { idempotencyKey }` 启动后台导出：
+
+- **幂等键**：办理人同键重放返回同一任务（`replay:true`）；同键用于其他归档得 `409 EXPORT_IDEMPOTENCY_CONFLICT`。
+- **同一归档同一版本至多一份进行中任务**：部分唯一索引 + `BEGIN IMMEDIATE` 保证两个页面并发启动只有一个成功，另一个得 `409 EXPORT_ALREADY_RUNNING` 并返回已存在任务。
+- **分块 + 断点续传**：按事件数分块（默认每块 50 条，`ARCHIVE_EXPORT_CHUNK_SIZE` 可调小），每完成一块写入 `audit_export_chunks` 并更新 `completed_chunks/progress`；后台扫描（默认 1s，`ARCHIVE_SWEEP_MS`）认领 queued 任务、从已完成分块之后继续。任务锁含 30s TTL，持锁进程崩溃后可被接管；**服务重启时无条件释放旧进程的 running 锁并从持久化分块进度续跑**（`recoverArchiveExportsOnStartup`）。
+- **完成与版本摘要**：完成时由冻结事件重算组装 JSON 文件（含归档号、来源、冻结时间、事件数、时间范围、状态摘要、来源关系、权限快照、脱敏规则、逐事件负载、分块摘要），写回 `file_version/file_digest(file SHA-256)/file_size` 与保留期（默认 24 小时）；**下载动作只读，不修改任何归档或业务数据**。
+- **查询/取消/重新下载**：`GET /api/archives/exports/{id}` 查状态（含进度、失败原因、文件摘要、保留期）；`POST …/exports/{id}?action=cancel` 取消 queued/running 任务（已完成/失败不可取消，其活动凭证一并作废）；已完成任务可多次“重新下载”，每次签发新凭证。
+- **一次性下载凭证**：`POST …/exports/{id}?action=credential` 对已完成任务签发一次性凭证（默认 15 分钟）；免登录兑换 `GET /api/archives/exports/{id}/download?credential=…`（凭证本身即授权），响应带 `X-File-Version` 与 `X-Content-Digest: sha-256=…`。重复使用 `410 EXPORT_CREDENTIAL_USED`；越权归档 `EXPORT_CREDENTIAL_ARCHIVE_MISMATCH`；任务取消 `EXPORT_TASK_CANCELLED`；任务/文件过期被清理 `EXPORT_TASK_EXPIRED`；凭证过期 `EXPORT_CREDENTIAL_EXPIRED`；未完成 `EXPORT_NOT_COMPLETED`。
+- **过期清理**：后台扫描把超过保留期的已完成任务文件内容清空并置 `expired`（任务行与审计事件留档），其活动凭证一并过期；过期凭证与外部核验码同样被置过期。办理页展示归档来源、冻结时间、事件数量、摘要链校验、三种视图权限、导出进度、凭证状态与失败原因。
+
 ## 多方复核批次（可配置的多方复核与决议编排）
 
 办理人可在**已签发回执**上创建一个多方复核批次：同一份回执配 2～5 个**限时、一次性**邀请，每个邀请有独立的**可查看字段范围**，批次对每个纳入编排的字段配置**接受阈值 / 驳回阈值**。批次只有在全部邀请完成一次性校验后才能进入复核；复核人只能针对**本邀请被授权的字段**提交意见；同一字段的多份意见**合并展示但逐字保留每位复核人的原始说明**；办理人逐字段作出接受或驳回决议时**必须满足对应阈值**；被接受字段的全部意见进入**同一份**新的更正办理并关联全部意见。
@@ -430,6 +460,19 @@ COOKIE_SECURE: "1"
 | POST | `/api/case-groups/{id}/config` | 是 | 保存组级配置（最少完成数、成员顺序、超时策略、限时、披露白名单；开始处理后冻结） |
 | POST | `/api/case-groups/{id}/start` | 是 | 启动按冻结顺序处理（条件更新保证不能启动两次；可在请求中一并提交最终配置） |
 | POST | `/api/case-groups/{id}/cancel` | 是 | 收集阶段取消案件组（成员释放，可加入其他组） |
+| GET | `/api/archives/auditors` | 是（办理人） | 可授权的 auditor 角色账号列表 |
+| POST | `/api/archives` | 是（办理人） | 创建只读归档（`sourceType/sourceId/note/auditorGrants`）；缺口/顺序冲突/来源不一致时拒绝并留档 |
+| GET | `/api/archives` | 是（办理人） | 归档列表、拒绝留档与导出任务列表 |
+| GET | `/api/archives/{id}` | 是（办理人） | 办理人完整视图（冻结事件、操作人、来源关系、摘要链校验、导出任务） |
+| POST | `/api/archives/{id}/external-code` | 是（办理人） | 签发外部一次性核验码（只返回一次） |
+| POST | `/api/archives/{id}/exports` | 是（办理人） | 启动后台导出（必带 `idempotencyKey`；并发只放行一个） |
+| GET | `/api/archives/exports/{id}` | 是（办理人） | 查询导出任务进度/失败原因/文件摘要/凭证状态 |
+| POST | `/api/archives/exports/{id}?action=cancel` | 是（办理人） | 取消排队中/进行中的导出（活动凭证一并作废） |
+| POST | `/api/archives/exports/{id}?action=credential` | 是（办理人） | 对已完成导出生成一次性下载凭证 |
+| POST | `/api/archives/exports/{id}?action=redownload` | 是（办理人） | 对已完成导出重新生成下载凭证 |
+| GET | `/api/archives/exports/{id}/download?credential=` | 否 | 一次性凭证兑换导出文件（重复使用/越权/取消/过期均拒绝；下载不改业务数据） |
+| GET | `/api/auditor/archives[/{id}]` | 是（审计员） | 仅授权归档的脱敏视图、来源关系与摘要链校验结果 |
+| POST | `/api/archives/external-verify` | 否 | 外部一次性核验码核验，仅返回事件数量/时间范围/摘要链连续性/最终状态 |
 | POST | `/api/verify` | 否 | 编号+核验码核验，仅返回脱敏结果，按 IP 限流 |
 | GET | `/api/public/receipts/{no}/print?code=` | 否 | 脱敏可打印回执文档 |
 | GET | `/verify` | 否 | 免登录核验页面 |
@@ -438,6 +481,8 @@ COOKIE_SECURE: "1"
 | GET | `/appeal-review` | 否 | 免登录复核申诉评议页面（先完成申诉邀请校验，只展示本回合授权内容） |
 | GET | `/mediation-review` | 否 | 免登录第一层调解评议页面（先完成调解邀请校验，只展示本层授权内容） |
 | GET | `/arbitration-review` | 否 | 免登录第二层仲裁评议页面（第一层升级后才开放） |
+| GET | `/auditor` | 否（审计员登录） | 审计员归档查阅页面 |
+| GET | `/archive-verify` | 否 | 免登录归档外部核验页面（一次性核验码） |
 
 所有非 GET 的登录态接口要求 `X-CSRF-Token`。会话 Cookie 为 `HttpOnly; SameSite=Lax`，HTTPS 环境可启用 `Secure`。
 
@@ -474,6 +519,13 @@ COOKIE_SECURE: "1"
 - `case_group_members`：组成员（加入瞬间冻结的来源/字段授权/两层配置/邀请状态 `member_snapshot_json`、门控状态 `joined/layer1_open/parked/arbitrating/arbitration_blocked/completed/failed/cancelled/released` 与原因、每成员结果/顺序/邀请状态/倒计时 `result_json`、`open_group_id`）；部分唯一索引 `idx_case_group_members_one_open` 保证成员包不能同时处于两个未终结案件组
 - `case_group_rejections`：加入时未通过冲突检查的调解包留档（原批次/申诉来源/字段授权/当前更正/状态五类原因码与明细）
 - `case_group_disclosures`：成员开放第二层时生成的跨包摘要（只含其他成员包的聚合结论，不含字段 key/原文/处理人身份），每个查看包唯一
+- `audit_archives`：只读审计归档（来源类型 `batch/appeal/mediation/caseGroup` 与来源 id、版本号 `UNIQUE(source_type,source_id,version)`、冻结范围/状态摘要/来源关系/脱敏规则/权限快照、事件数与时间范围、`genesis_hash/final_hash`、创建时间；**只有 INSERT，没有更新冻结内容的路径**）
+- `audit_archive_events`：冻结事件副本（顺序 ordinal、原 `events.id`、类型/步骤/脱敏前 detail、操作人角色与标签、`prev_hash/event_hash` 摘要链）；`UNIQUE(archive_id, source_event_id)` 防同一事件重复入档
+- `audit_archive_rejections`：归档创建被拒绝（缺口/顺序冲突/来源不一致）时的原因码与明细留档
+- `audit_exports`：导出后台任务（幂等键、`queued/running/completed/failed/cancelled/expired` 状态、分块总数/已完成数/进度、文件版本/内容/`file_digest`/大小、worker 锁与锁 TTL、保留期；部分唯一索引 `idx_audit_exports_one_active` 保证同一归档同版本至多一份进行中）
+- `audit_export_chunks`：导出分块内容与分块摘要（断点续传；重启后从已完成分块之后继续）
+- `audit_export_credentials` / `audit_external_codes`：一次性下载凭证与外部核验码（只存哈希、`active/used/revoked/expired`、使用时间/IP、过期时间；重复使用/取消/过期均拒绝）
+- `users`：新增 `role`（`handler`/`auditor`；旧库自动补列），审计员只能访问 `/api/auditor/*` 脱敏视图
 - `correction_objections`：批次字段意见/普通异议/申诉意见/调解意见与更正办理的统一来源关联（新增 `mediation_opinion_id`、`source_package_id`、`source_tier`；完成更正时据此回填新回执编号；放弃更正时调解包终局保留、仅清理进行中关系）
 - `tokens`：令牌哈希、绑定维度、过期、使用、撤销状态
 - `submissions`：幂等键、请求指纹、提交和确认结果
@@ -499,4 +551,9 @@ SQLite 启用 WAL 和外键；所有推进与回执签发都在同步 `BEGIN IMM
 | `REVIEW_INVITE_MIN_TTL_MS` | `300000` | 复核邀请允许的最短有效期（5 分钟） |
 | `REVIEW_INVITE_MAX_TTL_MS` | `604800000` | 复核邀请允许的最长有效期（7 天）；分阶段每阶段限时同样受此上下限约束 |
 | `BATCH_TIMEOUT_SWEEP_MS` | `5000` | 分阶段批次超时落定后台扫描间隔；服务启动时也会先扫描一次（设 `NO_BATCH_SWEEP=1` 可关闭定时器） |
+| `ARCHIVE_EXPORT_CHUNK_SIZE` | `50` | 归档导出每个后台分块包含的事件数（调小可观察断点续传） |
+| `ARCHIVE_EXPORT_TTL_MS` | `86400000` | 已完成导出文件的保留期，到期后台清理文件内容（任务行留档为 expired） |
+| `ARCHIVE_CREDENTIAL_TTL_MS` | `900000` | 一次性下载凭证有效期（15 分钟） |
+| `ARCHIVE_EXTERNAL_CODE_TTL_MS` | `86400000` | 外部一次性核验码有效期（24 小时） |
+| `ARCHIVE_SWEEP_MS` | `1000` | 归档导出后台扫描间隔（分块推进、崩溃接管、过期清理） |
 | `DISPLAY_TIMEZONE` | `Asia/Shanghai` | 回执文档时间展示时区 |

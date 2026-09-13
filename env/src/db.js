@@ -41,6 +41,8 @@ import {
   sweepCaseGroupTimeouts,
   getCrossPackageDisclosureForSession,
 } from './caseGroupStore.js';
+// 归档模块在文件末尾重导出；这里仅用命名空间在请求期惰性访问，规避 db ↔ archiveStore 循环
+import * as archiveNs from './archiveStore.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -96,6 +98,7 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
   display_name TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'handler' CHECK (role IN ('handler', 'auditor')),
   password_salt TEXT NOT NULL,
   password_hash TEXT NOT NULL,
   created_at INTEGER NOT NULL
@@ -896,6 +899,156 @@ CREATE TABLE IF NOT EXISTS case_group_disclosures (
   created_at INTEGER NOT NULL,
   UNIQUE(group_id, viewer_package_id)
 );
+
+-- ---------------------------------------------------------------------------
+-- 可验证审计归档：办理人按【原批次 / 申诉回合 / 调解包 / 案件组】选择一段
+-- 已经发生的审计事件，创建只读归档。创建瞬间冻结事件顺序、来源关系、状态摘要
+-- 与脱敏规则，并为事件计算可连续校验的 SHA-256 摘要链；此后业务记录如何变化
+-- 都不影响归档内容。事件缺口 / 顺序冲突 / 来源不一致时拒绝生成并在
+-- audit_archive_rejections 留档原因。归档一经创建只有版本递增（重新归档），
+-- 没有任何更新冻结内容的接口。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_archives (
+  id TEXT PRIMARY KEY,
+  owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  source_type TEXT NOT NULL CHECK (source_type IN ('batch', 'appeal', 'mediation', 'caseGroup')),
+  source_id TEXT NOT NULL,
+  source_label TEXT NOT NULL DEFAULT '',
+  receipt_no TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'frozen' CHECK (status IN ('frozen')),
+  scope_json TEXT NOT NULL DEFAULT '{}',
+  status_summary_json TEXT NOT NULL DEFAULT '{}',
+  provenance_json TEXT NOT NULL DEFAULT '[]',
+  redaction_json TEXT NOT NULL DEFAULT '{}',
+  permission_snapshot_json TEXT NOT NULL DEFAULT '{}',
+  event_count INTEGER NOT NULL,
+  first_event_at INTEGER,
+  last_event_at INTEGER,
+  genesis_hash TEXT NOT NULL,
+  final_hash TEXT NOT NULL,
+  chain_ok INTEGER NOT NULL DEFAULT 1,
+  note TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE(source_type, source_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_archives_owner ON audit_archives(owner_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_archives_source ON audit_archives(source_type, source_id, version);
+
+-- 冻结的审计事件（顺序与摘要链在创建瞬间确定；归档后永不 UPDATE/DELETE）
+CREATE TABLE IF NOT EXISTS audit_archive_events (
+  id TEXT PRIMARY KEY,
+  archive_id TEXT NOT NULL REFERENCES audit_archives(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  source_event_id INTEGER NOT NULL,
+  workflow_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  step INTEGER,
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  actor_role TEXT NOT NULL DEFAULT '',
+  actor_label TEXT NOT NULL DEFAULT '',
+  occurred_at INTEGER NOT NULL,
+  prev_hash TEXT NOT NULL,
+  event_hash TEXT NOT NULL,
+  UNIQUE(archive_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_archive_events_archive ON audit_archive_events(archive_id, ordinal);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_archive_events_source
+  ON audit_archive_events(archive_id, source_event_id);
+
+-- 归档创建被拒绝（事件缺口 / 顺序冲突 / 来源不一致）时的留档
+CREATE TABLE IF NOT EXISTS audit_archive_rejections (
+  id TEXT PRIMARY KEY,
+  owner_user_id TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  reason_detail TEXT NOT NULL DEFAULT '',
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_archive_rejections_owner ON audit_archive_rejections(owner_user_id, created_at);
+
+-- 导出后台任务：幂等键、分块断点续传、同归档同版本至多一份进行中。
+-- 文件内容在任务完成时由冻结事件重算（不触碰任何业务表）；重启后
+-- pending/running 任务从已完成分块之后继续。
+CREATE TABLE IF NOT EXISTS audit_exports (
+  id TEXT PRIMARY KEY,
+  archive_id TEXT NOT NULL REFERENCES audit_archives(id) ON DELETE CASCADE,
+  archive_version INTEGER NOT NULL,
+  owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'expired')),
+  total_chunks INTEGER NOT NULL,
+  completed_chunks INTEGER NOT NULL DEFAULT 0,
+  progress INTEGER NOT NULL DEFAULT 0,
+  fail_reason TEXT NOT NULL DEFAULT '',
+  file_content TEXT,
+  file_version INTEGER NOT NULL DEFAULT 1,
+  file_digest TEXT NOT NULL DEFAULT '',
+  file_size INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  locked_at INTEGER,
+  locked_by TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  expires_at INTEGER,
+  UNIQUE(owner_user_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_exports_archive ON audit_exports(archive_id, status);
+-- 同一归档同一版本只能有一份进行中（queued/running）的导出：两个页面并发启动只放行一个
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_exports_one_active
+  ON audit_exports(archive_id) WHERE status IN ('queued', 'running');
+CREATE INDEX IF NOT EXISTS idx_audit_exports_owner ON audit_exports(owner_user_id, created_at);
+
+-- 导出分块进度（断点续传）：已完成的分块行在重启/重试后不重新生成
+CREATE TABLE IF NOT EXISTS audit_export_chunks (
+  id TEXT PRIMARY KEY,
+  export_id TEXT NOT NULL REFERENCES audit_exports(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  chunk_digest TEXT NOT NULL DEFAULT '',
+  size INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  UNIQUE(export_id, ordinal)
+);
+
+-- 一次性下载凭证：完成时签发；重复使用 / 越权归档 / 取消 / 过期均明确拒绝
+CREATE TABLE IF NOT EXISTS audit_export_credentials (
+  id TEXT PRIMARY KEY,
+  export_id TEXT NOT NULL REFERENCES audit_exports(id) ON DELETE CASCADE,
+  archive_id TEXT NOT NULL,
+  owner_user_id TEXT NOT NULL,
+  code_hash BLOB NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'used', 'revoked', 'expired')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER,
+  used_ip TEXT NOT NULL DEFAULT '',
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_audit_export_credentials_export ON audit_export_credentials(export_id);
+
+-- 外部核验码：免登录、一次性，只能看到事件数量/时间范围/摘要链是否连续/最终状态
+CREATE TABLE IF NOT EXISTS audit_external_codes (
+  id TEXT PRIMARY KEY,
+  archive_id TEXT NOT NULL REFERENCES audit_archives(id) ON DELETE CASCADE,
+  owner_user_id TEXT NOT NULL,
+  code_hash BLOB NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'used', 'revoked', 'expired')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER,
+  used_ip TEXT NOT NULL DEFAULT '',
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_audit_external_codes_archive ON audit_external_codes(archive_id, status);
 `);
 
 // 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
@@ -906,6 +1059,10 @@ db.exec(`
 
 // 增量迁移：分阶段编排新增列已在主建表前补齐（见 STAGE_LEGACY_COLUMNS）；
 // 这里仅补早期批次意见表的后加列。
+// 审计归档：旧库 users 表补角色列（全新库建表语句已含 role）
+if (columnInfo('users').length > 0 && !columnInfo('users').some((c) => c.name === 'role')) {
+  db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'handler';");
+}
 for (const [table, column, ddl] of [
   ['review_batch_opinions', 'correction_receipt_no', "TEXT NOT NULL DEFAULT ''"],
 ]) {
@@ -1081,15 +1238,15 @@ export function immediateTransaction(fn) {
   return db.transaction(fn).immediate();
 }
 
-function seedUser(username, displayName) {
+function seedUser(username, displayName, role = 'handler') {
   const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
   if (existing) return existing.id;
   const { salt, hash } = hashPassword(config.demoPassword);
   const id = cryptoId();
   db.prepare(`
-    INSERT INTO users (id, username, display_name, password_salt, password_hash, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(id, username, displayName, salt, hash, now());
+    INSERT INTO users (id, username, display_name, role, password_salt, password_hash, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(id, username, displayName, role, salt, hash, now());
   return id;
 }
 
@@ -1102,6 +1259,9 @@ seedUser('bob', 'Bob 示例用户');
 seedUser('carol', 'Carol 并发测试用户');
 seedUser('dave', 'Dave 回执测试用户');
 seedUser('erin', 'Erin 回执测试用户');
+// 审计员账号：只能按归档创建时冻结的角色授权查看脱敏字段、来源关系与摘要链校验结果
+seedUser('auditor1', '审计员一号（角色：auditor）', 'auditor');
+seedUser('auditor2', '审计员二号（角色：auditor，未授权对照）', 'auditor');
 
 // 旧库已完成但当时尚未签发回执的记录，在升级时补签（内容按已持久化的确认冻结）
 if (legacyWorkflows || !hasReceipts) {
@@ -1119,7 +1279,10 @@ export const userQueries = {
     return db.prepare('SELECT * FROM users WHERE username = ?').get(username);
   },
   findById(id) {
-    return db.prepare('SELECT id, username, display_name, created_at FROM users WHERE id = ?').get(id);
+    return db.prepare('SELECT id, username, display_name, role, created_at FROM users WHERE id = ?').get(id);
+  },
+  listByRole(role) {
+    return db.prepare('SELECT id, username, display_name, role, created_at FROM users WHERE role = ? ORDER BY username ASC').all(role);
   },
 };
 
@@ -2356,6 +2519,10 @@ export function getStateForUser(userId) {
   envelope.reviewAppeals = listAppealRoundsForOwner(userId);
   envelope.mediationPackages = listMediationPackagesForOwner(userId);
   envelope.caseGroups = listCaseGroupsForOwner(userId);
+  // 归档模块通过重导出供路由使用；经命名空间惰性访问，规避模块求值期循环依赖
+  envelope.archives = archiveNs.listArchivesForOwner(userId);
+  envelope.archiveRejections = archiveNs.listArchiveRejectionsForOwner(userId);
+  envelope.archiveExports = archiveNs.listArchiveExportsForOwner(userId);
   return envelope;
 }
 
@@ -2426,3 +2593,30 @@ export {
   getCrossPackageDisclosureForSession,
   buildCaseGroupTimelineEntries,
 } from './caseGroupStore.js';
+
+// 可验证审计归档与分级查阅：统一从 db.js 重导出
+export {
+  createAuditArchive,
+  getArchiveForOwner,
+  getArchiveForAuditor,
+  getArchiveExternalView,
+  listArchivesForOwner,
+  listArchivesForAuditor,
+  listArchiveRejectionsForOwner,
+  getLatestArchiveForSource,
+  verifyArchiveChain,
+  verifyArchiveIntegrity,
+  issueExternalCode,
+  consumeExternalCode,
+  revokeExternalCode,
+  startArchiveExport,
+  getArchiveExportForOwner,
+  listArchiveExportsForOwner,
+  cancelArchiveExport,
+  issueDownloadCredential,
+  redeemDownloadCredential,
+  listCredentialsForOwner,
+  sweepArchiveExports,
+  recoverArchiveExportsOnStartup,
+  runExportToCompletion,
+} from './archiveStore.js';

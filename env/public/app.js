@@ -42,6 +42,7 @@ const els = {
   stateVersion: $('#stateVersion'), currentStepLabel: $('#currentStepLabel'), globalAlert: $('#globalAlert'),
   stepForm: $('#stepForm'), receiptPanel: $('#receiptPanel'), correctionPanel: $('#correctionPanel'),
   reviewPanel: $('#reviewPanel'), batchPanel: $('#batchPanel'),
+  archivePanel: $('#archivePanel'),
   recordsPanel: $('#recordsPanel'), recordsList: $('#recordsList'),
 };
 
@@ -57,6 +58,10 @@ const state = {
   reviewBatches: [],
   reviewAppeals: [],
   mediationPackages: [],
+  archives: [],
+  archiveRejections: [],
+  archiveExports: [],
+  auditorOptions: [],
   appealReasons: [],
   batchFieldOptions: [],
   batchMaxInvitations: 5,
@@ -109,6 +114,9 @@ function applyState(result) {
   state.reviewBatches = Array.isArray(result.reviewBatches) ? result.reviewBatches : [];
   state.reviewAppeals = Array.isArray(result.reviewAppeals) ? result.reviewAppeals : [];
   state.mediationPackages = Array.isArray(result.mediationPackages) ? result.mediationPackages : [];
+  state.archives = Array.isArray(result.archives) ? result.archives : [];
+  state.archiveRejections = Array.isArray(result.archiveRejections) ? result.archiveRejections : [];
+  state.archiveExports = Array.isArray(result.archiveExports) ? result.archiveExports : [];
 }
 
 async function login(event) {
@@ -171,12 +179,14 @@ function render() {
     renderReceipt(state.receipt || state.viewingReceipt || null);
     renderReviewPanel();
     renderBatchPanel();
+    renderArchivePanel();
     return;
   }
   if (state.viewingReceipt) {
     renderReceipt(state.viewingReceipt);
     renderReviewPanel();
     renderBatchPanel();
+    renderArchivePanel();
     return;
   }
   state.viewingReceipt = null;
@@ -186,6 +196,8 @@ function render() {
   els.reviewPanel.innerHTML = '';
   els.batchPanel.classList.add('hidden');
   els.batchPanel.innerHTML = '';
+  els.archivePanel.classList.add('hidden');
+  els.archivePanel.innerHTML = '';
   renderCurrentStep();
 }
 
@@ -2893,4 +2905,338 @@ async function openMediationBuilder(roundId) {
       fail(error.message || '生成调解包失败');
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// 可验证审计归档（办理人侧面板）
+// 展示：归档来源、冻结时间、事件数量、摘要链校验、三种视图权限、导出进度、
+// 凭证状态与失败原因；归档与导出内容完全只读。
+// ---------------------------------------------------------------------------
+
+const ARCHIVE_SOURCE_TEXT = { batch: '原批次', appeal: '申诉回合', mediation: '调解包', caseGroup: '案件组' };
+const ARCHIVE_SOURCES = [
+  { type: 'batch', label: '原批次', list: () => state.reviewBatches },
+  { type: 'appeal', label: '申诉回合', list: () => state.reviewAppeals },
+  { type: 'mediation', label: '调解包', list: () => state.mediationPackages },
+  { type: 'caseGroup', label: '案件组', list: () => (state.caseGroups || []) },
+];
+
+function archiveSourcesForCurrentReceipt() {
+  const receiptNo = currentBatchReceiptNo();
+  const out = [];
+  for (const source of ARCHIVE_SOURCES) {
+    for (const item of source.list()) {
+      if (receiptNo && item.receiptNo && item.receiptNo !== receiptNo) continue;
+      out.push({ type: source.type, typeLabel: source.label, id: item.id, status: item.status });
+    }
+  }
+  return out;
+}
+
+function renderArchivePanel() {
+  const panel = els.archivePanel;
+  panel.classList.remove('hidden');
+  const sources = archiveSourcesForCurrentReceipt();
+  const receiptNo = currentBatchReceiptNo();
+  const archives = state.archives.filter((a) => !receiptNo || a.receiptNo === receiptNo);
+  const rejections = state.archiveRejections.filter((r) => sources.some((s) => s.type === r.sourceType && s.id === r.sourceId));
+
+  panel.innerHTML = `
+    <h2>可验证审计归档（只读）</h2>
+    <p class="muted small">对已发生的审计事件创建只读归档：创建瞬间冻结事件顺序、来源关系、状态摘要与脱敏规则，并计算可连续校验的摘要链。事件缺口、顺序冲突或来源不一致时拒绝生成并留档。</p>
+    <div class="archive-create">
+      <label>归档来源
+        <select data-archive-source>
+          ${sources.length
+            ? sources.map((s) => `<option value="${s.type}:${escapeHtml(s.id)}">${s.typeLabel} · ${escapeHtml(s.id.slice(0, 10))}…（${escapeHtml(s.status)}）</option>`).join('')
+            : '<option value="">（当前回执暂无可归档来源：需先有原批次/申诉回合/调解包/案件组事件）</option>'}
+        </select>
+      </label>
+      <label class="archive-grants">授权审计员（角色 auditor，按归档创建时快照生效）
+        <div data-archive-auditors class="appeal-scope">加载中…</div>
+      </label>
+      <label>备注（可选）<input data-archive-note maxlength="200" placeholder="本次归档说明"></label>
+      <div class="form-actions">
+        <button class="button primary" type="button" data-archive-create ${sources.length ? '' : 'disabled'}>创建只读归档</button>
+      </div>
+      <div class="alert error hidden" data-archive-error></div>
+    </div>
+    <div data-archive-rejections>
+      ${rejections.length ? `<h3>归档拒绝留档（${rejections.length}）</h3>` : ''}
+      ${rejections.slice(0, 5).map((r) => `
+        <div class="archive-rejection card-inner">
+          <b>${escapeHtml(ARCHIVE_SOURCE_TEXT[r.sourceType] || r.sourceType)}</b>
+          <span class="tag tag-reject">${escapeHtml(r.reasonCode)}</span>
+          <span class="muted small">${formatTime(r.createdAt)}</span>
+          <div class="small">${escapeHtml(r.reasonDetail || (r.detail && r.detail.reason) || '')}</div>
+        </div>`).join('')}
+    </div>
+    <div data-archive-list>
+      ${archives.map(archiveCardHtml).join('') || '<p class="muted small">尚无归档。</p>'}
+    </div>`;
+
+  loadAuditorOptions(panel);
+  panel.querySelector('[data-archive-create]')?.addEventListener('click', () => createArchive(panel));
+  panel.querySelectorAll('[data-archive-detail-btn]').forEach((btn) => {
+    btn.addEventListener('click', () => toggleArchiveDetail(panel, btn.dataset.archiveDetailBtn));
+  });
+  panel.querySelectorAll('[data-archive-export]').forEach((btn) => {
+    btn.addEventListener('click', () => startExport(panel, btn.dataset.archiveExport));
+  });
+  panel.querySelectorAll('[data-archive-cancel-export]').forEach((btn) => {
+    btn.addEventListener('click', () => cancelExport(panel, btn.dataset.archiveCancelExport));
+  });
+  panel.querySelectorAll('[data-archive-credential]').forEach((btn) => {
+    btn.addEventListener('click', () => issueCredential(panel, btn.dataset.archiveCredential));
+  });
+  panel.querySelectorAll('[data-archive-external]').forEach((btn) => {
+    btn.addEventListener('click', () => issueExternalCode(panel, btn.dataset.archiveExternal));
+  });
+}
+
+function archiveCardHtml(archive) {
+  const chain = archive.chain || {};
+  const chainText = chain.continuous
+    ? '<span class="tag tag-ok">摘要链连续</span>'
+    : '<span class="tag tag-reject">摘要链校验失败</span>';
+  return `
+    <div class="archive-item card-inner" data-archive-card="${escapeHtml(archive.id)}">
+      <div class="record-main">
+        <b>${escapeHtml(archive.sourceTypeLabel)}归档 v${archive.version}</b>
+        <span class="mono small">${escapeHtml(archive.archiveNo)}</span>
+        ${chainText}
+      </div>
+      <div class="muted small">
+        来源：${escapeHtml(archive.sourceLabel)} · 冻结于 ${formatTime(archive.frozenAt)} ·
+        事件 ${archive.eventCount} 条（${formatTime(archive.firstEventAt)} ～ ${formatTime(archive.lastEventAt)}）
+      </div>
+      <div class="small archive-perms">
+        视图权限（创建时快照）：办理人=完整字段/操作人 · 审计员=脱敏字段/来源关系/摘要链结果 · 外部核验=事件数量/时间范围/摘要链连续性/最终状态
+      </div>
+      <div class="record-actions">
+        <button class="button secondary" type="button" data-archive-detail-btn="${escapeHtml(archive.id)}">查看冻结内容</button>
+        <button class="button primary" type="button" data-archive-export="${escapeHtml(archive.id)}">启动后台导出</button>
+        <button class="button secondary" type="button" data-archive-external="${escapeHtml(archive.id)}">生成外部一次性核验码</button>
+      </div>
+      <div data-archive-detail="${escapeHtml(archive.id)}" class="archive-detail hidden"></div>
+    </div>`;
+}
+
+async function loadAuditorOptions(panel) {
+  const box = panel.querySelector('[data-archive-auditors]');
+  if (!box) return;
+  try {
+    if (!state.auditorOptions.length) {
+      const result = await api('GET', '/api/archives/auditors');
+      state.auditorOptions = result.auditors || [];
+    }
+    box.innerHTML = state.auditorOptions.length
+      ? state.auditorOptions.map((a) => `<label class="appeal-scope-row"><input type="checkbox" value="${escapeHtml(a.username)}"> ${escapeHtml(a.displayName)}（${escapeHtml(a.username)}）</label>`).join('')
+      : '<span class="muted small">没有 auditor 角色账号</span>';
+  } catch {
+    box.innerHTML = '<span class="muted small">审计员列表加载失败</span>';
+  }
+}
+
+async function createArchive(panel) {
+  const errBox = panel.querySelector('[data-archive-error]');
+  errBox.classList.add('hidden');
+  const raw = String(panel.querySelector('[data-archive-source]').value || '');
+  const [sourceType, ...rest] = raw.split(':');
+  const sourceId = rest.join(':');
+  if (!sourceType || !sourceId) {
+    errBox.textContent = '请选择归档来源';
+    errBox.classList.remove('hidden');
+    return;
+  }
+  const auditorGrants = [...panel.querySelectorAll('[data-archive-auditors] input:checked')].map((i) => i.value);
+  const note = String(panel.querySelector('[data-archive-note]').value || '');
+  try {
+    await api('POST', '/api/archives', { sourceType, sourceId, note, auditorGrants });
+    await refreshState();
+    showAlert('只读归档已创建，事件顺序与摘要链已冻结', 'success');
+  } catch (error) {
+    const detail = error.body?.rejection?.reason || error.body?.error?.detail?.reason || '';
+    errBox.textContent = `${error.message}${detail ? `：${detail}` : ''}`;
+    errBox.classList.remove('hidden');
+    await refreshState();
+  }
+}
+
+async function refreshState() {
+  const result = await api('GET', '/api/state');
+  applyState(result);
+  render();
+}
+
+async function toggleArchiveDetail(panel, archiveId) {
+  const slot = panel.querySelector(`[data-archive-detail="${CSS.escape(archiveId)}"]`);
+  if (!slot) return;
+  if (!slot.classList.contains('hidden')) { slot.classList.add('hidden'); return; }
+  try {
+    const result = await api('GET', `/api/archives/${archiveId}`);
+    const a = result.archive;
+    slot.innerHTML = `
+      <div class="small"><b>状态摘要：</b><pre class="archive-pre">${escapeHtml(JSON.stringify(a.statusSummary, null, 2))}</pre></div>
+      <div class="small"><b>来源关系（${a.provenance.length}）：</b>
+        <ul>${a.provenance.map((p) => `<li class="mono small">${escapeHtml(p.from)} → ${escapeHtml(p.to)}（${escapeHtml(p.relation)}）</li>`).join('') || '<li class="muted">无</li>'}</ul>
+      </div>
+      <div class="small"><b>冻结事件（${a.events.length}）：</b>
+        <ol class="archive-events">
+          ${a.events.map((e) => `
+            <li>
+              <span class="mono small">${escapeHtml(e.type)}</span>
+              <span class="muted small">${formatTime(e.occurredAt)} · ${escapeHtml(e.actor.role)}：${escapeHtml(e.actor.label)}</span>
+              <details><summary class="muted small">事件负载/摘要</summary>
+                <pre class="archive-pre">${escapeHtml(JSON.stringify(e.detail, null, 2))}</pre>
+                <div class="mono small">hash: ${escapeHtml(e.hash)}</div>
+              </details>
+            </li>`).join('')}
+        </ol>
+      </div>
+      <div data-export-actions></div>
+      <div data-export-list>${(result.exports || []).map((t) => exportItemHtml(t, result.credentialsByTask?.[t.id] || [])).join('') || '<p class="muted small">尚无导出任务。</p>'}</div>`;
+    slot.classList.remove('hidden');
+    bindExportItemActions(slot, archiveId);
+  } catch (error) {
+    slot.textContent = error.message;
+    slot.classList.remove('hidden');
+  }
+}
+
+function exportItemHtml(task, credentials = []) {
+  const statusTag = {
+    queued: '排队中', running: '导出中', completed: '已完成', failed: '失败', cancelled: '已取消', expired: '已过期清理',
+  }[task.status] || task.status;
+  const progress = task.status === 'completed' ? 100 : task.progress;
+  const credentialStatus = { active: '有效（未使用）', used: '已使用', revoked: '已作废', expired: '已过期' };
+  return `
+    <div class="export-item card-inner" data-export-card="${escapeHtml(task.id)}">
+      <div class="record-main"><b>导出任务</b><span class="tag">${escapeHtml(statusTag)}</span>
+        <span class="muted small">v${task.archiveVersion} · 分块 ${task.completedChunks}/${task.totalChunks} · ${progress}%</span></div>
+      <div class="progress-bar"><div class="progress-fill" style="width:${progress}%"></div></div>
+      ${task.failReason ? `<div class="small tag-reject-text">失败原因：${escapeHtml(task.failReason)}</div>` : ''}
+      ${task.fileDigest ? `<div class="mono small">文件摘要 v${task.fileVersion}：${escapeHtml(task.fileDigest)}（${task.fileSize} 字节）${task.expiresAt ? ` · 保留至 ${formatTime(task.expiresAt)}` : ''}</div>` : ''}
+      ${credentials.length ? `
+        <div class="small">下载凭证：
+          <ul class="credential-list">
+            ${credentials.slice(0, 5).map((c) => `<li><span class="tag ${c.status === 'active' ? 'tag-ok' : c.status === 'used' ? '' : 'tag-reject'}">${escapeHtml(credentialStatus[c.status] || c.status)}</span>
+              <span class="muted small">签发 ${formatTime(c.createdAt)}${c.usedAt ? ` · 使用 ${formatTime(c.usedAt)}` : ''} · 失效 ${formatTime(c.expiresAt)}</span></li>`).join('')}
+          </ul>
+        </div>` : ''}
+      <div class="record-actions">
+        ${['queued', 'running'].includes(task.status) ? `<button class="button secondary" type="button" data-export-cancel="${escapeHtml(task.id)}">取消任务</button>` : ''}
+        ${task.canDownload ? `<button class="button primary" type="button" data-export-credential="${escapeHtml(task.id)}">生成一次性下载凭证</button>` : ''}
+      </div>
+      <div data-credential-slot></div>
+    </div>`;
+}
+
+function bindExportItemActions(slot, archiveId) {
+  slot.querySelectorAll('[data-export-cancel]').forEach((btn) => {
+    btn.addEventListener('click', () => cancelExport(slot, btn.dataset.exportCancel));
+  });
+  slot.querySelectorAll('[data-export-credential]').forEach((btn) => {
+    btn.addEventListener('click', () => issueCredential(slot, btn.dataset.exportCredential));
+  });
+}
+
+async function startExport(container, archiveId) {
+  try {
+    const idempotencyKey = randomId().slice(0, 40);
+    const result = await api('POST', `/api/archives/${archiveId}/exports`, { idempotencyKey });
+    await refreshState();
+    const panel = els.archivePanel;
+    const detail = panel.querySelector(`[data-archive-detail="${CSS.escape(archiveId)}"]`);
+    if (detail && !detail.classList.contains('hidden')) {
+      await toggleArchiveDetail(panel, archiveId);
+      const reopened = panel.querySelector(`[data-archive-detail="${CSS.escape(archiveId)}"]`);
+      reopened.classList.remove('hidden');
+    }
+    if (result.task.status === 'completed') showAlert('导出已完成（后台任务已从断点处理完毕）', 'success');
+    else scheduleExportPolling(archiveId);
+  } catch (error) {
+    showAlert(error.message, 'error');
+    await refreshState();
+  }
+}
+
+let archivePollTimers = new Map();
+function scheduleExportPolling(archiveId) {
+  if (archivePollTimers.has(archiveId)) return;
+  const timer = setInterval(async () => {
+    try {
+      const result = await api('GET', `/api/archives/${archiveId}`);
+      const task = (result.exports || [])[0];
+      if (!task || ['completed', 'failed', 'cancelled', 'expired'].includes(task.status)) {
+        clearInterval(timer);
+        archivePollTimers.delete(archiveId);
+      }
+      await refreshStateSilent(archiveId);
+    } catch { /* 下次轮询 */ }
+  }, 1000);
+  archivePollTimers.set(archiveId, timer);
+}
+
+async function refreshStateSilent(archiveId) {
+  const result = await api('GET', '/api/state');
+  applyState(result);
+  render();
+  const panel = els.archivePanel;
+  const detail = panel.querySelector(`[data-archive-detail="${CSS.escape(archiveId)}"]`);
+  if (detail && !detail.classList.contains('hidden')) {
+    const fresh = await api('GET', `/api/archives/${archiveId}`).catch(() => null);
+    if (fresh) {
+      const list = detail.querySelector('[data-export-list]');
+      if (list) {
+        list.innerHTML = (fresh.exports || []).map((t) => exportItemHtml(t, fresh.credentialsByTask?.[t.id] || [])).join('') || '<p class="muted small">尚无导出任务。</p>';
+      }
+      bindExportItemActions(detail, archiveId);
+    }
+  }
+}
+
+async function cancelExport(container, exportId) {
+  try {
+    await api('POST', `/api/archives/exports/${exportId}?action=cancel`, {});
+    await refreshState();
+    showAlert('导出任务已取消，其下载凭证一并作废', 'success');
+  } catch (error) {
+    showAlert(error.message, 'error');
+  }
+}
+
+async function issueCredential(container, exportId) {
+  try {
+    const result = await api('POST', `/api/archives/exports/${exportId}?action=credential`, {});
+    const card = (container.closest('[data-export-card]') || document.querySelector(`[data-export-card="${CSS.escape(exportId)}"]`));
+    const slot = card?.querySelector('[data-credential-slot]');
+    const task = await api('GET', `/api/archives/exports/${exportId}`);
+    const downloadUrl = `${location.origin}/api/archives/exports/${encodeURIComponent(exportId)}/download?credential=${encodeURIComponent(result.credential)}`;
+    if (slot) {
+      slot.innerHTML = `
+        <div class="alert success small">
+          <div>一次性下载凭证（仅展示这一次，重复使用/取消/过期后均拒绝下载），有效期至 ${formatTime(result.expiresAt)}：</div>
+          <div class="mono small word-break">${escapeHtml(result.credential)}</div>
+          <div><a class="button primary" href="${escapeHtml(downloadUrl)}">立即下载文件（v${result.fileVersion}）</a></div>
+          <div class="muted small">文件摘要：<span class="mono">${escapeHtml(result.fileDigest)}</span></div>
+        </div>`;
+    }
+    showAlert('一次性下载凭证已生成，请立即下载；离开后只能重新生成', 'success');
+  } catch (error) {
+    showAlert(error.message, 'error');
+  }
+}
+
+async function issueExternalCode(panel, archiveId) {
+  try {
+    const result = await api('POST', `/api/archives/${archiveId}/external-code`, {});
+    const url = `${location.origin}/archive-verify?a=${encodeURIComponent(archiveId)}`;
+    window.prompt(
+      `外部一次性核验码（仅展示这一次）。外部核验页面：${url}\n核验页只能看到事件数量、时间范围、摘要链是否连续与最终状态，得不到原文/证件/地址。`,
+      result.code,
+    );
+  } catch (error) {
+    showAlert(error.message, 'error');
+  }
 }
