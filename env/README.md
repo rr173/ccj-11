@@ -256,6 +256,17 @@ COOKIE_SECURE: "1"
 - **取消与超时**：任何一层尚无字段终局决议时可取消（未使用邀请立即失效、写操作全部 `410`）；已有终局决议后只能保留历史（`409 MEDIATION_HAS_DECISIONS`）。层级超时由后台 5 秒扫描、启动恢复与接口惰性检查三路触发，以 `timeout_fired_at IS NULL` 条件更新为唯一判定，**重复触发不产生第二次结果**；`revoke_unused` 只撤销未使用邀请（办理人仍须用已收集意见决议），`fail` 终结调解包，第一层 `escalate` 与第二层 `complete` 会自动驳回未决字段（留档）后升级/完成。
 - **审计与持久化**：办理人页面展示调解包↔申诉回合↔原批次↔更正办理关系、两层状态/邀请状态/倒计时/证据摘要/阈值进度/处理人；时间线在申诉回合条目之后插入 `kind: 'mediationPackage'` 条目，事件类型为 `review.mediation.created/tier.completed/tier.timeout/escalated/field.* /arbitration.invitation.consumed/arbitration.opinion.submitted/arbitration.field.*/correction.completed/cancelled`。刷新、重新登录、服务重启后冻结版本、两层状态、意见、决议、来源关系、超时结果和完整时间线保持一致（两层免登录会话均持久化）。
 
+## 案件组（case group，跨包冲突协调与按冻结顺序处理）
+
+办理人可把**同一原批次**下、由多个**已完成申诉回合**生成的调解包加入同一个案件组，按冻结顺序协调处理；加入时做跨包冲突检查并生成**只读组级冻结快照**，组开始处理后配置冻结、成员包的来源/字段授权/两层配置/历史不能被改写，成员包也不能重复加入其他未终结案件组。
+
+- **加入冲突检查（不通过即拒绝并留档）**：`POST /api/case-groups { anchorPackageId }` 以第一个包为锚点建组；`POST /api/case-groups/{id}/members { packageId }` 继续加入。加入时按四个维度检查：① **原批次字段**必须相同（否则 `409 CASE_PACKAGE_BATCH_MISMATCH`）；② **调解包状态**必须第一层处理中、第二层未开放、无字段终局决议（`CASE_PACKAGE_STATUS_CONFLICT`/`CASE_PACKAGE_TIER2_OPEN`）；③ **申诉来源**同一申诉回合只能有一个成员包（`CASE_PACKAGE_SOURCE_CONFLICT`）；④ **字段授权**按原批次字段（`source_field_id`）判重，与既有成员重叠即 `CASE_PACKAGE_FIELD_CONFLICT`；另有⑤ **当前更正**冲突（已存在进行中更正 → `CASE_PACKAGE_CORRECTION_CONFLICT`）。每个被拒包写入 `case_group_rejections`（原因/时间留档）。两个办理页面同时加入同一成员包只成功一个（部分唯一索引 `idx_case_group_members_one_open` + `BEGIN IMMEDIATE`，负者 `CASE_PACKAGE_ALREADY_IN_GROUP`）；`GET /api/case-groups/{id}/candidates` 列出同批次可加入的候选包及其不合格原因。
+- **组级配置（开始处理前可改，开始即冻结）**：`POST /api/case-groups/{id}/config { minCompletions, memberOrder, timeoutPolicy, ttlMinutes, disclosedPackageIds }`。最少完成数（1..成员数）、成员处理顺序（必须是全部成员的一个排列）、组级超时策略（`block_remaining` 到点阻断未开放成员 / `fail` 强制终结未开放成员）、组级限时与允许披露的跨包摘要白名单（只能引用本组成员）。`POST /api/case-groups/{id}/start` 以 `status='collecting'` 条件更新为唯一判定，**同一案件组不能启动两次处理**（`CASE_GROUP_ALREADY_STARTED`），开始后不能再加入成员或改配置；收集阶段可 `POST /api/case-groups/{id}/cancel`（成员释放，可加入其他组）。
+- **按冻结顺序的组级开放条件**：成员包第一层达到其自身升级条件时还要过组门控——只有在冻结顺序中的位置达到组级最少完成数、且所有前置成员第一层已终局时才开放第二层仲裁（级联放行后续成员）；前置未终局则第一层终局**挂起等待**（成员 `parked`，包保持 `mediating`，仲裁邀请继续被拒 `409 CASE_GROUP_ARBITRATION_NOT_OPEN`）；超出最少完成数或组级超时落定则第二层永不开放（成员 `arbitration_blocked`，包按第一层终局完成）。其他成员包的仲裁邀请在未达组级开放条件前一律继续拒绝。
+- **跨包摘要最小披露**：成员开放第二层瞬间按白名单生成 `case_group_disclosures`，仲裁人上下文 `context.group.crossPackageSummary` 只含其他成员包的**聚合结论**（顺序、成员/包状态、第一层驳回计数与自动驳回计数）并显式 `containsOtherPackageFields:false`，**不含任何其他包的字段 key、字段原文、证据逐字内容或处理人身份**；每个成员包仍只按自己的字段权限向其调解人/仲裁人展示内容。
+- **并发与原子更新**：成员包产生进行中更正、被取消或过期/失败时，组状态与剩余成员在同一事务内按冻结规则原子更新（成员置 `cancelled`/`failed` 并固化结果，其余成员按顺序重新门控）；组级超时由后台 5 秒扫描、启动恢复与接口惰性检查触发，以 `timeout_fired_at IS NULL` 条件更新为唯一判定，**重复扫描不产生第二份结果**。
+- **结果与审计持久化**：组完成或失败后保存每个成员的结果、冲突原因、处理顺序、邀请状态、倒计时（`result_json`）；时间线在锚点调解包条目之后插入 `kind: 'caseGroup'` 条目，事件类型为 `review.caseGroup.created/member.joined/member.rejected/configured/started/member.parked/member.arbitration.opened/member.arbitration.blocked/member.failed/timeout/completed/failed/cancelled`。刷新、重新登录、服务重启后组快照、成员关系、权限摘要、门控状态、超时结果与时间线保持一致。
+
 ## 多方复核批次（可配置的多方复核与决议编排）
 
 办理人可在**已签发回执**上创建一个多方复核批次：同一份回执配 2～5 个**限时、一次性**邀请，每个邀请有独立的**可查看字段范围**，批次对每个纳入编排的字段配置**接受阈值 / 驳回阈值**。批次只有在全部邀请完成一次性校验后才能进入复核；复核人只能针对**本邀请被授权的字段**提交意见；同一字段的多份意见**合并展示但逐字保留每位复核人的原始说明**；办理人逐字段作出接受或驳回决议时**必须满足对应阈值**；被接受字段的全部意见进入**同一份**新的更正办理并关联全部意见。
@@ -411,6 +422,14 @@ COOKIE_SECURE: "1"
 | GET | `/api/arbitration-review/context` | 否 | 仅仲裁授权字段的脱敏视图、第一层结论摘要（无第一层调解人身份/逐字意见）与选中证据 |
 | POST | `/api/arbitration-review/opinions` | 否 | 仲裁人提交第二层意见（需仲裁会话 `arb/accsrf2` + CSRF，幂等） |
 | POST | `/api/arbitration-review/logout` | 否 | 退出并清除本机仲裁会话 |
+| POST | `/api/case-groups` | 是 | 创建案件组（以锚点调解包为第一个成员，做加入冲突检查并冻结组快照） |
+| GET | `/api/case-groups` | 是 | 案件组清单（可按 `batchId`/`receiptNo` 过滤） |
+| GET | `/api/case-groups/{id}` | 是 | 案件组详情（冻结快照、配置、成员状态/结果、冲突拒绝留档、审计事件、倒计时） |
+| GET | `/api/case-groups/{id}/candidates` | 是 | 同原批次可加入的调解包候选及不合格原因 |
+| POST | `/api/case-groups/{id}/members` | 是 | 加入成员包（原批次/申诉来源/字段授权/当前更正/状态冲突检查，不通过拒绝并留档） |
+| POST | `/api/case-groups/{id}/config` | 是 | 保存组级配置（最少完成数、成员顺序、超时策略、限时、披露白名单；开始处理后冻结） |
+| POST | `/api/case-groups/{id}/start` | 是 | 启动按冻结顺序处理（条件更新保证不能启动两次；可在请求中一并提交最终配置） |
+| POST | `/api/case-groups/{id}/cancel` | 是 | 收集阶段取消案件组（成员释放，可加入其他组） |
 | POST | `/api/verify` | 否 | 编号+核验码核验，仅返回脱敏结果，按 IP 限流 |
 | GET | `/api/public/receipts/{no}/print?code=` | 否 | 脱敏可打印回执文档 |
 | GET | `/verify` | 否 | 免登录核验页面 |
@@ -451,6 +470,10 @@ COOKIE_SECURE: "1"
 - `mediation_opinions`：第一层调解意见与第二层仲裁意见（每邀请每字段唯一、幂等键、脱敏值快照）
 - `mediation_disclosures`：第一层升级到第二层时按冻结快照生成的“允许向仲裁人披露的第一层结论摘要”（聚合结论与选中证据，不含第一层调解人身份/逐字意见），每个第二层字段唯一
 - `mediation_corrections`：调解包接受与更正办理的来源关系（原批次/申诉回合/层级/第一层结论引用）；部分唯一索引保证同一调解包至多一份进行中的更正
+- `case_groups`：案件组（状态 `collecting/processing/completed/failed/cancelled`、组级冻结快照 `frozen_snapshot_json`、最少完成数、冻结成员顺序、组级超时策略与截止时间、跨包披露白名单、超时落定时间与结果）
+- `case_group_members`：组成员（加入瞬间冻结的来源/字段授权/两层配置/邀请状态 `member_snapshot_json`、门控状态 `joined/layer1_open/parked/arbitrating/arbitration_blocked/completed/failed/cancelled/released` 与原因、每成员结果/顺序/邀请状态/倒计时 `result_json`、`open_group_id`）；部分唯一索引 `idx_case_group_members_one_open` 保证成员包不能同时处于两个未终结案件组
+- `case_group_rejections`：加入时未通过冲突检查的调解包留档（原批次/申诉来源/字段授权/当前更正/状态五类原因码与明细）
+- `case_group_disclosures`：成员开放第二层时生成的跨包摘要（只含其他成员包的聚合结论，不含字段 key/原文/处理人身份），每个查看包唯一
 - `correction_objections`：批次字段意见/普通异议/申诉意见/调解意见与更正办理的统一来源关联（新增 `mediation_opinion_id`、`source_package_id`、`source_tier`；完成更正时据此回填新回执编号；放弃更正时调解包终局保留、仅清理进行中关系）
 - `tokens`：令牌哈希、绑定维度、过期、使用、撤销状态
 - `submissions`：幂等键、请求指纹、提交和确认结果

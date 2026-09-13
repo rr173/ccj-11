@@ -78,6 +78,16 @@ import {
   getMediationReviewerContext,
   submitMediationOpinion,
   sweepMediationTimeouts,
+  createCaseGroup,
+  addCaseGroupMember,
+  configureCaseGroup,
+  startCaseGroup,
+  cancelCaseGroup,
+  getCaseGroupForOwner,
+  listCaseGroupsForOwner,
+  listGroupablePackages,
+  sweepCaseGroupTimeouts,
+  recoverCaseGroupsOnStartup,
 } from './db.js';
 import { validateDraft, validateStepPayload } from './validation.js';
 import { stableStringify } from './crypto.js';
@@ -104,6 +114,11 @@ import {
   ARBITRATION_SESSION_COOKIE,
   ARBITRATION_CSRF_COOKIE,
 } from './mediationReviews.js';
+import {
+  parseCaseGroupCreateInput,
+  parseCaseGroupConfigInput,
+  CASE_GROUP_ERRORS,
+} from './caseGroups.js';
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -426,6 +441,44 @@ async function handleApi(req, res, url) {
   const mediationFieldDecideMatch = /^\/api\/mediation-packages\/([^/]+)\/fields\/([^/]+)\/(accept|reject)$/.exec(url.pathname);
   if (mediationFieldDecideMatch && req.method === 'POST') {
     return decideMediationFieldRoute(req, res, user, mediationFieldDecideMatch[1], mediationFieldDecideMatch[2], mediationFieldDecideMatch[3]);
+  }
+
+  // 案件组（跨包冲突协调，办理人）
+  if (url.pathname === '/api/case-groups' && req.method === 'POST') {
+    return createCaseGroupRoute(req, res, user);
+  }
+  if (url.pathname === '/api/case-groups' && req.method === 'GET') {
+    const batchId = url.searchParams.get('batchId') || '';
+    const receiptNo = url.searchParams.get('receiptNo') || '';
+    return sendJson(res, 200, { caseGroups: listCaseGroupsForOwner(user.id, { batchId, receiptNo }) });
+  }
+  const caseGroupCandidatesMatch = /^\/api\/case-groups\/([^/]+)\/candidates$/.exec(url.pathname);
+  if (caseGroupCandidatesMatch && req.method === 'GET') {
+    const result = listGroupablePackages({ userId: user.id, groupId: decodeURIComponent(caseGroupCandidatesMatch[1]) });
+    if (!result) return sendJson(res, 404, { error: { code: 'CASE_GROUP_NOT_FOUND', message: CASE_GROUP_ERRORS.CASE_GROUP_NOT_FOUND } });
+    return sendJson(res, 200, result);
+  }
+  const caseGroupMembersMatch = /^\/api\/case-groups\/([^/]+)\/members$/.exec(url.pathname);
+  if (caseGroupMembersMatch && req.method === 'POST') {
+    return addCaseGroupMemberRoute(req, res, user, caseGroupMembersMatch[1]);
+  }
+  const caseGroupConfigMatch = /^\/api\/case-groups\/([^/]+)\/config$/.exec(url.pathname);
+  if (caseGroupConfigMatch && req.method === 'POST') {
+    return configureCaseGroupRoute(req, res, user, caseGroupConfigMatch[1]);
+  }
+  const caseGroupStartMatch = /^\/api\/case-groups\/([^/]+)\/start$/.exec(url.pathname);
+  if (caseGroupStartMatch && req.method === 'POST') {
+    return startCaseGroupRoute(req, res, user, caseGroupStartMatch[1]);
+  }
+  const caseGroupCancelMatch = /^\/api\/case-groups\/([^/]+)\/cancel$/.exec(url.pathname);
+  if (caseGroupCancelMatch && req.method === 'POST') {
+    return cancelCaseGroupRoute(req, res, user, caseGroupCancelMatch[1]);
+  }
+  const caseGroupGetMatch = /^\/api\/case-groups\/([^/]+)$/.exec(url.pathname);
+  if (caseGroupGetMatch && req.method === 'GET') {
+    const group = getCaseGroupForOwner({ userId: user.id, groupId: decodeURIComponent(caseGroupGetMatch[1]) });
+    if (!group) return sendJson(res, 404, { error: { code: 'CASE_GROUP_NOT_FOUND', message: CASE_GROUP_ERRORS.CASE_GROUP_NOT_FOUND } });
+    return sendJson(res, 200, { caseGroup: group });
   }
 
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
@@ -1158,6 +1211,7 @@ async function decideMediationFieldRoute(req, res, user, rawPackageId, rawFieldI
     createdCorrection: Boolean(result.created),
     escalated: Boolean(result.escalated),
     packageCompleted: Boolean(result.packageCompleted),
+    parked: Boolean(result.parked),
     packageStatus: result.packageStatus,
     pkg: result.pkg,
     records: state.records,
@@ -1165,6 +1219,151 @@ async function decideMediationFieldRoute(req, res, user, rawPackageId, rawFieldI
     mediationPackages: state.mediationPackages,
     correction: state.correction,
   });
+}
+
+// ---------------------------------------------------------------------------
+// 案件组（跨包冲突协调）：办理人侧
+// ---------------------------------------------------------------------------
+
+function caseGroupConfigFromBody(body, memberPackageIds) {
+  const maxMinutes = Math.floor(config.reviewInviteMaxTtlMs / 60000);
+  const minMinutes = Math.max(1, Math.ceil(config.reviewInviteMinTtlMs / 60000));
+  return parseCaseGroupConfigInput(body, { memberPackageIds, minMinutes, maxMinutes });
+}
+
+async function createCaseGroupRoute(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseCaseGroupCreateInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = createCaseGroup({
+    userId: user.id,
+    anchorPackageId: parsed.value.anchorPackageId,
+    note: parsed.value.note,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '创建案件组失败', detail: result.detail || '' },
+      group: result.group || null,
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    caseGroup: result.group,
+    timeline: state.timeline,
+    caseGroups: state.caseGroups,
+  });
+}
+
+async function addCaseGroupMemberRoute(req, res, user, rawGroupId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const groupId = decodeURIComponent(rawGroupId);
+  const packageId = String(body.packageId || '');
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(groupId) || !/^[A-Za-z0-9_-]{8,200}$/.test(packageId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID', message: '案件组或调解包标识不正确' } });
+  }
+  const result = addCaseGroupMember({ userId: user.id, groupId, packageId });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: {
+        code: result.code,
+        message: result.message || CASE_GROUP_ERRORS[result.code] || '成员包未通过冲突检查，不能加入案件组',
+        detail: result.detail || '',
+      },
+      group: result.group || null,
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    caseGroup: result.group,
+    timeline: state.timeline,
+    caseGroups: state.caseGroups,
+  });
+}
+
+async function configureCaseGroupRoute(req, res, user, rawGroupId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const groupId = decodeURIComponent(rawGroupId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(groupId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const current = getCaseGroupForOwner({ userId: user.id, groupId });
+  if (!current) {
+    return sendJson(res, 404, { error: { code: 'CASE_GROUP_NOT_FOUND', message: CASE_GROUP_ERRORS.CASE_GROUP_NOT_FOUND } });
+  }
+  const memberPackageIds = current.members.map((member) => member.packageId);
+  const parsed = caseGroupConfigFromBody(body, memberPackageIds);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = configureCaseGroup({ userId: user.id, groupId, config: parsed.value });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '保存案件组配置失败' },
+      caseGroup: result.group || null,
+    });
+  }
+  return sendJson(res, 200, { ok: true, caseGroup: result.group });
+}
+
+async function startCaseGroupRoute(req, res, user, rawGroupId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const groupId = decodeURIComponent(rawGroupId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(groupId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  // 允许在启动请求中一并提交最终配置（仍须 collecting）
+  if (body && body.config) {
+    const current = getCaseGroupForOwner({ userId: user.id, groupId });
+    if (!current) {
+      return sendJson(res, 404, { error: { code: 'CASE_GROUP_NOT_FOUND', message: CASE_GROUP_ERRORS.CASE_GROUP_NOT_FOUND } });
+    }
+    const memberPackageIds = current.members.map((member) => member.packageId);
+    const parsed = caseGroupConfigFromBody(body.config, memberPackageIds);
+    if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+    const configured = configureCaseGroup({ userId: user.id, groupId, config: parsed.value });
+    if (!configured.ok) {
+      return sendJson(res, configured.status || 409, {
+        error: { code: configured.code, message: configured.message || '保存案件组配置失败' },
+        caseGroup: configured.group || null,
+      });
+    }
+  }
+  const result = startCaseGroup({ userId: user.id, groupId });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '启动案件组失败' },
+      caseGroup: result.group || null,
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    caseGroup: result.group,
+    timeline: state.timeline,
+    caseGroups: state.caseGroups,
+  });
+}
+
+async function cancelCaseGroupRoute(req, res, user, rawGroupId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const groupId = decodeURIComponent(rawGroupId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(groupId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const result = cancelCaseGroup({ userId: user.id, groupId, reason: String(body.reason || '') });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '取消案件组失败' },
+      caseGroup: result.group || null,
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, { ok: true, caseGroup: result.group, timeline: state.timeline, caseGroups: state.caseGroups });
 }
 
 // ---------------------------------------------------------------------------
@@ -1421,14 +1620,16 @@ const BATCH_TIMEOUT_SWEEP_MS = Number(process.env.BATCH_TIMEOUT_SWEEP_MS || 5000
 let batchSweepTimer = null;
 function startBatchTimeoutSweep() {
   if (batchSweepTimer || process.env.NO_BATCH_SWEEP === '1') return;
-  // 启动时先恢复一次：服务在限时内重启后，到点的批次阶段/申诉回合/调解包层级仍会被落定
+  // 启动时先恢复一次：服务在限时内重启后，到点的批次阶段/申诉回合/调解包层级/案件组仍会被落定
   try { sweepBatchTimeouts(); } catch { /* 记录但不阻塞启动 */ }
   try { sweepAppealTimeouts(); } catch { /* 同上 */ }
   try { sweepMediationTimeouts(); } catch { /* 同上 */ }
+  try { recoverCaseGroupsOnStartup(); } catch { /* 案件组成员状态对齐 */ }
   batchSweepTimer = setInterval(() => {
     try { sweepBatchTimeouts(); } catch (error) { console.error('batch timeout sweep failed', error); }
     try { sweepAppealTimeouts(); } catch (error) { console.error('appeal timeout sweep failed', error); }
     try { sweepMediationTimeouts(); } catch (error) { console.error('mediation timeout sweep failed', error); }
+    try { sweepCaseGroupTimeouts(); } catch (error) { console.error('case group timeout sweep failed', error); }
   }, BATCH_TIMEOUT_SWEEP_MS);
   batchSweepTimer.unref?.();
 }

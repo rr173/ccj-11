@@ -678,6 +678,7 @@ export function cancelMediationPackage({ userId, packageId, reason }) {
       WHERE id = ?
     `).run(ts, text, packageId);
     addMediationEvent(row.receipt_no, 'review.mediation.cancelled', { packageId, reason: text });
+    if (mediationGroupSync) mediationGroupSync(packageId, now());
     return { ok: true, pkg: packageOwnerView(loadPackageTx(packageId)) };
   });
 }
@@ -746,6 +747,7 @@ function settleMediationTimeoutsTx(pkg) {
       packageId: pkg.id, tier: 2, policy: 'complete',
     });
     fired.push({ tier: 2, result: 'completed' });
+    if (mediationGroupSync) mediationGroupSync(pkg.id, ts);
     break;
   }
   return fired;
@@ -793,6 +795,7 @@ function applyMediationFailTx(pkg, tier, ts, packageStatus) {
   addMediationEvent(pkg.receipt_no, 'review.mediation.tier.timeout', {
     packageId: pkg.id, tier: tier.tier, policy: 'fail', packageStatus,
   });
+  if (mediationGroupSync) mediationGroupSync(pkg.id, ts);
 }
 
 function applyTierRevokeUnusedTx(pkg, tier, ts) {
@@ -819,6 +822,19 @@ function applyTierRevokeUnusedTx(pkg, tier, ts) {
 
 // 第一层超时升级：与正常终局相同的升级判定（按冻结快照，只产生一次结果）
 function applyLayer1TimeoutEscalateTx(pkg, tier, ts) {
+  // 案件组门控：超时自动驳回后同样要先判定组级开放条件
+  let gate = null;
+  if (mediationGroupGate) gate = mediationGroupGate(pkg.id, ts);
+  if (gate && gate.mode === 'park') {
+    finalizeLayer1WithoutArbitrationTx(pkg, tier, ts, { park: true, reason: gate.reason || '' });
+    if (mediationGroupSync) mediationGroupSync(pkg.id, ts);
+    return;
+  }
+  if (gate && gate.mode === 'block') {
+    finalizeLayer1WithoutArbitrationTx(pkg, tier, ts, { park: false, reason: gate.reason || '' });
+    if (mediationGroupSync) mediationGroupSync(pkg.id, ts);
+    return;
+  }
   db.prepare(`
     UPDATE mediation_tiers
     SET status = 'completed', completed_at = COALESCE(completed_at, ?),
@@ -829,6 +845,7 @@ function applyLayer1TimeoutEscalateTx(pkg, tier, ts) {
     packageId: pkg.id, tier: 1, policy: 'escalate',
   });
   const escalated = maybeOpenLayer2Tx(pkg, ts);
+  if (mediationGroupSync) mediationGroupSync(pkg.id, ts);
   if (!escalated) {
     // 自动驳回后仍未达到升级条件：第二层永不开放，调解包按第一层终局完成
     db.prepare(`
@@ -929,12 +946,17 @@ export function consumeMediationInvitation({ rawToken, clientIp, expectedTier })
     }
     if (invite.tier === 2) {
       if (pkgNow.status !== 'arbitrating' || !tier || tier.status !== 'active') {
-        // 第一层未达到升级条件：第二层不能校验、查看或提交意见
+        // 案件组成员未达到组级开放条件时，仲裁邀请必须继续拒绝
+        let gateReason = '';
+        if (mediationGroupGate) {
+          const gate = mediationGroupGate(invite.package_id, now());
+          gateReason = gate ? gate.reason : '';
+        }
         return {
           ok: false,
           status: 409,
-          code: 'ARBITRATION_NOT_OPEN',
-          message: MEDIATION_ERRORS.ARBITRATION_NOT_OPEN,
+          code: gateReason ? 'CASE_GROUP_ARBITRATION_NOT_OPEN' : 'ARBITRATION_NOT_OPEN',
+          message: gateReason || MEDIATION_ERRORS.ARBITRATION_NOT_OPEN,
         };
       }
     }
@@ -1102,7 +1124,29 @@ export function getMediationReviewerContext(review) {
     view: buildMediationReviewView(snapshot, authorizedKeys),
     opinions: myOpinions,
     merged,
+    // 第二层仲裁人：案件组允许披露的跨包摘要（脱敏聚合，不含其他包字段原文）
+    ...(session.tier === 2 ? {
+      group: mediationCrossPackageDisclosure
+        ? {
+            member: getCaseGroupMemberInfoSafe(pkg.id),
+            crossPackageSummary: mediationCrossPackageDisclosure(pkg.id),
+          }
+        : null,
+    } : {}),
   };
+}
+
+function getCaseGroupMemberInfoSafe(packageId) {
+  try {
+    return caseGroupMemberInfoHook ? caseGroupMemberInfoHook(packageId) : null;
+  } catch {
+    return null;
+  }
+}
+
+let caseGroupMemberInfoHook = null;
+export function bindCaseGroupMemberInfoHook(fn) {
+  caseGroupMemberInfoHook = fn;
 }
 
 // 组装复核人侧单个字段的合并视图（本层意见 + 允许披露的上一层摘要/冻结证据）
@@ -1303,6 +1347,123 @@ export function bindMediationCorrectionFactory(fn) {
   mediationCorrectionFactory = fn;
 }
 
+// 案件组门控钩子：由 caseGroupStore 注入，避免 ESM 循环依赖。
+// 契约见 caseGroupStore.bindMediationGroupGate。返回：
+//   null            非案件组成员：按原调解包逻辑处理
+//   { mode:'open' }        达到组级开放条件：正常开放第二层
+//   { mode:'park' }        未轮到/前置成员未完成：第一层终局挂起，第二层继续拒绝
+//   { mode:'block' }       明确不开放（组超时策略/收集组取消）：第一层终局完成
+let mediationGroupGate = null;
+export function bindMediationGroupGate(fn) {
+  mediationGroupGate = fn;
+}
+
+// 案件组状态同步钩子：包取消/超时等任何终局变化后，按冻结规则原子更新组状态
+let mediationGroupSync = null;
+export function bindMediationGroupSync(fn) {
+  mediationGroupSync = fn;
+}
+
+// 案件组跨包摘要查询钩子：仲裁人上下文只取组级允许披露的脱敏摘要
+let mediationCrossPackageDisclosure = null;
+export function bindMediationCrossPackageDisclosure(fn) {
+  mediationCrossPackageDisclosure = fn;
+}
+
+export function loadMediationPackageTx(packageId) {
+  return loadPackageTx(packageId);
+}
+
+// 事务内：对已达到第一层升级条件的调解包执行【原生第二层开放】（不含是否开放的判定）。
+// 从 maybeOpenLayer2Tx 抽出，供案件组门控在 mode='open' 时复用。
+export function openLayer2NativeTx(pkg, ts) {
+  return maybeOpenLayer2Tx(pkg, ts);
+}
+
+// 事务内：第一层终局但第二层不开放（组门控 park/block 之外的原生“不升级”路径之外，
+// 由案件组门控显式调用）：标记第二层 skipped、调解包按第一层终局完成。
+// park=true 时仅冻结第一层并挂起（包保持 mediating，等待前置成员完成）。
+export function finalizeLayer1WithoutArbitrationTx(pkg, tier, ts, { park = false, reason = '' } = {}) {
+  const autoRejected = autoRejectPendingFieldsTx(pkg, tier, ts);
+  db.prepare(`
+    UPDATE mediation_tiers SET status = 'completed', completed_at = COALESCE(completed_at, ?),
+      final_decision = CASE WHEN final_decision = '' THEN 'escalated_pending_group' ELSE final_decision END
+    WHERE id = ? AND status = 'active'
+  `).run(ts, tier.id);
+  addMediationEvent(pkg.receipt_no, 'review.mediation.tier.completed', {
+    packageId: pkg.id, tier: 1, escalated: false, parked: park,
+    autoRejectedFields: autoRejected.map((f) => batchFieldKey(f.step, f.field)),
+  });
+  if (park) {
+    addMediationEvent(pkg.receipt_no, 'review.mediation.group.parked', { packageId: pkg.id, reason });
+    return { parked: true };
+  }
+  db.prepare(`
+    UPDATE mediation_tiers SET status = 'skipped', final_decision = 'group_gate_blocked'
+    WHERE package_id = ? AND tier = 2 AND status = 'pending'
+  `).run(pkg.id);
+  db.prepare(`
+    UPDATE mediation_packages SET status = 'completed', completed_at = COALESCE(completed_at, ?) WHERE id = ?
+  `).run(ts, pkg.id);
+  addMediationEvent(pkg.receipt_no, 'review.mediation.completed', {
+    packageId: pkg.id, afterTier: 1, escalated: false, groupGateBlocked: true, reason,
+  });
+  return { parked: false, completed: true };
+}
+
+// 事务内：组级 fail 策略强制终结一个成员包（未使用邀请失效、未决字段超时留档）。
+export function forceFinishPackageByGroupTx(pkg, ts, { packageStatus = 'failed', reason = '' } = {}) {
+  db.prepare(`
+    UPDATE mediation_invitations
+    SET status = 'revoked', revoked_at = ?, revoke_reason = '案件组超时失败'
+    WHERE package_id = ? AND used_at IS NULL AND revoked_at IS NULL
+  `).run(ts, pkg.id);
+  db.prepare('UPDATE mediation_sessions SET expires_at = 0 WHERE package_id = ?').run(pkg.id);
+  db.prepare(`
+    UPDATE mediation_fields SET status = 'timed_out' WHERE package_id = ? AND decision IS NULL
+  `).run(pkg.id);
+  for (const tierId of db.prepare('SELECT id FROM mediation_tiers WHERE package_id = ?').all(pkg.id).map((r) => r.id)) {
+    db.prepare(`
+      UPDATE mediation_tiers
+      SET status = CASE WHEN status = 'active' THEN 'failed' WHEN status = 'pending' THEN 'skipped' ELSE status END,
+          completed_at = COALESCE(completed_at, ?),
+          final_decision = CASE WHEN status = 'active' THEN 'group_timeout_failed' ELSE final_decision END,
+          timeout_fired_at = COALESCE(timeout_fired_at, ?),
+          timeout_result = CASE WHEN status = 'active' THEN 'group_fail' ELSE timeout_result END
+      WHERE id = ?
+    `).run(ts, ts, tierId);
+  }
+  db.prepare('UPDATE mediation_packages SET status = ?, expired_at = COALESCE(expired_at, ?) WHERE id = ?')
+    .run(packageStatus, ts, pkg.id);
+  addMediationEvent(pkg.receipt_no, 'review.mediation.group.forced', { packageId: pkg.id, packageStatus, reason });
+}
+
+// 供案件组在事务内查询第二层门控所需的包/层状态
+export function mediationLayer1StateTx(packageId) {
+  const pkg = loadPackageTx(packageId);
+  if (!pkg) return null;
+  const tier1 = loadTierTx(packageId, 1);
+  const tier2 = loadTierTx(packageId, 2);
+  const rejectedCount = db.prepare(`
+    SELECT COUNT(*) AS n FROM mediation_fields WHERE tier_id = ? AND decision = 'rejected'
+  `).get(tier1.id).n;
+  const pendingCount = db.prepare(`
+    SELECT COUNT(*) AS n FROM mediation_fields
+    WHERE tier_id = ? AND decision IS NULL AND status <> 'skipped'
+  `).get(tier1.id).n;
+  return {
+    packageId: pkg.id,
+    batchId: pkg.batch_id,
+    roundId: pkg.round_id,
+    receiptNo: pkg.receipt_no,
+    status: pkg.status,
+    tier1Status: tier1.status,
+    tier2Status: tier2.status,
+    rejectedCount,
+    pendingCount,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // 办理人逐字段决议（第一层调解 / 第二层仲裁）：
 //   - 接受：本层提出意见的不同处理人数达到该层冻结的接受阈值；
@@ -1470,6 +1631,7 @@ export function decideMediationField({ userId, packageId, mediationFieldId, acti
           packageStatus: result.status,
           escalated: result.escalated,
           packageCompleted: result.completed,
+          parked: result.parked,
         };
       }
 
@@ -1511,6 +1673,7 @@ export function decideMediationField({ userId, packageId, mediationFieldId, acti
           packageStatus: result.status,
           escalated: result.escalated,
           packageCompleted: result.completed,
+          parked: result.parked,
         };
       }
       return { ok: false, status: 400, code: 'INVALID_ACTION', message: '决议类型必须是 accept 或 reject' };
@@ -1550,6 +1713,23 @@ function afterFieldDecisionTx(pkg, tier, ts) {
       SELECT COUNT(*) AS n FROM mediation_fields WHERE tier_id = ? AND decision = 'rejected'
     `).get(tier.id).n;
     if (rejectedCount >= tier.escalate_rejected_count && tier.status === 'active') {
+      // 达到第一层升级条件。是否开放第二层还要过【案件组组级开放条件】：
+      //   open → 正常按冻结快照开放；park → 第一层终局挂起等待前置成员；
+      //   block → 第一层终局完成，第二层永不开放。
+      let gate = null;
+      if (mediationGroupGate) {
+        gate = mediationGroupGate(pkg.id, ts);
+      }
+      if (gate && gate.mode === 'park') {
+        finalizeLayer1WithoutArbitrationTx(pkg, tier, ts, { park: true, reason: gate.reason || '' });
+        if (mediationGroupSync) mediationGroupSync(pkg.id, ts);
+        return { completed: false, escalated: false, parked: true, status: pkg.status, pkg: packageOwnerView(loadPackageTx(pkg.id)) };
+      }
+      if (gate && gate.mode === 'block') {
+        finalizeLayer1WithoutArbitrationTx(pkg, tier, ts, { park: false, reason: gate.reason || '' });
+        if (mediationGroupSync) mediationGroupSync(pkg.id, ts);
+        return { completed: true, escalated: false, status: 'completed', pkg: packageOwnerView(loadPackageTx(pkg.id)) };
+      }
       // 达到升级条件：第一层立即冻结终局。第一层剩余未决字段由系统自动驳回（留档），
       // 其意见原样保留；已被第一层接受的字段不动。
       const autoRejected = autoRejectPendingFieldsTx(pkg, tier, ts);
@@ -1563,6 +1743,7 @@ function afterFieldDecisionTx(pkg, tier, ts) {
         autoRejectedFields: autoRejected.map((f) => batchFieldKey(f.step, f.field)),
       });
       const escalated = maybeOpenLayer2Tx(pkg, ts);
+      if (mediationGroupSync) mediationGroupSync(pkg.id, ts);
       if (escalated) {
         return { completed: false, escalated: true, status: 'arbitrating', pkg: packageOwnerView(loadPackageTx(pkg.id)) };
       }
@@ -1727,6 +1908,7 @@ export function attachCorrectionReceiptForMediation({ workflowId, receiptNo }) {
       db.prepare("UPDATE mediation_packages SET status = 'completed', completed_at = COALESCE(completed_at, ?) WHERE id = ?")
         .run(ts, pkg.id);
       addMediationEvent(pkg.receipt_no, 'review.mediation.completed', { packageId: pkg.id, afterCorrection: receiptNo });
+      if (mediationGroupSync) mediationGroupSync(pkg.id, ts);
     }
   }
 }
@@ -1753,6 +1935,7 @@ export function resolveMediationCorrectionAbandonment(workflowId) {
         packageId: pkg.id, workflowId, sourceTier: link.source_tier,
       });
     }
+    if (mediationGroupSync) mediationGroupSync(link.package_id, now());
   }
   return packageIds;
 }

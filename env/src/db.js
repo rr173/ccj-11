@@ -34,6 +34,13 @@ import {
   listMediationPackagesForOwner,
   bindMediationCorrectionFactory,
 } from './mediationStore.js';
+import {
+  buildCaseGroupTimelineEntries,
+  listCaseGroupsForOwner,
+  recoverCaseGroupsOnStartup,
+  sweepCaseGroupTimeouts,
+  getCrossPackageDisclosureForSession,
+} from './caseGroupStore.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -803,6 +810,92 @@ CREATE TABLE IF NOT EXISTS mediation_corrections (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mediation_corrections_one_open
   ON mediation_corrections(package_id) WHERE completed_at IS NULL;
+
+-- ---------------------------------------------------------------------------
+-- 案件组（case group）：同一原批次下、多个【已完成申诉回合】生成的调解包的
+-- 跨包冲突协调与按冻结顺序处理。加入时做冲突检查并生成只读组级冻结快照；
+-- 组开始处理后配置冻结，成员包不能重复加入其他未终结案件组。
+-- 状态机：collecting（加入/配置阶段）→ processing（按冻结顺序处理）
+--         → completed；终态 failed / cancelled。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS case_groups (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL,
+  receipt_no TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'collecting'
+    CHECK (status IN ('collecting', 'processing', 'completed', 'failed', 'cancelled')),
+  note TEXT NOT NULL DEFAULT '',
+  config_json TEXT NOT NULL DEFAULT '{}',
+  frozen_snapshot_json TEXT NOT NULL DEFAULT '{}',
+  min_completions INTEGER NOT NULL DEFAULT 1,
+  member_order_json TEXT NOT NULL DEFAULT '[]',
+  timeout_policy TEXT NOT NULL DEFAULT 'block_remaining',
+  disclosures_json TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  configured_at INTEGER,
+  started_at INTEGER,
+  deadline_at INTEGER,
+  completed_at INTEGER,
+  cancelled_at INTEGER,
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  timeout_fired_at INTEGER,
+  timeout_result TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_case_groups_user ON case_groups(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_case_groups_batch ON case_groups(batch_id, created_at);
+
+-- 组成员：加入瞬间冻结来源/字段授权/两层配置/包状态（member_snapshot_json）。
+-- open_group_id 为该包当前归属的未终结案件组：组终结（completed/failed/cancelled）
+-- 时清空，部分唯一索引保证成员包不能同时处于两个未终结案件组。
+CREATE TABLE IF NOT EXISTS case_group_members (
+  id TEXT PRIMARY KEY,
+  group_id TEXT NOT NULL REFERENCES case_groups(id) ON DELETE CASCADE,
+  package_id TEXT NOT NULL,
+  round_id TEXT NOT NULL,
+  batch_id TEXT NOT NULL,
+  receipt_no TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'joined'
+    CHECK (status IN ('joined', 'layer1_open', 'parked', 'arbitrating',
+                      'arbitration_blocked', 'completed', 'failed', 'cancelled', 'released')),
+  open_group_id TEXT,
+  gate_reason TEXT NOT NULL DEFAULT '',
+  member_snapshot_json TEXT NOT NULL DEFAULT '{}',
+  result_json TEXT NOT NULL DEFAULT '{}',
+  joined_at INTEGER NOT NULL,
+  gate_decided_at INTEGER,
+  finished_at INTEGER,
+  UNIQUE(group_id, package_id)
+);
+CREATE INDEX IF NOT EXISTS idx_case_group_members_group ON case_group_members(group_id, ordinal);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_case_group_members_one_open
+  ON case_group_members(package_id) WHERE open_group_id IS NOT NULL;
+
+-- 加入时未通过冲突检查的调解包留档（不能进入案件组，原因持久化）
+CREATE TABLE IF NOT EXISTS case_group_rejections (
+  id TEXT PRIMARY KEY,
+  group_id TEXT NOT NULL REFERENCES case_groups(id) ON DELETE CASCADE,
+  package_id TEXT NOT NULL,
+  round_id TEXT NOT NULL DEFAULT '',
+  batch_id TEXT NOT NULL DEFAULT '',
+  reason_code TEXT NOT NULL,
+  reason_detail TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_case_group_rejections_group ON case_group_rejections(group_id, created_at);
+
+-- 组级允许披露的跨包摘要：成员包开放第二层仲裁瞬间按冻结规则生成，
+-- 只含其他成员包的聚合结论（计数/状态/自动驳回标记），不含任何其他包字段原文。
+CREATE TABLE IF NOT EXISTS case_group_disclosures (
+  id TEXT PRIMARY KEY,
+  group_id TEXT NOT NULL REFERENCES case_groups(id) ON DELETE CASCADE,
+  viewer_package_id TEXT NOT NULL,
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  UNIQUE(group_id, viewer_package_id)
+);
 `);
 
 // 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
@@ -2151,6 +2244,18 @@ export function getTimelineForUser(userId) {
     if (!mediationEntriesByRound.has(mediationEntry.roundId)) mediationEntriesByRound.set(mediationEntry.roundId, []);
     mediationEntriesByRound.get(mediationEntry.roundId).push(mediationEntry);
   }
+  // 案件组按其锚点成员包归组：时间线中插入到该调解包条目之后
+  const caseGroups = buildCaseGroupTimelineEntries(userId);
+  const caseGroupIdsByPackage = new Map();
+  for (const groupEntry of caseGroups) {
+    const anchor = (groupEntry.memberOrder || [])[0]
+      || (groupEntry.members || [])[0]?.packageId
+      || '';
+    if (anchor) {
+      if (!caseGroupIdsByPackage.has(anchor)) caseGroupIdsByPackage.set(anchor, []);
+      caseGroupIdsByPackage.get(anchor).push(groupEntry);
+    }
+  }
   for (const entry of entries) {
     withReviews.push(entry);
     if (entry.kind !== 'receipt') continue;
@@ -2167,6 +2272,10 @@ export function getTimelineForUser(userId) {
           withReviews.push({ sequence: entry.sequence, ...appealEntry });
           for (const mediationEntry of mediationEntriesByRound.get(appealEntry.roundId) || []) {
             withReviews.push({ sequence: entry.sequence, ...mediationEntry });
+            // 案件组条目插入到其锚点调解包之后
+            for (const caseGroupEntry of caseGroupIdsByPackage.get(mediationEntry.packageId) || []) {
+              withReviews.push({ sequence: entry.sequence, ...caseGroupEntry, kind: 'caseGroup' });
+            }
           }
         }
         continue;
@@ -2246,6 +2355,7 @@ export function getStateForUser(userId) {
   envelope.reviewBatches = listBatchesForOwner(userId);
   envelope.reviewAppeals = listAppealRoundsForOwner(userId);
   envelope.mediationPackages = listMediationPackagesForOwner(userId);
+  envelope.caseGroups = listCaseGroupsForOwner(userId);
   return envelope;
 }
 
@@ -2299,3 +2409,20 @@ export {
   submitMediationOpinion,
   sweepMediationTimeouts,
 } from './mediationStore.js';
+
+// 案件组（跨包冲突协调）：统一从 db.js 重导出
+export {
+  createCaseGroup,
+  addCaseGroupMember,
+  configureCaseGroup,
+  startCaseGroup,
+  cancelCaseGroup,
+  getCaseGroupForOwner,
+  listCaseGroupsForOwner,
+  listGroupablePackages,
+  sweepCaseGroupTimeouts,
+  recoverCaseGroupsOnStartup,
+  getCaseGroupMemberInfo,
+  getCrossPackageDisclosureForSession,
+  buildCaseGroupTimelineEntries,
+} from './caseGroupStore.js';
