@@ -105,7 +105,28 @@ import {
   listCredentialsForOwner,
   sweepArchiveExports,
   recoverArchiveExportsOnStartup,
+  createArchiveComparison,
+  verifyComparison,
+  getComparisonForOwner,
+  listComparisonsForOwner,
+  listComparisonsForAuditor,
+  getComparisonForAuditor,
+  createReplaySession,
+  getReplayForOwner,
+  listReplaysForOwner,
+  issueReplaySubmitToken,
+  submitReplayOpinion,
+  pauseReplaySession,
+  resumeReplaySession,
+  cancelReplaySession,
 } from './db.js';
+import {
+  parseComparisonCreateInput,
+  parseReplayCreateInput,
+  parseReplayOpinionInput,
+  parseReplayControlInput,
+  COMPARISON_ERRORS,
+} from './archiveComparisons.js';
 import { validateDraft, validateStepPayload } from './validation.js';
 import { stableStringify } from './crypto.js';
 import { STEPS } from './workflow.js';
@@ -587,6 +608,58 @@ async function handleApi(req, res, url) {
     if (action === 'redownload') return redownloadCredentialRoute(req, res, user, exportId);
   }
 
+  // 归档版本比较报告（办理人：只读）
+  if (url.pathname === '/api/archive-comparisons' && req.method === 'POST') {
+    return createComparisonRoute(req, res, user);
+  }
+  if (url.pathname === '/api/archive-comparisons' && req.method === 'GET') {
+    const sourceType = url.searchParams.get('sourceType') || '';
+    const sourceId = url.searchParams.get('sourceId') || '';
+    return sendJson(res, 200, { comparisons: listComparisonsForOwner(user.id, { sourceType, sourceId }) });
+  }
+  const comparisonGetMatch = /^\/api\/archive-comparisons\/([^/]+)$/.exec(url.pathname);
+  if (comparisonGetMatch && req.method === 'GET') {
+    const comparison = getComparisonForOwner({
+      userId: user.id,
+      comparisonId: decodeURIComponent(comparisonGetMatch[1]),
+    });
+    if (!comparison) return sendJson(res, 404, { error: { code: 'COMPARE_NOT_FOUND', message: COMPARISON_ERRORS.COMPARE_NOT_FOUND } });
+    return sendJson(res, 200, { comparison });
+  }
+  const replayCreateMatch = /^\/api\/archive-comparisons\/([^/]+)\/replays$/.exec(url.pathname);
+  if (replayCreateMatch && req.method === 'POST') {
+    return createReplayRoute(req, res, user, replayCreateMatch[1]);
+  }
+  const replayListMatch = /^\/api\/archive-comparisons\/([^/]+)\/replays$/.exec(url.pathname);
+  if (replayListMatch && req.method === 'GET') {
+    return sendJson(res, 200, {
+      replays: listReplaysForOwner(user.id, { comparisonId: decodeURIComponent(replayListMatch[1]) }),
+    });
+  }
+
+  // 受控重放审阅会话
+  if (url.pathname === '/api/replay-sessions' && req.method === 'GET') {
+    return sendJson(res, 200, { replays: listReplaysForOwner(user.id) });
+  }
+  const replayMatch = /^\/api\/replay-sessions\/([^/]+)$/.exec(url.pathname);
+  if (replayMatch && req.method === 'GET') {
+    const replay = getReplayForOwner({ userId: user.id, replayId: decodeURIComponent(replayMatch[1]) });
+    if (!replay) return sendJson(res, 404, { error: { code: 'REPLAY_NOT_FOUND', message: COMPARISON_ERRORS.REPLAY_NOT_FOUND } });
+    return sendJson(res, 200, { replay });
+  }
+  const replayTokenMatch = /^\/api\/replay-sessions\/([^/]+)\/submit-token$/.exec(url.pathname);
+  if (replayTokenMatch && req.method === 'POST') {
+    return issueReplayTokenRoute(req, res, user, replayTokenMatch[1]);
+  }
+  const replayOpinionMatch = /^\/api\/replay-sessions\/([^/]+)\/opinions$/.exec(url.pathname);
+  if (replayOpinionMatch && req.method === 'POST') {
+    return submitReplayOpinionRoute(req, res, user, replayOpinionMatch[1]);
+  }
+  const replayControlMatch = /^\/api\/replay-sessions\/([^/]+)\/(pause|resume|cancel)$/.exec(url.pathname);
+  if (replayControlMatch && req.method === 'POST') {
+    return replayControlRoute(req, res, user, replayControlMatch[1], replayControlMatch[2]);
+  }
+
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
 }
 
@@ -594,6 +667,22 @@ async function handleApi(req, res, url) {
 function handleAuditorArchiveApi(req, res, user, url) {
   if (url.pathname === '/api/auditor/archives' && req.method === 'GET') {
     return sendJson(res, 200, { archives: listArchivesForAuditor(user.id) });
+  }
+  // 比较报告：只有同时被两个版本的权限快照授权时可见；只给脱敏条目，不含任何重放意见
+  if (url.pathname === '/api/auditor/comparisons' && req.method === 'GET') {
+    return sendJson(res, 200, { comparisons: listComparisonsForAuditor(user.id) });
+  }
+  const comparisonMatch = /^\/api\/auditor\/comparisons\/([^/]+)$/.exec(url.pathname);
+  if (comparisonMatch && req.method === 'GET') {
+    const comparison = getComparisonForAuditor({
+      userId: user.id,
+      comparisonId: decodeURIComponent(comparisonMatch[1]),
+    });
+    if (!comparison) return sendJson(res, 404, { error: { code: 'COMPARE_NOT_FOUND', message: COMPARISON_ERRORS.COMPARE_NOT_FOUND } });
+    if (comparison.forbidden) {
+      return sendJson(res, 403, { error: { code: 'COMPARE_VIEW_FORBIDDEN', message: COMPARISON_ERRORS.COMPARE_VIEW_FORBIDDEN } });
+    }
+    return sendJson(res, 200, { comparison });
   }
   const match = /^\/api\/auditor\/archives\/([^/]+)$/.exec(url.pathname);
   if (match && req.method === 'GET') {
@@ -1618,6 +1707,172 @@ async function redownloadCredentialRoute(req, res, user, rawExportId) {
   return issueDownloadCredentialRoute(req, res, user, rawExportId);
 }
 
+// ---------------------------------------------------------------------------
+// 归档版本比较报告：办理人侧（只读；不改写任一归档）
+// ---------------------------------------------------------------------------
+
+async function createComparisonRoute(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseComparisonCreateInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = createArchiveComparison({
+    userId: user.id,
+    baseArchiveId: parsed.value.baseArchiveId,
+    targetArchiveId: parsed.value.targetArchiveId,
+    note: parsed.value.note,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || COMPARISON_ERRORS[result.code] || '比较报告生成失败' },
+      detail: result.detail || null,
+    });
+  }
+  return sendJson(res, 200, { ok: true, comparison: result.comparison });
+}
+
+function replayTtlRange() {
+  const maxMinutes = Math.floor(config.replayMaxTtlMs / 60000);
+  const minMinutes = Math.max(1, Math.ceil(config.replayMinTtlMs / 60000));
+  return { minMinutes, maxMinutes };
+}
+
+async function createReplayRoute(req, res, user, rawComparisonId) {
+  const comparisonId = decodeURIComponent(rawComparisonId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(comparisonId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const { minMinutes, maxMinutes } = replayTtlRange();
+  const parsed = parseReplayCreateInput(body, { minMinutes, maxMinutes });
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = createReplaySession({
+    userId: user.id,
+    comparisonId,
+    entryKeys: parsed.value.entryKeys,
+    ttlMs: parsed.value.ttlMinutes * 60000,
+    note: parsed.value.note,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || COMPARISON_ERRORS[result.code] || '创建重放会话失败' },
+      entryKey: result.entryKey,
+      verification: result.verification || null,
+      replay: null,
+    });
+  }
+  // 创建即签发第一枚一次性提交令牌，页面刷新后可再取新令牌（旧令牌作废）
+  const token = issueReplaySubmitToken({ userId: user.id, replayId: result.replay.id });
+  return sendJson(res, 200, {
+    ok: true,
+    replay: result.replay,
+    submitToken: token.ok ? token.submitToken : null,
+    submitTokenExpiresAt: token.ok ? token.expiresAt : null,
+  });
+}
+
+async function issueReplayTokenRoute(req, res, user, rawReplayId) {
+  const replayId = decodeURIComponent(rawReplayId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(replayId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const result = issueReplaySubmitToken({ userId: user.id, replayId });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || COMPARISON_ERRORS[result.code] || '获取提交令牌失败' },
+    });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    submitToken: result.submitToken,
+    expiresAt: result.expiresAt,
+    ttlMs: result.ttlMs,
+    version: result.version,
+    replayStatus: result.replayStatus,
+  });
+}
+
+async function submitReplayOpinionRoute(req, res, user, rawReplayId) {
+  const replayId = decodeURIComponent(rawReplayId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(replayId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseReplayOpinionInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const value = parsed.value;
+  const result = submitReplayOpinion({
+    userId: user.id,
+    replayId,
+    entryKey: value.entryKey,
+    kind: value.kind,
+    comment: value.comment,
+    reason: value.reason,
+    idempotencyKey: value.idempotencyKey,
+    submitToken: value.submitToken,
+    expectedVersion: value.expectedVersion,
+    requestText: value.requestText,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || COMPARISON_ERRORS[result.code] || '提交失败' },
+      replay: result.replay === false ? false : undefined,
+      currentVersion: result.currentVersion,
+      existingKind: result.existingKind,
+    });
+  }
+  // 令牌一次性消费后，为下一次写操作补发一枚新令牌（旧令牌已被本次请求消费）
+  const nextToken = issueReplaySubmitToken({ userId: user.id, replayId });
+  return sendJson(res, 200, {
+    ok: true,
+    replay: Boolean(result.replay),
+    opinion: result.opinion,
+    version: result.version,
+    nextSubmitToken: nextToken.ok ? nextToken.submitToken : null,
+    nextSubmitTokenExpiresAt: nextToken.ok ? nextToken.expiresAt : null,
+  });
+}
+
+async function replayControlRoute(req, res, user, rawReplayId, action) {
+  const replayId = decodeURIComponent(rawReplayId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(replayId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseReplayControlInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const args = {
+    userId: user.id,
+    replayId,
+    submitToken: parsed.value.submitToken,
+    expectedVersion: parsed.value.expectedVersion,
+    reason: parsed.value.reason,
+  };
+  const result = action === 'pause' ? pauseReplaySession(args)
+    : action === 'resume' ? resumeReplaySession(args)
+      : cancelReplaySession(args);
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || COMPARISON_ERRORS[result.code] || '操作失败' },
+      currentVersion: result.currentVersion,
+      verification: result.verification || null,
+    });
+  }
+  // 暂停后不再签发写令牌；恢复成功后补发新令牌；取消后只读，不签发
+  let nextToken = null;
+  if (action === 'resume') nextToken = issueReplaySubmitToken({ userId: user.id, replayId });
+  return sendJson(res, 200, {
+    ok: true,
+    replay: result.replay,
+    verification: result.verification || result.replay?.verification || null,
+    nextSubmitToken: nextToken?.ok ? nextToken.submitToken : null,
+    nextSubmitTokenExpiresAt: nextToken?.ok ? nextToken.expiresAt : null,
+  });
+}
+
 // 免登录外部核验：一次性核验码，只返回事件数量/时间范围/摘要链连续性/最终状态
 async function archiveExternalVerify(req, res) {
   const clientIp = req.socket.remoteAddress || 'unknown';
@@ -1932,6 +2187,8 @@ function startBatchTimeoutSweep() {
   try { recoverCaseGroupsOnStartup(); } catch { /* 案件组成员状态对齐 */ }
   // 归档导出：未完成任务从持久化的分块进度继续，完成/过期状态重新对齐
   try { recoverArchiveExportsOnStartup(); } catch { /* 归档导出恢复 */ }
+  // 重放会话过期落定（只读恢复不依赖扫描，扫描只负责把到期会话转为 expired）
+  try { sweepReplaySessions(); } catch { /* 重放过期恢复 */ }
   batchSweepTimer = setInterval(() => {
     try { sweepBatchTimeouts(); } catch (error) { console.error('batch timeout sweep failed', error); }
     try { sweepAppealTimeouts(); } catch (error) { console.error('appeal timeout sweep failed', error); }
@@ -1942,6 +2199,7 @@ function startBatchTimeoutSweep() {
   // 归档导出后台任务：分块推进、断点续传与过期清理（间隔可经 ARCHIVE_SWEEP_MS 调整）
   archiveSweepTimer = setInterval(() => {
     try { sweepArchiveExports(); } catch (error) { console.error('archive export sweep failed', error); }
+    try { sweepReplaySessions(); } catch (error) { console.error('replay session sweep failed', error); }
   }, config.archiveSweepMs);
   archiveSweepTimer.unref?.();
 }

@@ -30,6 +30,26 @@ function sha256Hex(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+// 冻结事件的“内容负载”：与摘要链哈希输入字段一致，但不含 prev_hash，
+// 供版本比较判断同一原始事件在两个归档版本中内容是否真的被修改
+// （不能直接用 event_hash：链中后继事件的摘要会随新增事件而整体变化）。
+export function frozenEventPayload(event) {
+  return stableStringify({
+    sourceEventId: event.source_event_id,
+    workflowId: event.workflow_id,
+    type: event.event_type,
+    step: event.step ?? null,
+    detail: safeJson(event.detail_json, {}),
+    actorRole: event.actor_role,
+    actorLabel: event.actor_label,
+    occurredAt: event.occurred_at,
+  });
+}
+
+export function frozenEventContentHash(event) {
+  return sha256Hex(frozenEventPayload(event));
+}
+
 const GENESIS = 'ARCHIVE-GENESIS-v1';
 
 // 分块处理的任务锁 TTL：持锁进程崩溃后，超过该时间的 running 任务可被重新接管

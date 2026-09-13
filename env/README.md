@@ -297,6 +297,46 @@ COOKIE_SECURE: "1"
 - **一次性下载凭证**：`POST …/exports/{id}?action=credential` 对已完成任务签发一次性凭证（默认 15 分钟）；免登录兑换 `GET /api/archives/exports/{id}/download?credential=…`（凭证本身即授权），响应带 `X-File-Version` 与 `X-Content-Digest: sha-256=…`。重复使用 `410 EXPORT_CREDENTIAL_USED`；越权归档 `EXPORT_CREDENTIAL_ARCHIVE_MISMATCH`；任务取消 `EXPORT_TASK_CANCELLED`；任务/文件过期被清理 `EXPORT_TASK_EXPIRED`；凭证过期 `EXPORT_CREDENTIAL_EXPIRED`；未完成 `EXPORT_NOT_COMPLETED`。
 - **过期清理**：后台扫描把超过保留期的已完成任务文件内容清空并置 `expired`（任务行与审计事件留档），其活动凭证一并过期；过期凭证与外部核验码同样被置过期。办理页展示归档来源、冻结时间、事件数量、摘要链校验、三种视图权限、导出进度、凭证状态与失败原因。
 
+## 归档版本对比与受控重放审阅（只读报告 + 冻结副本重放）
+
+办理人可为**同一来源**的两个**已冻结归档版本**生成只读比较报告，并从报告获准的事件子集创建**受控重放审阅会话**。两者都严格只读：比较不触碰任一归档，重放不触碰归档、业务记录或导出文件。
+
+### 只读比较报告
+
+`POST /api/archive-comparisons { baseArchiveId, targetArchiveId, note }`：
+
+- **前置校验**：两个归档都属于当前办理人（否则 `404 COMPARE_ARCHIVE_NOT_FOUND`，不区分“不存在/他人所有”）；不能是同一归档（`400 COMPARE_SAME_ARCHIVE`）；必须 `source_type + source_id` 完全相同（`409 COMPARE_NOT_SAME_SOURCE`）；版本低者自动作为基准（base）、高者作为目标（target）。
+- **摘要链失效拒绝比较**：生成前实时重算两个归档的摘要链，任一失效即 `409 ARCHIVE_CHAIN_INVALID`，响应 `detail.side` 指明是基准还是目标版本及其断点；失效归档之间不产生任何报告行。
+- **事件对齐（按事件顺序）**：以原始事件 id 为键、基准序列中的目标下标求最长递增子序列（LCS）对齐，条目按合并后的事件顺序编号，逐事件分类：
+  - `added` 新增：只存在于目标（较新）版本；
+  - `deleted` 删除：只存在于基准（较旧）版本；
+  - `modified` 修改：两版共有但**冻结内容**不同（比较用不含链信息的事件内容摘要，因此后继事件新增不会把前面的事件误判为修改）；
+  - `unchanged` 未变化：两版共有且内容一致；
+  - `unaligned` 无法对齐：同一事件在两个版本中的相对顺序不一致（落在 LCS 之外），条目给出明确原因，**永远不能加入重放**。
+- **四类汇总比较**：摘要链连续性（两版最终摘要、跨版本顺序是否可对齐）、**来源关系差异**（新增/移除的来源链）、**状态摘要差异**（逐字段 from/to）、**权限快照差异**（新增/移除的授权审计员、外部视图字段）。
+- **冻结与校验**：规范化报告体计算 SHA-256 `digest` 存 `audit_comparisons.body_json/digest`，条目另存 `audit_comparison_entries`；报告与条目创建后**没有任何改写路径**。每次读取都重算 digest 并实时重算两份归档摘要链（`verification.reportOk / digestMatches / archiveChainsOk / reasons[]`）；报告生成后归档再新增业务事件、再归档新版本，**报告内容与 digest 均不变**。
+- 办理人查询 `GET /api/archive-comparisons[/{id}]`；审计员查询 `GET /api/auditor/comparisons[/{id}]`：**只有同时被两个版本创建时的权限快照授权**才可见（否则列表不可见、直接访问 `403 COMPARE_VIEW_FORBIDDEN`），审计员视图不含任何重放会话或意见信息。
+
+### 受控重放审阅会话
+
+`POST /api/archive-comparisons/{id}/replays { entryKeys[], ttlMinutes }` 从报告中获准的**已对齐事件**创建：
+
+- **事件子集受控**：空子集 `400 REPLAY_SUBSET_EMPTY`；任何不在报告中的键、或 `unaligned` 条目一律 `403 REPLAY_EVENT_OUT_OF_SCOPE`；他人报告 `404 COMPARE_NOT_FOUND`。创建时报告 digest 与双归档摘要链必须全部有效，否则 `409 REPLAY_REPORT_INVALID`。
+- **冻结副本**：所选事件在单事务内复制到 `audit_replay_events`（新增/修改/未变化取目标版本，删除取基准版本）；重放期间只读这份副本，敏感字段继续按归档视图在服务端脱敏。
+- **版本号、过期时间与一次性提交令牌**：会话有单调递增 `version`（每次写入 +1）、`expiresAt`（默认 5 分钟～7 天，`REPLAY_MIN_TTL_MS/REPLAY_MAX_TTL_MS` 可配）。写操作必须先 `POST /api/replay-sessions/{id}/submit-token` 取一枚**一次性提交令牌**（默认 10 分钟，`REPLAY_SUBMIT_TOKEN_TTL_MS`），每次意见/暂停/恢复/取消消费一枚；新令牌作废旧令牌，使用已用/作废/过期令牌分别返回 `REPLAY_TOKEN_INVALID/REPLAY_TOKEN_EXPIRED`。
+- **三类写入**：`POST /api/replay-sessions/{id}/opinions { entryKey, kind, comment/reason, idempotencyKey, submitToken, expectedVersion }`：
+  - `comment` 添加意见（可多次追加，1-1000 字）；`confirm` 标记已确认；`object` 提出异议（需 2-500 字理由）。
+  - **幂等重试**：同一事件的意见按 `idempotencyKey` 幂等，同键同指纹的网络重试（即使发生在暂停/取消/过期之后、令牌已用尽时）返回**同一条意见**（`replay:true`）；同键换内容 `409 REPLAY_IDEMPOTENCY_CONFLICT`。
+  - **并发确认唯一**：每个事件至多一条 confirm/object 结论，部分唯一索引兜底，两个页面并发确认**只有一个成功**，负者得 `409 REPLAY_ALREADY_DECIDED`，重复确认同样明确拒绝。
+  - 旧版本提交 `409 REPLAY_VERSION_CONFLICT`（先于令牌校验，不让有效令牌因版本过期而作废）；事件不在本会话 `403 REPLAY_EVENT_OUT_OF_SCOPE`。
+- **暂停 / 恢复 / 取消**：`POST /api/replay-sessions/{id}/pause|resume|cancel`（带令牌与 `expectedVersion`）。
+  - 暂停后**不能写入意见**（`409 REPLAY_PAUSED`），但仍可获取控制令牌；
+  - 恢复必须重新校验**比较报告 digest 与两份归档摘要链仍然有效、会话版本未变化**，否则 `409 REPLAY_REPORT_INVALID`，校验通过版本 +1 并补发写令牌；
+  - 取消后会话**只读**：写操作 `409 REPLAY_CANCELLED_READONLY`，历史意见与审计时间线全部保留；重复取消 `REPLAY_ALREADY_CANCELLED`；
+  - 过期后所有写操作 `410 REPLAY_EXPIRED`（后台 sweep 落定状态），GET 仍返回只读视图。
+- **重启/刷新一致性**：会话状态、版本、过期时间、冻结事件、意见、审计时间线全部持久化；服务重启、重新登录、页面刷新后从服务端恢复一致视图与倒计时，提交令牌重新获取即可。办理页展示版本差异、报告校验状态、重放进度（已选/已确认/异议/意见/剩余）、倒计时与审计时间线。
+- **隔离边界**：重放意见只存 `audit_replay_opinions`，审计员比较视图与免登录外部核验都**看不到任何重放意见原文**；比较、重放、下载全过程不修改 `audit_archives/audit_archive_events` 与任何业务表（只有 INSERT 到比较/重放自有表，且归档审计时间线追加 `audit.comparison.created/audit.replay.created` 事件）。
+
 ## 多方复核批次（可配置的多方复核与决议编排）
 
 办理人可在**已签发回执**上创建一个多方复核批次：同一份回执配 2～5 个**限时、一次性**邀请，每个邀请有独立的**可查看字段范围**，批次对每个纳入编排的字段配置**接受阈值 / 驳回阈值**。批次只有在全部邀请完成一次性校验后才能进入复核；复核人只能针对**本邀请被授权的字段**提交意见；同一字段的多份意见**合并展示但逐字保留每位复核人的原始说明**；办理人逐字段作出接受或驳回决议时**必须满足对应阈值**；被接受字段的全部意见进入**同一份**新的更正办理并关联全部意见。
@@ -472,6 +512,17 @@ COOKIE_SECURE: "1"
 | POST | `/api/archives/exports/{id}?action=redownload` | 是（办理人） | 对已完成导出重新生成下载凭证 |
 | GET | `/api/archives/exports/{id}/download?credential=` | 否 | 一次性凭证兑换导出文件（重复使用/越权/取消/过期均拒绝；下载不改业务数据） |
 | GET | `/api/auditor/archives[/{id}]` | 是（审计员） | 仅授权归档的脱敏视图、来源关系与摘要链校验结果 |
+| POST | `/api/archive-comparisons` | 是（办理人） | 为同一来源的两个已冻结归档版本生成只读比较报告（任一摘要链失效即拒绝） |
+| GET | `/api/archive-comparisons[/{id}]` | 是（办理人） | 比较报告列表/详情（事件对齐、四类差异、digest 与双摘要链实时校验） |
+| POST | `/api/archive-comparisons/{id}/replays` | 是（办理人） | 从报告获准的已对齐事件子集创建受控重放会话（越权/未对齐事件拒绝） |
+| GET | `/api/archive-comparisons/{id}/replays` | 是（办理人） | 报告下的重放会话列表 |
+| GET | `/api/replay-sessions[/{id}]` | 是（办理人） | 重放会话列表/详情（冻结副本、意见、进度、版本、倒计时、审计时间线） |
+| POST | `/api/replay-sessions/{id}/submit-token` | 是（办理人） | 签发一次性提交令牌（新令牌作废旧令牌；取消/过期时拒绝） |
+| POST | `/api/replay-sessions/{id}/opinions` | 是（办理人） | 提交意见/确认/异议（幂等键、期望版本、一次性令牌；并发确认只成功一个） |
+| POST | `/api/replay-sessions/{id}/pause` | 是（办理人） | 暂停重放（暂停期间禁止写入意见） |
+| POST | `/api/replay-sessions/{id}/resume` | 是（办理人） | 恢复重放（重新校验报告 digest 与双归档摘要链、版本未变化） |
+| POST | `/api/replay-sessions/{id}/cancel` | 是（办理人） | 取消重放（会话只读，历史意见与审计事件保留） |
+| GET | `/api/auditor/comparisons[/{id}]` | 是（审计员） | 仅当同时被两个版本授权时可见的脱敏比较内容（不含任何重放意见） |
 | POST | `/api/archives/external-verify` | 否 | 外部一次性核验码核验，仅返回事件数量/时间范围/摘要链连续性/最终状态 |
 | POST | `/api/verify` | 否 | 编号+核验码核验，仅返回脱敏结果，按 IP 限流 |
 | GET | `/api/public/receipts/{no}/print?code=` | 否 | 脱敏可打印回执文档 |
@@ -525,6 +576,12 @@ COOKIE_SECURE: "1"
 - `audit_exports`：导出后台任务（幂等键、`queued/running/completed/failed/cancelled/expired` 状态、分块总数/已完成数/进度、文件版本/内容/`file_digest`/大小、worker 锁与锁 TTL、保留期；部分唯一索引 `idx_audit_exports_one_active` 保证同一归档同版本至多一份进行中）
 - `audit_export_chunks`：导出分块内容与分块摘要（断点续传；重启后从已完成分块之后继续）
 - `audit_export_credentials` / `audit_external_codes`：一次性下载凭证与外部核验码（只存哈希、`active/used/revoked/expired`、使用时间/IP、过期时间；重复使用/取消/过期均拒绝）
+- `audit_comparisons` / `audit_comparison_entries`：只读归档版本比较报告（两版本引用、规范化报告体 `body_json` 与冻结 `digest`、新增/删除/修改/未变化/无法对齐计数、双摘要链状态；创建后无改写路径）与其按事件顺序排列的条目（`entry_key=e{source_event_id}`、两侧 ordinal/事件摘要/时间、无法对齐原因；`UNIQUE(comparison_id, entry_key)`）
+- `audit_replay_sessions`：受控重放会话（`active/paused/completed/cancelled/expired` 状态机、单调 `version`、过期时间、暂停/恢复/取消时间与原因、已选/确认/异议/意见计数）
+- `audit_replay_events`：会话创建时从比较报告引用的归档冻结事件复制的只读副本（来源侧 base/target、原始事件 id、类型/负载/操作人/时间/事件内容摘要）；`UNIQUE(replay_id, entry_key)`
+- `audit_replay_opinions`：重放意见（`comment/confirm/object`、逐字内容或异议理由、幂等键与请求指纹、写入时版本）；幂等唯一索引支持网络重试，部分唯一索引保证每事件至多一条 confirm/object 结论（并发确认只成功一个）
+- `audit_replay_submit_tokens`：重放一次性提交令牌（只存 SHA-256 哈希、`active/used/revoked/expired`、使用时间与关联意见/控制动作、过期时间；新签作废旧令牌）
+- `audit_replay_audit`：重放审计时间线（只追加：created/paused/resumed/cancelled/expired/confirm/object/opinion），服务重启后从表恢复
 - `users`：新增 `role`（`handler`/`auditor`；旧库自动补列），审计员只能访问 `/api/auditor/*` 脱敏视图
 - `correction_objections`：批次字段意见/普通异议/申诉意见/调解意见与更正办理的统一来源关联（新增 `mediation_opinion_id`、`source_package_id`、`source_tier`；完成更正时据此回填新回执编号；放弃更正时调解包终局保留、仅清理进行中关系）
 - `tokens`：令牌哈希、绑定维度、过期、使用、撤销状态
@@ -556,4 +613,8 @@ SQLite 启用 WAL 和外键；所有推进与回执签发都在同步 `BEGIN IMM
 | `ARCHIVE_CREDENTIAL_TTL_MS` | `900000` | 一次性下载凭证有效期（15 分钟） |
 | `ARCHIVE_EXTERNAL_CODE_TTL_MS` | `86400000` | 外部一次性核验码有效期（24 小时） |
 | `ARCHIVE_SWEEP_MS` | `1000` | 归档导出后台扫描间隔（分块推进、崩溃接管、过期清理） |
+| `REPLAY_MIN_TTL_MS` | `300000` | 受控重放会话最短有效期（5 分钟） |
+| `REPLAY_MAX_TTL_MS` | `604800000` | 受控重放会话最长有效期（7 天） |
+| `REPLAY_DEFAULT_TTL_MS` | `3600000` | 重放会话默认有效期（1 小时） |
+| `REPLAY_SUBMIT_TOKEN_TTL_MS` | `600000` | 重放一次性提交令牌有效期（10 分钟） |
 | `DISPLAY_TIMEZONE` | `Asia/Shanghai` | 回执文档时间展示时区 |

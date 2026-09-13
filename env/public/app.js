@@ -43,6 +43,7 @@ const els = {
   stepForm: $('#stepForm'), receiptPanel: $('#receiptPanel'), correctionPanel: $('#correctionPanel'),
   reviewPanel: $('#reviewPanel'), batchPanel: $('#batchPanel'),
   archivePanel: $('#archivePanel'),
+  comparisonPanel: $('#comparisonPanel'),
   recordsPanel: $('#recordsPanel'), recordsList: $('#recordsList'),
 };
 
@@ -61,6 +62,10 @@ const state = {
   archives: [],
   archiveRejections: [],
   archiveExports: [],
+  archiveComparisons: [],
+  replaySessions: [],
+  // 重放会话运行态（页面级）：一次性提交令牌、版本号与倒计时；刷新后从服务端重新拉取
+  replayRuntime: new Map(),
   auditorOptions: [],
   appealReasons: [],
   batchFieldOptions: [],
@@ -117,6 +122,8 @@ function applyState(result) {
   state.archives = Array.isArray(result.archives) ? result.archives : [];
   state.archiveRejections = Array.isArray(result.archiveRejections) ? result.archiveRejections : [];
   state.archiveExports = Array.isArray(result.archiveExports) ? result.archiveExports : [];
+  state.archiveComparisons = Array.isArray(result.archiveComparisons) ? result.archiveComparisons : [];
+  state.replaySessions = Array.isArray(result.replaySessions) ? result.replaySessions : [];
 }
 
 async function login(event) {
@@ -180,6 +187,7 @@ function render() {
     renderReviewPanel();
     renderBatchPanel();
     renderArchivePanel();
+    renderComparisonPanel();
     return;
   }
   if (state.viewingReceipt) {
@@ -187,6 +195,7 @@ function render() {
     renderReviewPanel();
     renderBatchPanel();
     renderArchivePanel();
+    renderComparisonPanel();
     return;
   }
   state.viewingReceipt = null;
@@ -198,6 +207,8 @@ function render() {
   els.batchPanel.innerHTML = '';
   els.archivePanel.classList.add('hidden');
   els.archivePanel.innerHTML = '';
+  els.comparisonPanel.classList.add('hidden');
+  els.comparisonPanel.innerHTML = '';
   renderCurrentStep();
 }
 
@@ -3239,4 +3250,419 @@ async function issueExternalCode(panel, archiveId) {
   } catch (error) {
     showAlert(error.message, 'error');
   }
+}
+
+// ===========================================================================
+// 归档版本对比 + 受控重放审阅（办理人页面）
+// ===========================================================================
+
+const COMPARE_STATUS_TEXT = {
+  added: '新增', deleted: '删除', modified: '修改', unchanged: '未变化', unaligned: '无法对齐',
+};
+const COMPARE_STATUS_CLASS = {
+  added: 'tag-ok', deleted: 'tag-reject', modified: 'tag-warn', unchanged: 'tag-muted', unaligned: 'tag-reject',
+};
+const REPLAY_STATUS_TEXT = {
+  active: '进行中', paused: '已暂停', completed: '已完成', cancelled: '已取消', expired: '已过期',
+};
+
+function currentReceiptNoForCompare() {
+  return currentBatchReceiptNo();
+}
+
+function renderComparisonPanel() {
+  const panel = els.comparisonPanel;
+  panel.classList.remove('hidden');
+  const receiptNo = currentReceiptNoForCompare();
+  // 同来源版本分组：只能选择同一 sourceType+sourceId 的两个已冻结版本
+  const archives = (state.archives || []).filter((a) => !receiptNo || a.receiptNo === receiptNo);
+  const groups = new Map();
+  for (const archive of archives) {
+    const key = `${archive.sourceType}:${archive.sourceId}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(archive);
+  }
+  const groupOptions = [...groups.entries()]
+    .filter(([, list]) => list.length >= 2)
+    .map(([key, list]) => ({ key, list: [...list].sort((a, b) => a.version - b.version) }));
+  const comparisons = (state.archiveComparisons || [])
+    .filter((c) => !receiptNo || c.receiptNo === receiptNo);
+  const replays = (state.replaySessions || [])
+    .filter((r) => comparisons.some((c) => c.id === r.comparisonId));
+
+  panel.innerHTML = `
+    <h2>归档版本对比与受控重放审阅（只读）</h2>
+    <p class="muted small">选择同一来源的两个已冻结归档版本生成只读比较报告：按事件顺序标出新增/删除/修改/未变化/无法对齐事件，并比较摘要链连续性、来源关系、状态摘要与权限快照。报告生成后不能改写任一归档；可从获准的已对齐事件创建重放审阅会话。</p>
+    <div class="archive-create">
+      <label>同一来源的两个版本
+        <select data-compare-group>
+          ${groupOptions.length
+            ? groupOptions.map((g) => `<option value="${escapeHtml(g.key)}">${escapeHtml(g.list[0].sourceTypeLabel)} · v${g.list.map((a) => a.version).join('/')}（${g.list.length} 个版本）</option>`).join('')
+            : '<option value="">（当前回执需要至少两个同来源归档版本）</option>'}
+        </select>
+      </label>
+      <div data-compare-versions class="compare-versions"></div>
+      <label>备注（可选）<input data-compare-note maxlength="200" placeholder="本次比较说明"></label>
+      <div class="form-actions">
+        <button class="button primary" type="button" data-compare-create ${groupOptions.length ? '' : 'disabled'}>生成只读比较报告</button>
+      </div>
+      <div class="alert error hidden" data-compare-error></div>
+    </div>
+    <div data-compare-list>
+      <h3>比较报告（${comparisons.length}）</h3>
+      ${comparisons.map(comparisonCardHtml).join('') || '<p class="muted small">尚无比较报告。</p>'}
+    </div>
+    <div data-replay-list>
+      <h3>重放审阅会话（${replays.length}）</h3>
+      ${replays.map(replayCardHtml).join('') || '<p class="muted small">尚无重放审阅会话。</p>'}
+    </div>`;
+
+  const groupSelect = panel.querySelector('[data-compare-group]');
+  const versionBox = panel.querySelector('[data-compare-versions]');
+  const renderVersionPickers = () => {
+    const group = groupOptions.find((g) => g.key === groupSelect.value);
+    if (!group) { versionBox.innerHTML = ''; return; }
+    const opts = (selected) => group.list.map((a) =>
+      `<option value="${escapeHtml(a.id)}" ${a.id === selected ? 'selected' : ''}>v${a.version} · ${escapeHtml(a.archiveNo)} · ${a.eventCount} 事件</option>`).join('');
+    versionBox.innerHTML = `
+      <label>基准版本（较旧）<select data-compare-base>${opts(group.list[0].id)}</select></label>
+      <label>目标版本（较新）<select data-compare-target>${opts(group.list[group.list.length - 1].id)}</select></label>`;
+  };
+  groupSelect?.addEventListener('change', renderVersionPickers);
+  renderVersionPickers();
+
+  panel.querySelector('[data-compare-create]')?.addEventListener('click', () => createComparison(panel));
+  panel.querySelectorAll('[data-compare-toggle]').forEach((btn) => {
+    btn.addEventListener('click', () => toggleComparisonDetail(panel, btn.dataset.compareToggle));
+  });
+  panel.querySelectorAll('[data-replay-toggle]').forEach((btn) => {
+    btn.addEventListener('click', () => toggleReplayDetail(panel, btn.dataset.replayToggle));
+  });
+}
+
+function comparisonCardHtml(c) {
+  const v = c.verification || {};
+  const verifyTag = v.reportOk
+    ? '<span class="tag tag-ok">报告校验通过</span>'
+    : '<span class="tag tag-reject">报告校验失败</span>';
+  const counts = c.counts || {};
+  return `
+    <div class="archive-item card-inner" data-comparison-card="${escapeHtml(c.id)}">
+      <div class="record-main">
+        <b>比较报告 ${escapeHtml(c.comparisonNo)}</b>
+        <span class="mono small">${escapeHtml(c.base?.archiveNo || '')} v${c.base?.version} ⇄ ${escapeHtml(c.target?.archiveNo || '')} v${c.target?.version}</span>
+        ${verifyTag}
+      </div>
+      <div class="muted small">生成于 ${formatTime(c.createdAt)} · ${escapeHtml(c.sourceType ? ARCHIVE_SOURCE_TEXT[c.sourceType] || c.sourceType : '')}</div>
+      <div class="small compare-counts">
+        <span class="tag tag-ok">新增 ${counts.added || 0}</span>
+        <span class="tag tag-reject">删除 ${counts.deleted || 0}</span>
+        <span class="tag tag-warn">修改 ${counts.modified || 0}</span>
+        <span class="tag tag-muted">未变化 ${counts.unchanged || 0}</span>
+        <span class="tag tag-reject">无法对齐 ${counts.unaligned || 0}</span>
+      </div>
+      <div class="record-actions">
+        <button class="button secondary" type="button" data-compare-toggle="${escapeHtml(c.id)}">查看报告 / 创建重放</button>
+      </div>
+      <div data-comparison-detail="${escapeHtml(c.id)}" class="archive-detail hidden"></div>
+    </div>`;
+}
+
+async function createComparison(panel) {
+  const errBox = panel.querySelector('[data-compare-error]');
+  errBox.classList.add('hidden');
+  const baseArchiveId = String(panel.querySelector('[data-compare-base]')?.value || '');
+  const targetArchiveId = String(panel.querySelector('[data-compare-target]')?.value || '');
+  const note = String(panel.querySelector('[data-compare-note]').value || '');
+  if (!baseArchiveId || !targetArchiveId) {
+    errBox.textContent = '请选择两个归档版本';
+    errBox.classList.remove('hidden');
+    return;
+  }
+  try {
+    await api('POST', '/api/archive-comparisons', { baseArchiveId, targetArchiveId, note });
+    await refreshState();
+    showAlert('只读比较报告已生成；两个归档均未被改写', 'success');
+  } catch (error) {
+    const side = error.body?.detail?.side ? `（${error.body.detail.side === 'base' ? '基准' : '目标'}版本摘要链失效）` : '';
+    errBox.textContent = `${error.message}${side}`;
+    errBox.classList.remove('hidden');
+  }
+}
+
+async function toggleComparisonDetail(panel, comparisonId) {
+  const slot = panel.querySelector(`[data-comparison-detail="${CSS.escape(comparisonId)}"]`);
+  if (!slot) return;
+  if (!slot.classList.contains('hidden')) { slot.classList.add('hidden'); return; }
+  slot.innerHTML = '<p class="muted small">加载中…</p>';
+  try {
+    const { comparison: c } = await api('GET', `/api/archive-comparisons/${comparisonId}`);
+    const v = c.verification || {};
+    const provenance = c.provenanceDiff || {};
+    const statusDiff = c.statusSummaryDiff || { changes: [] };
+    const perms = c.permissionSnapshotDiff || {};
+    slot.innerHTML = `
+      <div class="small compare-verify ${v.reportOk ? 'tag-ok-text' : 'tag-reject-text'}">
+        报告校验：${v.reportOk ? '通过（冻结摘要一致）' : '未通过'}；
+        基准链 ${v.baseChain?.continuous ? '连续' : '失效'} · 目标链 ${v.targetChain?.continuous ? '连续' : '失效'}
+        ${v.reasons?.length ? `<ul>${v.reasons.map((r) => `<li>${escapeHtml(r.reason)}${r.broken ? `（断点 ordinal ${r.broken.ordinal}: ${escapeHtml(r.broken.reason)}）` : ''}</li>`).join('')}</ul>` : ''}
+      </div>
+      <div class="mono small word-break">报告摘要：${escapeHtml(c.digest)}</div>
+      <h4>摘要链连续性</h4>
+      <div class="small">基准最终摘要：<span class="mono">${escapeHtml(c.base?.finalHash || '')}</span><br>
+        目标最终摘要：<span class="mono">${escapeHtml(c.target?.finalHash || '')}</span><br>
+        跨版本顺序${c.chainContinuity?.alignedAcrossVersions ? '可对齐' : '不能完全对齐（见无法对齐条目）'}</div>
+      <h4>来源关系差异</h4>
+      <div class="small">${provenance.same ? '两版来源关系一致' : `新增关系 ${provenance.added?.length || 0} 条，移除 ${provenance.removed?.length || 0} 条`}
+        ${(provenance.added || []).map((p) => `<div class="tag-ok-text small">+ ${escapeHtml(p.from)} → ${escapeHtml(p.to)}（${escapeHtml(p.relation)}）</div>`).join('')}
+        ${(provenance.removed || []).map((p) => `<div class="tag-reject-text small">- ${escapeHtml(p.from)} → ${escapeHtml(p.to)}（${escapeHtml(p.relation)}）</div>`).join('')}
+      </div>
+      <h4>状态摘要差异（${statusDiff.changes?.length || 0} 个字段）</h4>
+      ${(statusDiff.changes || []).length ? `<table class="diff-table small">
+        <tr><th>字段</th><th>基准 v${c.base?.version}</th><th>目标 v${c.target?.version}</th></tr>
+        ${statusDiff.changes.map((d) => `<tr><td class="mono">${escapeHtml(d.field)}</td><td>${escapeHtml(JSON.stringify(d.from))}</td><td>${escapeHtml(JSON.stringify(d.to))}</td></tr>`).join('')}
+      </table>` : '<p class="muted small">状态摘要无变化</p>'}
+      <h4>权限快照差异</h4>
+      <div class="small">${perms.same ? '两版权限快照一致' : ''}
+        ${perms.auditorGrantsAdded?.length ? `<div>新增授权审计员：${perms.auditorGrantsAdded.map(escapeHtml).join('、')}</div>` : ''}
+        ${perms.auditorGrantsRemoved?.length ? `<div>移除授权审计员：${perms.auditorGrantsRemoved.map(escapeHtml).join('、')}</div>` : ''}
+      </div>
+      <h4>事件差异（按事件顺序，${c.entries.length}）</h4>
+      <div class="small replay-pick">
+        <label class="compare-all"><input type="checkbox" data-replay-all> 全选可重放事件</label>
+        <ol class="archive-events compare-entries">
+          ${c.entries.map((e) => `
+            <li data-entry-row="${escapeHtml(e.entryKey)}" class="compare-entry compare-${e.status}">
+              <span class="tag ${COMPARE_STATUS_CLASS[e.status] || ''}">${COMPARE_STATUS_TEXT[e.status] || e.status}</span>
+              ${['added', 'deleted', 'modified', 'unchanged'].includes(e.status)
+                ? `<label class="compare-pick"><input type="checkbox" data-replay-pick="${escapeHtml(e.entryKey)}"> 加入重放</label>`
+                : '<span class="tag tag-reject">不可重放</span>'}
+              <span class="mono small">${escapeHtml(e.target?.type || e.base?.type || '')}</span>
+              <span class="muted small">基准 #${e.base?.ordinal ?? '—'} → 目标 #${e.target?.ordinal ?? '—'}</span>
+              ${e.reason ? `<div class="tag-reject-text small">${escapeHtml(e.reason)}</div>` : ''}
+            </li>`).join('')}
+        </ol>
+      </div>
+      <div class="form-actions replay-create-row">
+        <label>重放有效期（分钟，5-10080）<input type="number" min="5" max="10080" value="60" data-replay-ttl></label>
+        <button class="button primary" type="button" data-replay-create="${escapeHtml(c.id)}">用所选事件创建重放审阅会话</button>
+      </div>
+      <div class="alert error hidden" data-replay-create-error></div>`;
+
+    const allBox = slot.querySelector('[data-replay-all]');
+    allBox?.addEventListener('change', () => {
+      slot.querySelectorAll('[data-replay-pick]').forEach((box) => { box.checked = allBox.checked; });
+    });
+    slot.querySelector('[data-replay-create]')?.addEventListener('click', () => createReplaySession(slot, comparisonId));
+  } catch (error) {
+    slot.textContent = error.message;
+    slot.classList.remove('hidden');
+  }
+}
+
+async function createReplaySession(container, comparisonId) {
+  const errBox = container.querySelector('[data-replay-create-error]') || els.comparisonPanel.querySelector('[data-replay-create-error]');
+  const entryKeys = [...container.querySelectorAll('[data-replay-pick]:checked')].map((box) => box.dataset.replayPick);
+  const ttlMinutes = Number(container.querySelector('[data-replay-ttl]')?.value || 60);
+  if (errBox) errBox.classList.add('hidden');
+  if (!entryKeys.length) {
+    if (errBox) { errBox.textContent = '请至少选择一个已对齐事件'; errBox.classList.remove('hidden'); }
+    return;
+  }
+  try {
+    const result = await api('POST', `/api/archive-comparisons/${comparisonId}/replays`, { entryKeys, ttlMinutes, note: '' });
+    if (result.submitToken) state.replayRuntime.set(result.replay.id, { submitToken: result.submitToken, submitTokenExpiresAt: result.submitTokenExpiresAt });
+    await refreshState();
+    showAlert(`重放审阅会话 ${result.replay.replayNo} 已创建（只读冻结副本，v${result.replay.version}）`, 'success');
+    const panel = els.comparisonPanel;
+    await toggleReplayDetail(panel, result.replay.id, true);
+  } catch (error) {
+    if (errBox) { errBox.textContent = error.message; errBox.classList.remove('hidden'); }
+  }
+}
+
+function replayCardHtml(r) {
+  const statusText = REPLAY_STATUS_TEXT[r.status] || r.status;
+  const tagClass = r.status === 'active' ? 'tag-ok' : r.status === 'paused' ? 'tag-warn' : 'tag-muted';
+  return `
+    <div class="archive-item card-inner" data-replay-card="${escapeHtml(r.id)}">
+      <div class="record-main">
+        <b>重放会话 ${escapeHtml(r.replayNo)}</b>
+        <span class="tag ${tagClass}">${statusText}</span>
+        <span class="muted small">v${r.version}</span>
+      </div>
+      <div class="muted small">
+        ${formatTime(r.createdAt)} ～ 过期 ${formatTime(r.expiresAt)} ·
+        已选 ${r.selectedCount} · 已确认 ${r.confirmedCount} · 异议 ${r.objectedCount} · 意见 ${r.commentCount}
+      </div>
+      <div class="record-actions">
+        <button class="button secondary" type="button" data-replay-toggle="${escapeHtml(r.id)}">进入重放审阅</button>
+      </div>
+      <div data-replay-detail="${escapeHtml(r.id)}" class="archive-detail hidden"></div>
+    </div>`;
+}
+
+async function toggleReplayDetail(panel, replayId, forceOpen = false) {
+  let slot = panel.querySelector(`[data-replay-detail="${CSS.escape(replayId)}"]`);
+  if (!slot) {
+    await refreshState();
+    slot = els.comparisonPanel.querySelector(`[data-replay-detail="${CSS.escape(replayId)}"]`);
+  }
+  if (!slot) return;
+  if (!forceOpen && !slot.classList.contains('hidden')) { slot.classList.add('hidden'); return; }
+  await renderReplayDetail(slot, replayId);
+}
+
+async function renderReplayDetail(slot, replayId) {
+  if (slot._countdownTimer) { clearInterval(slot._countdownTimer); slot._countdownTimer = null; }
+  slot.innerHTML = '<p class="muted small">加载中…</p>';
+  try {
+    const { replay } = await api('GET', `/api/replay-sessions/${replayId}`);
+    state.replayRuntime.delete(`${replayId}:stale`);
+    const writable = replay.status === 'active';
+    const readOnlyNotice = replay.status === 'paused' ? '会话已暂停：暂停期间不能写入意见，恢复前会重新校验报告与归档摘要链。'
+      : replay.status === 'cancelled' ? '会话已取消：只读保留，历史意见与审计事件不删除。'
+        : replay.status === 'expired' ? '会话已过期：只读保留。' : '';
+    const v = replay.verification || {};
+    slot.innerHTML = `
+      <div class="small ${v.reportOk ? 'tag-ok-text' : 'tag-reject-text'}">
+        报告校验：${v.reportOk ? '通过' : '未通过'} · 基准链 ${v.baseChain?.continuous ? '连续' : '失效'} · 目标链 ${v.targetChain?.continuous ? '连续' : '失效'}
+      </div>
+      <div class="small">会话状态：<b>${REPLAY_STATUS_TEXT[replay.status] || replay.status}</b> · 版本 <b data-replay-version>${replay.version}</b>
+        · 进度 ${replay.progress.decided}/${replay.progress.selected}（剩余 ${replay.progress.remaining}）</div>
+      <div class="small" data-replay-countdown>过期倒计时：${countdownText(replay.expiresAt)}</div>
+      ${readOnlyNotice ? `<div class="alert ${writable ? '' : 'error'} small">${escapeHtml(readOnlyNotice)}</div>` : ''}
+      <div class="record-actions">
+        ${writable ? '<button class="button secondary" type="button" data-replay-pause>暂停</button>' : ''}
+        ${replay.status === 'paused' ? '<button class="button primary" type="button" data-replay-resume>恢复</button>' : ''}
+        ${['active', 'paused'].includes(replay.status) ? '<button class="button secondary" type="button" data-replay-cancel>取消会话（只读留档）</button>' : ''}
+        <button class="button secondary" type="button" data-replay-refresh>刷新状态 / 重新获取提交令牌</button>
+      </div>
+      <h4>冻结事件（只读副本，按归档视图脱敏由服务端完成）</h4>
+      <ol class="archive-events">
+        ${replay.events.map((e) => `
+          <li data-replay-event="${escapeHtml(e.entryKey)}" class="replay-event">
+            <div class="record-main">
+              <span class="mono small">${escapeHtml(e.type)}</span>
+              <span class="muted small">#${e.ordinal} · ${escapeHtml(e.actor.role)}：${escapeHtml(e.actor.label)} · ${formatTime(e.occurredAt)}</span>
+              ${e.decision === 'confirm' ? '<span class="tag tag-ok">已确认</span>' : e.decision === 'object' ? '<span class="tag tag-reject">已异议</span>' : ''}
+            </div>
+            <details><summary class="muted small">冻结事件负载</summary><pre class="archive-pre">${escapeHtml(JSON.stringify(e.detail, null, 2))}</pre></details>
+            ${writable ? `
+            <div class="replay-actions small">
+              <input type="text" maxlength="1000" placeholder="添加意见（1-1000 字）" data-replay-comment="${escapeHtml(e.entryKey)}">
+              <button type="button" data-replay-op="comment:${escapeHtml(e.entryKey)}">提交意见</button>
+              <button type="button" data-replay-op="confirm:${escapeHtml(e.entryKey)}">标记已确认</button>
+              <input type="text" maxlength="500" placeholder="异议理由（2-500 字）" data-replay-object="${escapeHtml(e.entryKey)}">
+              <button type="button" data-replay-op="object:${escapeHtml(e.entryKey)}">提出异议</button>
+            </div>` : ''}
+            <ul class="replay-opinions">
+              ${replay.opinions.filter((o) => o.entryKey === e.entryKey).map((o) => `
+                <li class="small"><span class="tag ${o.kind === 'confirm' ? 'tag-ok' : o.kind === 'object' ? 'tag-reject' : 'tag-warn'}">${o.kind === 'confirm' ? '已确认' : o.kind === 'object' ? '异议' : '意见'}</span>
+                  ${escapeHtml(o.comment || o.reason || '')} <span class="muted">${formatTime(o.createdAt)} · v${o.replayVersion}</span></li>`).join('')}
+            </ul>
+          </li>`).join('')}
+      </ol>
+      <h4>审计时间线</h4>
+      <ol class="archive-events">
+        ${replay.auditTimeline.map((a) => `<li class="small"><span class="mono">${escapeHtml(a.type)}</span> <span class="muted">${formatTime(a.createdAt)}</span>
+          <pre class="archive-pre">${escapeHtml(JSON.stringify(a.detail))}</pre></li>`).join('')}
+      </ol>
+      <div class="alert error hidden" data-replay-error></div>`;
+
+    bindReplayActions(slot, replay);
+    startReplayCountdown(slot, replay.expiresAt);
+  } catch (error) {
+    slot.textContent = error.message;
+    slot.classList.remove('hidden');
+  }
+}
+
+function countdownText(expiresAt) {
+  const ms = Math.max(0, expiresAt - Date.now());
+  const totalMin = Math.floor(ms / 60000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  const s = Math.floor((ms % 60000) / 1000);
+  return ms <= 0 ? '已过期' : `${h}小时${String(m).padStart(2, '0')}分${String(s).padStart(2, '0')}秒`;
+}
+
+function startReplayCountdown(slot, expiresAt) {
+  const box = slot.querySelector('[data-replay-countdown]');
+  if (!box) return;
+  if (slot._countdownTimer) clearInterval(slot._countdownTimer);
+  slot._countdownTimer = setInterval(() => {
+    if (!document.body.contains(slot)) { clearInterval(slot._countdownTimer); return; }
+    box.textContent = `过期倒计时：${countdownText(expiresAt)}`;
+  }, 1000);
+}
+
+async function ensureSubmitToken(slot, replay) {
+  const runtime = state.replayRuntime.get(replay.id);
+  if (runtime?.submitToken && runtime.submitTokenExpiresAt > Date.now() + 2000) return runtime.submitToken;
+  const result = await api('POST', `/api/replay-sessions/${replay.id}/submit-token`, {});
+  state.replayRuntime.set(replay.id, { submitToken: result.submitToken, submitTokenExpiresAt: result.expiresAt });
+  return result.submitToken;
+}
+
+function bindReplayActions(slot, replay) {
+  const showError = (message) => {
+    const box = slot.querySelector('[data-replay-error]');
+    if (box) { box.textContent = message; box.classList.remove('hidden'); }
+    else showAlert(message, 'error');
+  };
+  const control = async (action, reason = '') => {
+    try {
+      const submitToken = await ensureSubmitToken(slot, replay);
+      const expectedVersion = replay.version;
+      const result = await api('POST', `/api/replay-sessions/${replay.id}/${action}`, { submitToken, expectedVersion, reason });
+      if (result.nextSubmitToken) state.replayRuntime.set(replay.id, { submitToken: result.nextSubmitToken, submitTokenExpiresAt: result.nextSubmitTokenExpiresAt });
+      await refreshState();
+      const reopened = els.comparisonPanel.querySelector(`[data-replay-detail="${CSS.escape(replay.id)}"]`);
+      if (reopened) await renderReplayDetail(reopened, replay.id);
+      showAlert(`重放会话已${action === 'pause' ? '暂停' : action === 'resume' ? '恢复' : '取消'}`, 'success');
+    } catch (error) {
+      if (error.body?.currentVersion) {
+        await refreshState();
+        const reopened = els.comparisonPanel.querySelector(`[data-replay-detail="${CSS.escape(replay.id)}"]`);
+        if (reopened) await renderReplayDetail(reopened, replay.id);
+      }
+      showError(error.message);
+    }
+  };
+  slot.querySelector('[data-replay-pause]')?.addEventListener('click', () => control('pause'));
+  slot.querySelector('[data-replay-resume]')?.addEventListener('click', () => control('resume'));
+  slot.querySelector('[data-replay-cancel]')?.addEventListener('click', () => {
+    const reason = window.prompt('取消原因（可选，留空确认取消）', '') ?? null;
+    if (reason !== null) control('cancel', reason);
+  });
+  slot.querySelector('[data-replay-refresh]')?.addEventListener('click', async () => {
+    state.replayRuntime.delete(replay.id);
+    try { await ensureSubmitToken(slot, replay); } catch { /* 只读/暂停时允许无令牌刷新 */ }
+    await renderReplayDetail(slot, replay.id);
+  });
+
+  slot.querySelectorAll('[data-replay-op]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const [kind, entryKey] = btn.dataset.replayOp.split(':');
+      const comment = String(slot.querySelector(`[data-replay-comment="${CSS.escape(entryKey)}"]`)?.value || '');
+      const reason = String(slot.querySelector(`[data-replay-object="${CSS.escape(entryKey)}"]`)?.value || '');
+      const idempotencyKey = randomId().slice(0, 40);
+      try {
+        const submitToken = await ensureSubmitToken(slot, replay);
+        const result = await api('POST', `/api/replay-sessions/${replay.id}/opinions`, {
+          entryKey, kind, comment, reason, idempotencyKey, submitToken, expectedVersion: replay.version,
+        });
+        if (result.nextSubmitToken) state.replayRuntime.set(replay.id, { submitToken: result.nextSubmitToken, submitTokenExpiresAt: result.nextSubmitTokenExpiresAt });
+        await renderReplayDetail(slot, replay.id);
+        if (result.replay) showAlert('幂等重试：返回同一条意见', 'success');
+      } catch (error) {
+        if (error.body?.currentVersion) {
+          // 版本冲突/重复确认：以服务端为准重渲染（两个页面并发时只有一个成功）
+          await renderReplayDetail(slot, replay.id);
+        }
+        showError(error.message);
+      }
+    });
+  });
 }

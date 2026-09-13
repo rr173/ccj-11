@@ -239,3 +239,23 @@ a.button { display: inline-block; text-decoration: none; }
 .verify-list dt { color: #667085; font-size: 13px; }
 .verify-list dd { margin: 0; font-size: 14px; }
 .archive-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+
+/* 归档版本对比 + 受控重放 */
+.tag-warn { background: #fef0c7; color: #b54708; }
+.tag-muted { background: #e4e7ec; color: #475467; }
+.tag-ok-text { color: #027a48; }
+.compare-versions { display: flex; gap: 12px; flex-wrap: wrap; margin: 6px 0; }
+.compare-counts { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+.compare-entry { padding: 4px 6px; border-left: 3px solid #e4e7ec; }
+.compare-added { border-left-color: #12b76a; }
+.compare-deleted { border-left-color: #f04438; }
+.compare-modified { border-left-color: #f79009; }
+.compare-unchanged { border-left-color: #98a2b3; }
+.compare-unaligned { border-left-color: #d92d20; background: #fef3f2; }
+.compare-pick, .compare-all { margin-right: 8px; font-size: 12px; }
+.replay-create-row { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; margin-top: 8px; }
+.replay-create-row label { display: flex; flex-direction: column; font-size: 12px; }
+.replay-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+.replay-actions input { flex: 1; min-width: 160px; }
+.replay-opinions { margin: 4px 0; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; }
+.replay-event { padding: 6px; border-radius: 6px; }

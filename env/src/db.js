@@ -43,6 +43,8 @@ import {
 } from './caseGroupStore.js';
 // 归档模块在文件末尾重导出；这里仅用命名空间在请求期惰性访问，规避 db ↔ archiveStore 循环
 import * as archiveNs from './archiveStore.js';
+// 版本对比 / 受控重放模块同样惰性访问（其依赖 db.js）
+import * as comparisonNs from './comparisonStore.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -1049,6 +1051,164 @@ CREATE TABLE IF NOT EXISTS audit_external_codes (
   revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_audit_external_codes_archive ON audit_external_codes(archive_id, status);
+
+-- ---------------------------------------------------------------------------
+-- 归档版本比较报告：办理人为同一来源选择两个【已冻结】归档版本生成的只读文档。
+-- 报告生成时复制对齐结果（新增/删除/修改/未变化/无法对齐）、摘要链连续性、
+-- 来源关系差异、状态摘要差异与权限快照差异；body_json 规范化后计算 digest
+-- 冻结。报告与条目创建后没有任何改写路径，归档之后新增业务事件不影响报告。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_comparisons (
+  id TEXT PRIMARY KEY,
+  owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  comparison_no TEXT NOT NULL,
+  receipt_no TEXT NOT NULL DEFAULT '',
+  base_archive_id TEXT NOT NULL REFERENCES audit_archives(id),
+  target_archive_id TEXT NOT NULL REFERENCES audit_archives(id),
+  source_type TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'frozen' CHECK (status IN ('frozen')),
+  note TEXT NOT NULL DEFAULT '',
+  body_json TEXT NOT NULL DEFAULT '{}',
+  digest TEXT NOT NULL,
+  count_added INTEGER NOT NULL DEFAULT 0,
+  count_deleted INTEGER NOT NULL DEFAULT 0,
+  count_modified INTEGER NOT NULL DEFAULT 0,
+  count_unchanged INTEGER NOT NULL DEFAULT 0,
+  count_unaligned INTEGER NOT NULL DEFAULT 0,
+  base_chain_ok INTEGER NOT NULL DEFAULT 1,
+  target_chain_ok INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER,
+  UNIQUE(base_archive_id, target_archive_id)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_comparisons_owner ON audit_comparisons(owner_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_comparisons_source ON audit_comparisons(source_type, source_id);
+
+-- 比较报告条目（按合并后的事件顺序）；entry_key 为 e{source_event_id}
+CREATE TABLE IF NOT EXISTS audit_comparison_entries (
+  id TEXT PRIMARY KEY,
+  comparison_id TEXT NOT NULL REFERENCES audit_comparisons(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  entry_key TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('added', 'deleted', 'modified', 'unchanged', 'unaligned')),
+  reason TEXT NOT NULL DEFAULT '',
+  base_ordinal INTEGER,
+  base_source_event_id INTEGER,
+  base_event_hash TEXT NOT NULL DEFAULT '',
+  base_event_type TEXT NOT NULL DEFAULT '',
+  base_occurred_at INTEGER,
+  target_ordinal INTEGER,
+  target_source_event_id INTEGER,
+  target_event_hash TEXT NOT NULL DEFAULT '',
+  target_event_type TEXT NOT NULL DEFAULT '',
+  target_occurred_at INTEGER,
+  UNIQUE(comparison_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_comparison_entries_report ON audit_comparison_entries(comparison_id, ordinal);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_comparison_entries_key
+  ON audit_comparison_entries(comparison_id, entry_key);
+
+-- ---------------------------------------------------------------------------
+-- 受控重放审阅：从比较报告获准条目（可对齐事件）创建的只读重放会话。
+-- 会话只能读取创建时从报告复制的冻结事件副本（audit_replay_events），
+-- 写操作只追加意见/审计行、推进会话版本与状态；绝不修改归档、业务记录、导出文件。
+-- 状态机：active ⇄ paused → completed（全部结论落定，不强制）/ cancelled / expired。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_replay_sessions (
+  id TEXT PRIMARY KEY,
+  owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  replay_no TEXT NOT NULL,
+  comparison_id TEXT NOT NULL REFERENCES audit_comparisons(id),
+  receipt_no TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'paused', 'completed', 'cancelled', 'expired')),
+  version INTEGER NOT NULL DEFAULT 1,
+  note TEXT NOT NULL DEFAULT '',
+  selected_count INTEGER NOT NULL,
+  confirmed_count INTEGER NOT NULL DEFAULT 0,
+  objected_count INTEGER NOT NULL DEFAULT 0,
+  comment_count INTEGER NOT NULL DEFAULT 0,
+  submit_token_hash BLOB,
+  submit_token_expires_at INTEGER,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  paused_at INTEGER,
+  resumed_at INTEGER,
+  cancelled_at INTEGER,
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  completed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_audit_replay_owner ON audit_replay_sessions(owner_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_replay_comparison ON audit_replay_sessions(comparison_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_replay_status ON audit_replay_sessions(status, expires_at);
+
+-- 重放冻结事件副本：会话创建时从比较报告引用的归档冻结事件复制，之后永不更新
+CREATE TABLE IF NOT EXISTS audit_replay_events (
+  id TEXT PRIMARY KEY,
+  replay_id TEXT NOT NULL REFERENCES audit_replay_sessions(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  entry_key TEXT NOT NULL,
+  source_side TEXT NOT NULL CHECK (source_side IN ('base', 'target')),
+  source_event_id INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  actor_role TEXT NOT NULL DEFAULT '',
+  actor_label TEXT NOT NULL DEFAULT '',
+  occurred_at INTEGER NOT NULL,
+  event_content_hash TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE(replay_id, ordinal),
+  UNIQUE(replay_id, entry_key)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_replay_events_replay ON audit_replay_events(replay_id, ordinal);
+
+-- 重放意见：comment（意见，可多次追加）/ confirm（已确认）/ object（异议）。
+-- 同一事件至多一条 confirm/object 结论（部分唯一索引兜底并发，两个页面只能一个成功）；
+-- 幂等键支持同内容网络重试，返回同一条意见。
+CREATE TABLE IF NOT EXISTS audit_replay_opinions (
+  id TEXT PRIMARY KEY,
+  replay_id TEXT NOT NULL REFERENCES audit_replay_sessions(id) ON DELETE CASCADE,
+  replay_event_id TEXT NOT NULL REFERENCES audit_replay_events(id) ON DELETE CASCADE,
+  entry_key TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('comment', 'confirm', 'object')),
+  comment TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  request_hash TEXT NOT NULL DEFAULT '',
+  replay_version INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_replay_opinions_replay ON audit_replay_opinions(replay_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_replay_opinions_idempotency
+  ON audit_replay_opinions(replay_id, idempotency_key) WHERE idempotency_key <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_replay_opinions_decision
+  ON audit_replay_opinions(replay_id, entry_key) WHERE kind IN ('confirm', 'object');
+
+-- 重放一次性提交令牌：每次写操作（意见/暂停/恢复/取消）必须携带并消费一枚
+CREATE TABLE IF NOT EXISTS audit_replay_submit_tokens (
+  id TEXT PRIMARY KEY,
+  replay_id TEXT NOT NULL REFERENCES audit_replay_sessions(id) ON DELETE CASCADE,
+  token_hash BLOB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'used', 'revoked', 'expired')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER,
+  used_opinion_id TEXT NOT NULL DEFAULT '',
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_audit_replay_tokens_replay ON audit_replay_submit_tokens(replay_id, status);
+
+-- 重放审计时间线（只追加）：会话所有受控动作留档；服务重启后从表恢复
+CREATE TABLE IF NOT EXISTS audit_replay_audit (
+  id TEXT PRIMARY KEY,
+  replay_id TEXT NOT NULL REFERENCES audit_replay_sessions(id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_replay_audit_replay ON audit_replay_audit(replay_id, created_at);
 `);
 
 // 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
@@ -2523,6 +2683,9 @@ export function getStateForUser(userId) {
   envelope.archives = archiveNs.listArchivesForOwner(userId);
   envelope.archiveRejections = archiveNs.listArchiveRejectionsForOwner(userId);
   envelope.archiveExports = archiveNs.listArchiveExportsForOwner(userId);
+  // 归档版本比较报告与受控重放会话（同样惰性访问）
+  envelope.archiveComparisons = comparisonNs.listComparisonsForOwner(userId);
+  envelope.replaySessions = comparisonNs.listReplaysForOwner(userId);
   return envelope;
 }
 
@@ -2620,3 +2783,22 @@ export {
   recoverArchiveExportsOnStartup,
   runExportToCompletion,
 } from './archiveStore.js';
+
+// 归档版本对比 + 受控重放审阅：统一从 db.js 重导出
+export {
+  createArchiveComparison,
+  verifyComparison,
+  getComparisonForOwner,
+  listComparisonsForOwner,
+  listComparisonsForAuditor,
+  getComparisonForAuditor,
+  createReplaySession,
+  getReplayForOwner,
+  listReplaysForOwner,
+  issueReplaySubmitToken,
+  submitReplayOpinion,
+  pauseReplaySession,
+  resumeReplaySession,
+  cancelReplaySession,
+  sweepReplaySessions,
+} from './comparisonStore.js';

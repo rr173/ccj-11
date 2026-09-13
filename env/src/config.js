@@ -35,6 +35,11 @@ export const config = {
   archiveExternalCodeTtlMs: Number(process.env.ARCHIVE_EXTERNAL_CODE_TTL_MS || 24 * 60 * 60 * 1000),
   // 导出任务的后台扫描间隔（断点续传、过期清理；设 NO_ARCHIVE_SWEEP=1 关闭定时器）
   archiveSweepMs: Number(process.env.ARCHIVE_SWEEP_MS || 1000),
+  // 受控重放审阅会话：有效期范围（分钟）与一次性提交令牌有效期
+  replayMinTtlMs: Number(process.env.REPLAY_MIN_TTL_MS || 5 * 60 * 1000),
+  replayMaxTtlMs: Number(process.env.REPLAY_MAX_TTL_MS || 7 * 24 * 60 * 60 * 1000),
+  replayDefaultTtlMs: Number(process.env.REPLAY_DEFAULT_TTL_MS || 60 * 60 * 1000),
+  replaySubmitTokenTtlMs: Number(process.env.REPLAY_SUBMIT_TOKEN_TTL_MS || 10 * 60 * 1000),
 };
 
 config.isProduction = config.nodeEnv === 'production';

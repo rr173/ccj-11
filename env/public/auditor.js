@@ -67,6 +67,7 @@ async function boot(knownUser = null) {
     $('#loginView').classList.add('hidden');
     $('#appView').classList.remove('hidden');
     await loadArchives();
+    await loadComparisons();
   } catch (error) {
     $('#loginView').classList.remove('hidden');
     $('#appView').classList.add('hidden');
@@ -143,3 +144,72 @@ async function loadDetail(archiveId) {
 }
 
 boot();
+
+// 比较报告：只有同时被两个版本授权时才出现在列表中；条目按归档脱敏规则处理
+const COMPARE_STATUS_TEXT = {
+  added: '新增', deleted: '删除', modified: '修改', unchanged: '未变化', unaligned: '无法对齐',
+};
+async function loadComparisons() {
+  const result = await api('GET', '/api/auditor/comparisons');
+  const list = $('#comparisonList');
+  if (!result.comparisons.length) {
+    list.innerHTML = '<p class="muted">当前没有同时授权给本审计员账号两个版本的比较报告。</p>';
+    return;
+  }
+  list.innerHTML = result.comparisons.map((c) => `
+    <div class="archive-item card-inner">
+      <div class="record-main">
+        <b>比较报告 ${escapeHtml(c.comparisonNo)}</b>
+        <span class="mono small">v${c.base.version} ⇄ v${c.target.version}</span>
+        ${c.verification?.reportOk ? '<span class="tag tag-ok">报告校验通过</span>' : '<span class="tag tag-reject">报告校验失败</span>'}
+      </div>
+      <div class="muted small">生成于 ${formatTime(c.createdAt)} ·
+        新增 ${c.counts.added} · 删除 ${c.counts.deleted} · 修改 ${c.counts.modified} · 未变化 ${c.counts.unchanged} · 无法对齐 ${c.counts.unaligned}</div>
+      <div class="record-actions">
+        <button class="button secondary" type="button" data-compare="${escapeHtml(c.id)}">查阅脱敏比较内容</button>
+      </div>
+    </div>`).join('');
+  list.querySelectorAll('[data-compare]').forEach((btn) => {
+    btn.addEventListener('click', () => loadComparisonDetail(btn.dataset.compare));
+  });
+}
+
+async function loadComparisonDetail(comparisonId) {
+  const view = $('#comparisonView');
+  view.classList.remove('hidden');
+  view.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  view.innerHTML = '<p class="muted">加载中…</p>';
+  try {
+    const { comparison: c } = await api('GET', `/api/auditor/comparisons/${comparisonId}`);
+    const statusDiff = c.statusSummaryDiff || { changes: [] };
+    const provenance = c.provenanceDiff || {};
+    view.innerHTML = `
+      <h2>比较报告 ${escapeHtml(c.comparisonNo)}
+        ${c.verification?.reportOk ? '<span class="tag tag-ok">报告校验通过</span>' : '<span class="tag tag-reject">报告校验失败</span>'}</h2>
+      <p class="muted small">基准 v${c.base.version}（${escapeHtml(c.base.archiveNo)}）⇄ 目标 v${c.target.version}（${escapeHtml(c.target.archiveNo)}）·
+        报告摘要 <span class="mono">${escapeHtml(c.digest)}</span></p>
+      <div class="small ${c.verification?.reportOk ? 'tag-ok-text' : 'tag-reject-text'}">
+        基准摘要链 ${c.verification?.baseChain?.continuous ? '连续' : '失效'} ·
+        目标摘要链 ${c.verification?.targetChain?.continuous ? '连续' : '失效'}
+      </div>
+      <h3>来源关系差异</h3>
+      <div class="small">${provenance.same ? '两版来源关系一致' : `新增 ${provenance.added?.length || 0} 条 / 移除 ${provenance.removed?.length || 0} 条`}</div>
+      <h3>状态摘要差异（${statusDiff.changes?.length || 0} 个字段，已脱敏）</h3>
+      ${(statusDiff.changes || []).length ? `<table class="diff-table small">
+        <tr><th>字段</th><th>基准</th><th>目标</th></tr>
+        ${(statusDiff.changes || []).map((d) => `<tr><td class="mono">${escapeHtml(d.field)}</td><td>${escapeHtml(JSON.stringify(d.from))}</td><td>${escapeHtml(JSON.stringify(d.to))}</td></tr>`).join('')}
+      </table>` : '<p class="muted small">无变化</p>'}
+      <h3>事件差异顺序（${c.entries.length}，不含重放意见）</h3>
+      <ol class="archive-events">
+        ${c.entries.map((e) => `
+          <li class="compare-entry compare-${e.status}">
+            <span class="tag ${e.status === 'added' ? 'tag-ok' : e.status === 'deleted' || e.status === 'unaligned' ? 'tag-reject' : e.status === 'modified' ? 'tag-warn' : 'tag-muted'}">${COMPARE_STATUS_TEXT[e.status] || e.status}</span>
+            <span class="mono small">${escapeHtml(e.target?.type || e.base?.type || '')}</span>
+            <span class="muted small">基准 #${e.base?.ordinal ?? '—'} → 目标 #${e.target?.ordinal ?? '—'}</span>
+            ${e.reason ? `<div class="tag-reject-text small">${escapeHtml(e.reason)}</div>` : ''}
+          </li>`).join('')}
+      </ol>`;
+  } catch (error) {
+    view.innerHTML = `<div class="alert error">${escapeHtml(error.message)}</div>`;
+  }
+}
