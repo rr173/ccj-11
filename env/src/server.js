@@ -66,6 +66,18 @@ import {
   submitAppealOpinion,
   decideAppealField,
   sweepAppealTimeouts,
+  listMediatableAppealFields,
+  createMediationPackage,
+  listMediationPackagesForOwner,
+  getMediationPackageForOwner,
+  cancelMediationPackage,
+  decideMediationField,
+  consumeMediationInvitation,
+  getValidMediationSession,
+  deleteMediationSession,
+  getMediationReviewerContext,
+  submitMediationOpinion,
+  sweepMediationTimeouts,
 } from './db.js';
 import { validateDraft, validateStepPayload } from './validation.js';
 import { stableStringify } from './crypto.js';
@@ -84,6 +96,14 @@ import {
 import { INVITATION_ERRORS, isValidTtlMinutes } from './reviews.js';
 import { parseBatchInput, BATCH_ERRORS, BATCH_SESSION_COOKIE, BATCH_CSRF_COOKIE, ALL_BATCH_FIELDS, BATCH_MAX_INVITATIONS } from './batchReviews.js';
 import { parseAppealCreateInput, APPEAL_ERRORS, APPEAL_SESSION_COOKIE, APPEAL_CSRF_COOKIE, APPEAL_REASONS } from './appealReviews.js';
+import {
+  parseMediationCreateInput,
+  MEDIATION_ERRORS,
+  MEDIATION_SESSION_COOKIE,
+  MEDIATION_CSRF_COOKIE,
+  ARBITRATION_SESSION_COOKIE,
+  ARBITRATION_CSRF_COOKIE,
+} from './mediationReviews.js';
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -108,6 +128,14 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/appeal-review' && req.method === 'GET') {
       return serveStaticFile(req, res, '/appeal-review.html');
     }
+    // 争议调解包第一层：免登录调解人页面与接口（只展示本层授权内容）
+    if (url.pathname === '/mediation-review' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/mediation-review.html');
+    }
+    // 争议调解包第二层：免登录仲裁人页面与接口（第一层升级后才开放）
+    if (url.pathname === '/arbitration-review' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/arbitration-review.html');
+    }
     if (url.pathname === '/api/appeal-review/validate' && req.method === 'POST') {
       return appealReviewValidate(req, res);
     }
@@ -119,6 +147,30 @@ const server = createServer(async (req, res) => {
     }
     if (url.pathname === '/api/appeal-review/opinions' && req.method === 'POST') {
       return appealReviewSubmit(req, res);
+    }
+    if (url.pathname === '/api/mediation-review/validate' && req.method === 'POST') {
+      return mediationReviewValidate(req, res, 1);
+    }
+    if (url.pathname === '/api/mediation-review/logout' && req.method === 'POST') {
+      return mediationReviewLogout(req, res, 1);
+    }
+    if (url.pathname === '/api/mediation-review/context' && req.method === 'GET') {
+      return mediationReviewContext(req, res, 1);
+    }
+    if (url.pathname === '/api/mediation-review/opinions' && req.method === 'POST') {
+      return mediationReviewSubmit(req, res, 1);
+    }
+    if (url.pathname === '/api/arbitration-review/validate' && req.method === 'POST') {
+      return mediationReviewValidate(req, res, 2);
+    }
+    if (url.pathname === '/api/arbitration-review/logout' && req.method === 'POST') {
+      return mediationReviewLogout(req, res, 2);
+    }
+    if (url.pathname === '/api/arbitration-review/context' && req.method === 'GET') {
+      return mediationReviewContext(req, res, 2);
+    }
+    if (url.pathname === '/api/arbitration-review/opinions' && req.method === 'POST') {
+      return mediationReviewSubmit(req, res, 2);
     }
     if (url.pathname === '/api/batch-review/validate' && req.method === 'POST') {
       return batchReviewValidate(req, res);
@@ -344,6 +396,36 @@ async function handleApi(req, res, url) {
   const appealFieldDecideMatch = /^\/api\/review-appeals\/([^/]+)\/fields\/([^/]+)\/(accept|reject)$/.exec(url.pathname);
   if (appealFieldDecideMatch && req.method === 'POST') {
     return decideAppealFieldRoute(req, res, user, appealFieldDecideMatch[1], appealFieldDecideMatch[2], appealFieldDecideMatch[3]);
+  }
+
+  // 争议调解包（办理人）
+  const mediatableMatch = /^\/api\/review-appeals\/([^/]+)\/mediatable-fields$/.exec(url.pathname);
+  if (mediatableMatch && req.method === 'GET') {
+    const result = listMediatableAppealFields({ userId: user.id, roundId: decodeURIComponent(mediatableMatch[1]) });
+    if (!result) return sendJson(res, 404, { error: { code: 'APPEAL_NOT_FOUND', message: '申诉回合不存在' } });
+    return sendJson(res, 200, { source: result });
+  }
+  if (url.pathname === '/api/mediation-packages' && req.method === 'POST') {
+    return createMediation(req, res, user);
+  }
+  if (url.pathname === '/api/mediation-packages' && req.method === 'GET') {
+    const roundId = url.searchParams.get('roundId') || '';
+    const receiptNo = url.searchParams.get('receiptNo') || '';
+    return sendJson(res, 200, { packages: listMediationPackagesForOwner(user.id, { roundId, receiptNo }) });
+  }
+  const mediationGetMatch = /^\/api\/mediation-packages\/([^/]+)$/.exec(url.pathname);
+  if (mediationGetMatch && req.method === 'GET') {
+    const pkg = getMediationPackageForOwner({ userId: user.id, packageId: decodeURIComponent(mediationGetMatch[1]) });
+    if (!pkg) return sendJson(res, 404, { error: { code: 'MEDIATION_NOT_FOUND', message: '调解包不存在' } });
+    return sendJson(res, 200, { pkg });
+  }
+  const mediationCancelMatch = /^\/api\/mediation-packages\/([^/]+)\/cancel$/.exec(url.pathname);
+  if (mediationCancelMatch && req.method === 'POST') {
+    return cancelMediation(req, res, user, mediationCancelMatch[1]);
+  }
+  const mediationFieldDecideMatch = /^\/api\/mediation-packages\/([^/]+)\/fields\/([^/]+)\/(accept|reject)$/.exec(url.pathname);
+  if (mediationFieldDecideMatch && req.method === 'POST') {
+    return decideMediationFieldRoute(req, res, user, mediationFieldDecideMatch[1], mediationFieldDecideMatch[2], mediationFieldDecideMatch[3]);
   }
 
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
@@ -981,11 +1063,274 @@ async function decideAppealFieldRoute(req, res, user, rawRoundId, rawFieldId, ac
   });
 }
 
-function batchCookies(req) {
+// ---------------------------------------------------------------------------
+// 争议调解包：办理人侧
+// ---------------------------------------------------------------------------
+
+async function createMediation(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const roundId = String(body.roundId || '');
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(roundId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_MEDIATION', message: '申诉回合标识不正确' } });
+  }
+  const maxMinutes = Math.floor(config.reviewInviteMaxTtlMs / 60000);
+  const minMinutes = Math.max(1, Math.ceil(config.reviewInviteMinTtlMs / 60000));
+  const parsed = parseMediationCreateInput(body, { minMinutes, maxMinutes });
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = createMediationPackage({ userId: user.id, config: parsed.value });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '生成调解包失败' },
+      pkg: result.pkg || null,
+    });
+  }
+  const pkg = getMediationPackageForOwner({ userId: user.id, packageId: result.packageId });
+  const tierPath = { 1: 'mediation-review', 2: 'arbitration-review' };
+  const links = result.invitations.map((invite) => ({
+    invitationId: invite.id,
+    tier: invite.tier,
+    label: invite.label,
+    token: invite.token,
+    url: `/${tierPath[invite.tier]}?t=${encodeURIComponent(invite.token)}`,
+  }));
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    pkg,
+    links,
+    timeline: state.timeline,
+    mediationPackages: state.mediationPackages,
+  });
+}
+
+async function cancelMediation(req, res, user, rawPackageId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const packageId = decodeURIComponent(rawPackageId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(packageId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_MEDIATION_ID' } });
+  }
+  const result = cancelMediationPackage({ userId: user.id, packageId, reason: String(body.reason || '') });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '取消调解包失败' },
+      pkg: result.pkg || null,
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    pkg: result.pkg,
+    timeline: state.timeline,
+    mediationPackages: state.mediationPackages,
+  });
+}
+
+async function decideMediationFieldRoute(req, res, user, rawPackageId, rawFieldId, action) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const packageId = decodeURIComponent(rawPackageId);
+  const mediationFieldId = decodeURIComponent(rawFieldId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(packageId) || !/^[A-Za-z0-9_-]{8,200}$/.test(mediationFieldId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const result = decideMediationField({
+    userId: user.id,
+    packageId,
+    mediationFieldId,
+    action,
+    reason: String(body.reason || ''),
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '决议失败' },
+      field: result.field || null,
+      pkg: result.pkg || null,
+      workflow: result.workflow || null,
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    field: result.field,
+    workflow: result.workflow || null,
+    createdCorrection: Boolean(result.created),
+    escalated: Boolean(result.escalated),
+    packageCompleted: Boolean(result.packageCompleted),
+    packageStatus: result.packageStatus,
+    pkg: result.pkg,
+    records: state.records,
+    timeline: state.timeline,
+    mediationPackages: state.mediationPackages,
+    correction: state.correction,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 争议调解包：免登录调解人/仲裁人侧（第一层 mid/mcsrf，第二层 arb/accsrf2）
+// ---------------------------------------------------------------------------
+
+const mediationTierCookies = {
+  1: { session: MEDIATION_SESSION_COOKIE, csrf: MEDIATION_CSRF_COOKIE },
+  2: { session: ARBITRATION_SESSION_COOKIE, csrf: ARBITRATION_CSRF_COOKIE },
+};
+
+function mediationCookies(req) {
   return parseCookies(req.headers.cookie);
 }
 
-function batchSessionFromReq(req) {
+function mediationSessionFromReq(req, tier) {
+  const cookies = mediationCookies(req);
+  const name = mediationTierCookies[tier].session;
+  if (!cookies[name]) return null;
+  const review = getValidMediationSession(cookies[name]);
+  if (review && review.session.tier !== tier) return null;
+  return review;
+}
+
+function setMediationSessionCookies(res, tier, { sessionToken, csrf, expiresAt }) {
+  const secure = config.cookieSecure ? '; Secure' : '';
+  const maxAge = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+  const { session, csrf: csrfName } = mediationTierCookies[tier];
+  res.setHeader('Set-Cookie', [
+    `${session}=${sessionToken}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`,
+    `${csrfName}=${csrf}; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`,
+  ]);
+}
+
+function clearMediationSessionCookies(res, tier) {
+  const { session, csrf } = mediationTierCookies[tier];
+  res.setHeader('Set-Cookie', [
+    `${session}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`,
+    `${csrf}=; SameSite=Lax; Path=/; Max-Age=0`,
+  ]);
+}
+
+function checkMediationCsrf(req, review, tier) {
+  const header = req.headers['x-csrf-token'];
+  const cookies = mediationCookies(req);
+  const secret = review.session.csrf_secret;
+  const csrfName = mediationTierCookies[tier].csrf;
+  return Boolean(header && cookies[csrfName] && header === secret && timingSafeEqualBuffer(header, secret));
+}
+
+async function mediationReviewValidate(req, res, tier) {
+  const clientIp = req.socket.remoteAddress || 'unknown';
+  const limitKey = `${tier === 2 ? 'arbitration' : 'mediation'}-review-validate:${clientIp}`;
+  const rate = { windowMs: config.verifyRateWindowMs, max: config.verifyRateMax };
+  const preview = peekRateLimit(limitKey, rate);
+  if (!preview.allowed) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(preview.retryAfterMs / 1000))));
+    return sendJson(res, 429, { error: { code: 'TOO_MANY_REQUESTS', message: '校验尝试过于频繁，请稍后再试' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const token = String(body.token || '').trim();
+  if (!/^[A-Za-z0-9_-]{20,512}$/.test(token)) {
+    recordFailure(limitKey, rate);
+    return sendJson(res, 400, {
+      error: {
+        code: tier === 2 ? 'ARBITRATION_NOT_FOUND' : 'MEDIATION_INVITATION_NOT_FOUND',
+        message: MEDIATION_ERRORS[tier === 2 ? 'ARBITRATION_NOT_FOUND' : 'MEDIATION_INVITATION_NOT_FOUND'],
+      },
+    });
+  }
+  const result = consumeMediationInvitation({ rawToken: token, clientIp, expectedTier: tier });
+  if (!result.ok) {
+    recordFailure(limitKey, rate);
+    return sendJson(res, result.status, {
+      error: { code: result.code, message: result.message || MEDIATION_ERRORS[result.code] || '邀请校验失败' },
+    });
+  }
+  setMediationSessionCookies(res, tier, { sessionToken: result.sessionToken, csrf: result.csrf, expiresAt: result.expiresAt });
+  return sendJson(res, 200, {
+    ok: true,
+    packageId: result.packageId,
+    tier: result.tier,
+    receiptNo: result.receiptNo,
+    label: result.label,
+    csrfToken: result.csrf,
+    expiresAt: result.expiresAt,
+  });
+}
+
+async function mediationReviewLogout(req, res, tier) {
+  const cookies = mediationCookies(req);
+  const name = mediationTierCookies[tier].session;
+  if (cookies[name]) deleteMediationSession(cookies[name]);
+  clearMediationSessionCookies(res, tier);
+  return sendJson(res, 200, { ok: true });
+}
+
+function requireMediationSession(req, res, tier, { write = false } = {}) {
+  const review = mediationSessionFromReq(req, tier);
+  if (!review) {
+    sendJson(res, 401, {
+      error: {
+        code: tier === 2 ? 'ARBITRATION_SESSION_REQUIRED' : 'MEDIATION_SESSION_REQUIRED',
+        message: MEDIATION_ERRORS[tier === 2 ? 'ARBITRATION_SESSION_REQUIRED' : 'MEDIATION_SESSION_REQUIRED'],
+      },
+    });
+    return null;
+  }
+  if (write && !checkMediationCsrf(req, review, tier)) {
+    sendJson(res, 403, {
+      error: {
+        code: tier === 2 ? 'ARBITRATION_CSRF_INVALID' : 'MEDIATION_CSRF_INVALID',
+        message: MEDIATION_ERRORS[tier === 2 ? 'ARBITRATION_CSRF_INVALID' : 'MEDIATION_CSRF_INVALID'],
+      },
+    });
+    return null;
+  }
+  return review;
+}
+
+async function mediationReviewContext(req, res, tier) {
+  const review = requireMediationSession(req, res, tier);
+  if (!review) return;
+  const context = getMediationReviewerContext(review);
+  if (!context) {
+    clearMediationSessionCookies(res, tier);
+    return sendJson(res, 404, {
+      error: { code: 'MEDIATION_NOT_FOUND', message: MEDIATION_ERRORS.MEDIATION_NOT_FOUND },
+    });
+  }
+  return sendJson(res, 200, { ok: true, csrfToken: review.session.csrf_secret, context });
+}
+
+async function mediationReviewSubmit(req, res, tier) {
+  const review = requireMediationSession(req, res, tier, { write: true });
+  if (!review) return;
+  const body = await readJson(req, res);
+  if (!body) return;
+  const key = String(body.key || '');
+  const reason = String(body.reason || '');
+  const idempotencyKey = String(body.idempotencyKey || '');
+  if (!/^[A-Za-z0-9_-]{8,100}$/.test(idempotencyKey)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_IDEMPOTENCY_KEY', message: '提交编号格式不正确' } });
+  }
+  if (body.receiptNo !== undefined && formatReceiptNoInput(String(body.receiptNo)) !== review.session.receipt_no) {
+    return sendJson(res, 403, {
+      error: {
+        code: tier === 2 ? 'ARBITRATION_RECEIPT_MISMATCH' : 'MEDIATION_RECEIPT_MISMATCH',
+        message: MEDIATION_ERRORS[tier === 2 ? 'ARBITRATION_RECEIPT_MISMATCH' : 'MEDIATION_RECEIPT_MISMATCH'],
+      },
+    });
+  }
+  const requestHash = requestFingerprint({ key, reason });
+  const result = submitMediationOpinion({ review, key, reason, idempotencyKey, requestHash });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || MEDIATION_ERRORS[result.code] || '提交失败' },
+    });
+  }
+  return sendJson(res, 200, { ok: true, replay: Boolean(result.replay), opinion: result.opinion });
+}
+
+function batchCookies(req) {
+  return parseCookies(req.headers.cookie);
+}function batchSessionFromReq(req) {
   const cookies = batchCookies(req);
   if (!cookies[BATCH_SESSION_COOKIE]) return null;
   return getValidBatchSession(cookies[BATCH_SESSION_COOKIE]);
@@ -1076,12 +1421,14 @@ const BATCH_TIMEOUT_SWEEP_MS = Number(process.env.BATCH_TIMEOUT_SWEEP_MS || 5000
 let batchSweepTimer = null;
 function startBatchTimeoutSweep() {
   if (batchSweepTimer || process.env.NO_BATCH_SWEEP === '1') return;
-  // 启动时先恢复一次：服务在限时内重启后，到点的批次阶段/申诉回合仍会被落定
+  // 启动时先恢复一次：服务在限时内重启后，到点的批次阶段/申诉回合/调解包层级仍会被落定
   try { sweepBatchTimeouts(); } catch { /* 记录但不阻塞启动 */ }
   try { sweepAppealTimeouts(); } catch { /* 同上 */ }
+  try { sweepMediationTimeouts(); } catch { /* 同上 */ }
   batchSweepTimer = setInterval(() => {
     try { sweepBatchTimeouts(); } catch (error) { console.error('batch timeout sweep failed', error); }
     try { sweepAppealTimeouts(); } catch (error) { console.error('appeal timeout sweep failed', error); }
+    try { sweepMediationTimeouts(); } catch (error) { console.error('mediation timeout sweep failed', error); }
   }, BATCH_TIMEOUT_SWEEP_MS);
   batchSweepTimer.unref?.();
 }

@@ -56,6 +56,7 @@ const state = {
   reviews: { invitations: [], objections: [] },
   reviewBatches: [],
   reviewAppeals: [],
+  mediationPackages: [],
   appealReasons: [],
   batchFieldOptions: [],
   batchMaxInvitations: 5,
@@ -107,6 +108,7 @@ function applyState(result) {
   state.reviews = result.reviews || { invitations: [], objections: [] };
   state.reviewBatches = Array.isArray(result.reviewBatches) ? result.reviewBatches : [];
   state.reviewAppeals = Array.isArray(result.reviewAppeals) ? result.reviewAppeals : [];
+  state.mediationPackages = Array.isArray(result.mediationPackages) ? result.mediationPackages : [];
 }
 
 async function login(event) {
@@ -137,6 +139,7 @@ async function logout() {
     state.reviews = { invitations: [], objections: [] };
     state.reviewBatches = [];
     state.reviewAppeals = [];
+    state.mediationPackages = [];
     state.appealReasons = [];
     showLogin();
   }
@@ -561,6 +564,9 @@ function renderTimeline() {
         <div class="batch-fields">${fieldHtml}</div>
         ${eventHtml}
       `;
+    } else if (entry.kind === 'mediationPackage') {
+      li.className = 'record-item mediation-item';
+      li.append(renderMediationTimelineCard(entry));
     } else {
       li.className = 'record-item in-progress';
       li.innerHTML = `
@@ -1488,6 +1494,7 @@ function renderBatchPanel() {
     <div data-batch-builder></div>
     <div class="batch-list"></div>
     <div class="appeal-list"></div>
+    <div class="mediation-list"></div>
   `;
   panel.querySelector('[data-action="new-batch"]').addEventListener('click', () => openBatchBuilder(receiptNo));
   panel.querySelector('[data-action="new-staged-batch"]').addEventListener('click', () => openStagedBuilder(receiptNo));
@@ -1498,6 +1505,7 @@ function renderBatchPanel() {
     batches.forEach((batch) => list.append(renderBatchCard(batch)));
   }
   renderAppealSection(panel.querySelector('.appeal-list'), batches, receiptNo);
+  renderMediationSection(panel.querySelector('.mediation-list'), batches, receiptNo);
 }
 
 // 申诉回合区块：展示原批次↔申诉回合关系、邀请状态、倒计时、证据摘要、阈值进度与处理人
@@ -1533,6 +1541,9 @@ function renderAppealSection(container, batches, receiptNo) {
   });
   container.querySelectorAll('[data-appeal-reject]').forEach((btn) => {
     btn.addEventListener('click', () => rejectAppealField(btn.dataset.appealReject.split('|')[0], btn.dataset.appealReject.split('|')[1]));
+  });
+  container.querySelectorAll('[data-mediation-launch]').forEach((btn) => {
+    btn.addEventListener('click', () => openMediationBuilder(btn.dataset.mediationLaunch));
   });
 }
 
@@ -1622,8 +1633,12 @@ function renderAppealRoundCard(round, batch) {
       ${['collecting', 'in_review'].includes(round.status) && round.decidedCount === 0
         ? `<button class="link-button danger-link" type="button" data-appeal-cancel="${escapeHtml(round.id)}">取消申诉回合（尚无字段决议时可取消）</button>`
         : ''}
+      ${round.status === 'completed'
+        ? `<button class="link-button" type="button" data-mediation-launch="${escapeHtml(round.id)}">从申诉驳回字段生成争议调解包（两层处理）</button>`
+        : ''}
       ${canCreate ? '' : ''}
     </div>
+    <div class="mediation-builder-slot" data-mediation-builder="${escapeHtml(round.id)}"></div>
   </div>`;
 }
 
@@ -2419,4 +2434,463 @@ async function rejectAppealField(roundId, fieldId) {
     else showAlert(`驳回申诉失败：${error.message}`, 'error');
     await boot();
   }
+}
+
+// ---------------------------------------------------------------------------
+// 争议调解包区块：展示调解包↔申诉回合↔原批次关系、两层状态、邀请、倒计时、
+// 证据摘要、阈值进度、处理人与审计结果
+// ---------------------------------------------------------------------------
+function renderMediationSection(container, batches, receiptNo) {
+  const packages = (state.mediationPackages || []).filter((pkg) => pkg.receiptNo === receiptNo);
+  if (!batches.length || !packages.length) {
+    container.innerHTML = '';
+    return;
+  }
+  const rounds = (state.reviewAppeals || []).filter((round) => round.receiptNo === receiptNo);
+  const blocks = rounds.map((round) => {
+    const roundPackages = packages.filter((pkg) => pkg.roundId === round.id);
+    if (!roundPackages.length) return '';
+    const cards = roundPackages.map((pkg) => renderMediationPackageCard(pkg, round)).join('');
+    return `<div class="appeal-group">
+      <h3 class="appeal-group-title">申诉回合 <span class="mono small">${escapeHtml(round.id.slice(0, 12))}…</span> 的争议调解包</h3>
+      ${cards}
+    </div>`;
+  }).join('');
+  container.innerHTML = blocks;
+  // 简要卡片（列表接口无详情）：需要操作时点开时间线中的完整卡片
+}
+
+const MEDIATION_STATUS_TEXT = {
+  mediating: '第一层调解中',
+  arbitrating: '第二层仲裁中',
+  completed: '已完成',
+  cancelled: '已取消',
+  expired: '第一层超时终结',
+  failed: '第二层超时失败',
+};
+const MEDIATION_TIER_STATUS_TEXT = {
+  pending: '未开放', active: '进行中', active_deadline_passed: '限时已到',
+  completed: '已完成', skipped: '未升级/已跳过', cancelled: '已取消', timed_out: '已超时', failed: '已失败',
+};
+const MEDIATION_L1_POLICY_TEXT = { escalate: '自动升级第二层', revoke_unused: '撤销未使用邀请', fail: '超时终结调解包' };
+const MEDIATION_L2_POLICY_TEXT = { complete: '自动驳回并完成', revoke_unused: '撤销未使用邀请', fail: '超时终结调解包' };
+
+// 完整卡片由时间线条目渲染（含两层字段详情）；列表中的包只给简要摘要与“查看时间线”
+function renderMediationPackageCard(pkg, round) {
+  const statusCls = {
+    mediating: 'current', arbitrating: 'confirmed', completed: 'confirmed',
+    cancelled: 'invalidated', expired: 'invalidated', failed: 'invalidated',
+  }[pkg.status] || 'current';
+  return `<div class="objection-item batch-card appeal-card mediation-card ${pkg.status}">
+    <div class="record-main">
+      <span>调解包 <span class="mono small">${escapeHtml(pkg.id.slice(0, 12))}…</span> · 来自申诉回合 <span class="mono small">${escapeHtml(round.id.slice(0, 8))}…</span></span>
+      <span class="badge ${statusCls}">${MEDIATION_STATUS_TEXT[pkg.status] || pkg.status}</span>
+    </div>
+    <div class="muted small">创建于 ${formatTime(pkg.createdAt)}${pkg.note ? ` · 备注：${escapeHtml(pkg.note)}` : ''}</div>
+    <div class="muted small">两层字段决议、邀请链接、阈值进度与完整时间线请见下方时间线条目。</div>
+  </div>`;
+}
+
+// 时间线中的调解包完整卡片：两层状态/邀请/倒计时/字段阈值进度/决议操作/审计事件
+function renderMediationTimelineCard(entry) {
+  const card = document.createElement('div');
+  card.className = `mediation-timeline-card mediation-${entry.status}`;
+  const statusText = MEDIATION_STATUS_TEXT[entry.status] || entry.status;
+  const statusCls = {
+    mediating: 'current', arbitrating: 'confirmed', completed: 'confirmed',
+    cancelled: 'invalidated', expired: 'invalidated', failed: 'invalidated',
+  }[entry.status] || 'current';
+
+  const tierBlock = (tierView, tier) => {
+    if (!tierView) return '';
+    const tStatus = MEDIATION_TIER_STATUS_TEXT[tierView.status] || tierView.status;
+    const policyMap = tier === 1 ? MEDIATION_L1_POLICY_TEXT : MEDIATION_L2_POLICY_TEXT;
+    const countdown = (tierView.status === 'active' || tierView.status === 'active_deadline_passed') && tierView.deadlineAt
+      ? ` · 剩余 <b data-countdown="${tierView.deadlineAt}">${formatRemaining(tierView.deadlineAt)}</b>` : '';
+    const inviteHtml = (tierView.invitations || []).map((inv) => {
+      const invStatus = { active: '待使用', used: '已校验', revoked: '已撤销', expired: '已过期' }[inv.status] || inv.status;
+      return `<li class="muted small">${escapeHtml(inv.label)}：${invStatus} · 授权 ${inv.fieldKeys.length} 个字段${inv.usedAt ? ` · 校验于 ${formatTime(inv.usedAt)}` : ''}</li>`;
+    }).join('');
+    const fieldsHtml = (tierView.fields || []).map((field) => {
+      const badge = field.decision === 'accepted'
+        ? '<span class="badge confirmed">已接受</span>'
+        : field.decision === 'rejected'
+          ? '<span class="badge invalidated">已驳回</span>'
+          : '<span class="badge current">待决议</span>';
+      const opinions = (field.opinions || []).map((o) => `
+        <li class="batch-opinion">
+          <div class="record-main"><b>${escapeHtml(o.reviewerLabel)}</b><span class="muted small">${formatTime(o.submittedAt)}</span></div>
+          <div class="small">${escapeHtml(o.reason)}</div>
+        </li>`).join('');
+      const evidence = tier === 1 ? (field.evidence || []) : (field.layer1Summary?.evidence || []);
+      const evidenceHtml = (evidence || []).map((ev) => `
+        <li class="batch-opinion evidence-opinion">
+          <div class="record-main"><b>${escapeHtml(ev.alias)}</b><span class="muted small">选中证据 · ${formatTime(ev.originalSubmittedAt)}</span></div>
+          <div class="small">${escapeHtml(ev.reason)}</div>
+        </li>`).join('');
+      const summary = tier === 2 && field.layer1Summary ? `
+        <div class="muted small">第一层结论摘要：${field.layer1Summary.layer1Decision === 'rejected' ? '驳回' : '接受'}
+          ${field.layer1Summary.layer1DecidedByPolicy ? '（第一层冻结策略自动驳回）' : ''}
+          · 第一层意见 ${field.layer1Summary.layer1OpinionCount} 份
+          ${field.layer1Summary.layer1RejectedReason ? ` · 理由：${escapeHtml(field.layer1Summary.layer1RejectedReason)}` : ''}
+        </div>` : '';
+      const originals = tier === 1 ? `
+        <div class="muted small">原批次决议：驳回${field.originalBatchDecision?.reason ? `（${escapeHtml(field.originalBatchDecision.reason)}）` : ''}
+          ；申诉回合决议：驳回${field.appealDecision?.reason ? `（${escapeHtml(field.appealDecision.reason)}）` : ''}</div>` : '';
+      const result = field.correctionReceiptNo
+        ? `<div class="small review-obj-result">→ 更正回执 <span class="mono">${escapeHtml(field.correctionReceiptNo)}</span></div>`
+        : field.decision === 'rejected'
+          ? `<div class="small review-obj-result">${field.decidedByPolicy ? '系统按冻结策略自动驳回：' : '驳回理由：'}${escapeHtml(field.decisionReason || '—')} · 处理人 ${escapeHtml(field.decidedBy || '系统')}</div>`
+          : '';
+      return `<li class="batch-field mediation-field tier${tier} ${field.decision || 'pending'}">
+        <div class="record-main">
+          <span>${escapeHtml(field.label)}
+            <span class="muted small">（接受阈值 ${field.acceptThreshold} / 驳回阈值 ${field.rejectThreshold}，${field.opinionCount} 份本层意见）</span>
+          </span>${badge}
+        </div>
+        ${originals}${summary}
+        <details class="appeal-evidence-box">
+          <summary class="muted small">调解包选中证据（${(evidence || []).length} 条，原复核人匿名）</summary>
+          <ul class="batch-opinion-list">${evidenceHtml || '<li class="muted small">未选择证据</li>'}</ul>
+        </details>
+        <div class="muted small">本层意见：</div>
+        <ul class="batch-opinion-list">${opinions || '<li class="muted small">暂无意见</li>'}</ul>
+        ${result}
+        <span class="record-actions" data-mediation-field="${escapeHtml(entry.packageId)}|${escapeHtml(field.id)}|${tier}"></span>
+      </li>`;
+    }).join('');
+    const escalation = tier === 1
+      ? `<div class="muted small">升级条件：第一层驳回字段 ≥ <b>${tierView.escalateRejectedCount}</b> 时开放第二层仲裁</div>` : '';
+    return `<div class="mediation-tier tier-${tier}">
+      <div class="record-main">
+        <b>第 ${tier} 层 · ${tier === 1 ? '调解' : '仲裁'}</b>
+        <span class="badge ${tierView.status === 'active' ? 'confirmed' : tierView.status === 'pending' ? 'current' : 'invalidated'}">${tStatus} · ${tierView.validatedCount}/${tierView.invitationCount} · 决议 ${tierView.decidedCount}/${tierView.fieldCount}</span>
+      </div>
+      <div class="muted small">限时 ${Math.round(tierView.durationMs / 60000)} 分钟 · 冻结策略：${escapeHtml(policyMap[tierView.timeoutPolicy] || tierView.timeoutPolicy)}${countdown}</div>
+      ${escalation}
+      <ul class="batch-invite-list">${inviteHtml}</ul>
+      <ul class="batch-field-list">${fieldsHtml}</ul>
+    </div>`;
+  };
+
+  const correction = entry.correction ? `
+    <div class="muted small">关联更正：${escapeHtml(entry.correction.workflowId.slice(0, 10))}… · 第 ${entry.correction.sourceTier} 层接受
+      ${entry.correction.correctionReceiptNo ? ` · 新回执 <span class="mono">${escapeHtml(entry.correction.correctionReceiptNo)}</span>` : ' · 进行中'}
+    </div>` : '';
+  const events = (entry.events || []).length ? `
+    <details class="batch-history"><summary class="muted small">调解包审计事件（${entry.events.length}）</summary>
+    <ul class="batch-history-list">
+      ${entry.events.map((event) => `<li class="muted small">${formatTime(event.at)} · ${escapeHtml(event.type)}</li>`).join('')}
+    </ul></details>` : '';
+
+  card.innerHTML = `
+    <div class="record-main">
+      <span>↳ 争议调解包（申诉回合 <span class="mono small">${escapeHtml(entry.roundId.slice(0, 10))}…</span> · 原批次 <span class="mono small">${escapeHtml(entry.batchId.slice(0, 8))}…</span>）</span>
+      <span class="badge ${statusCls}">${statusText}</span>
+    </div>
+    <div class="muted small">
+      创建于 ${formatTime(entry.createdAt)}
+      ${entry.escalatedAt ? ` · 升级于 ${formatTime(entry.escalatedAt)}` : ''}
+      ${entry.cancelledAt ? ` · 取消于 ${formatTime(entry.cancelledAt)}（${escapeHtml(entry.cancelReason || '—')}）` : ''}
+      ${entry.completedAt ? ` · 完成于 ${formatTime(entry.completedAt)}` : ''}
+      · 针对回执 <span class="mono">${escapeHtml(entry.receiptNo)}</span>
+    </div>
+    ${correction}
+    ${tierBlock(entry.tier1, 1)}
+    ${tierBlock(entry.tier2, 2)}
+    ${events}
+    <div class="record-actions">
+      ${['mediating', 'arbitrating'].includes(entry.status)
+        ? `<button class="link-button danger-link" type="button" data-mediation-cancel="${escapeHtml(entry.packageId)}">取消调解包（任何一层尚无字段终局决议时可取消）</button>`
+        : ''}
+    </div>`;
+
+  card.querySelectorAll('[data-mediation-cancel]').forEach((btn) => {
+    btn.addEventListener('click', () => cancelMediationPackage(btn.dataset.mediationCancel));
+  });
+  card.querySelectorAll('[data-mediation-field]').forEach((slot) => {
+    const [packageId, fieldId, tier] = slot.dataset.mediationField.split('|');
+    const tierView = tier === '1' ? entry.tier1 : entry.tier2;
+    const field = tierView?.fields?.find((f) => f.id === fieldId);
+    if (!field || field.decision || tierView.status !== 'active') return;
+    const acceptBtn = document.createElement('button');
+    acceptBtn.type = 'button';
+    acceptBtn.className = 'link-button';
+    acceptBtn.textContent = `接受（第${tier === '1' ? '一' : '二'}层，阈值 ${field.acceptThreshold}）`;
+    acceptBtn.addEventListener('click', () => acceptMediationField(packageId, fieldId));
+    const rejectBtn = document.createElement('button');
+    rejectBtn.type = 'button';
+    rejectBtn.className = 'link-button muted-link';
+    rejectBtn.textContent = `驳回（阈值 ${field.rejectThreshold}）`;
+    rejectBtn.addEventListener('click', () => rejectMediationField(packageId, fieldId));
+    slot.append(acceptBtn, rejectBtn);
+  });
+  return card;
+}
+
+async function cancelMediationPackage(packageId) {
+  const reason = window.prompt('取消后所有未使用邀请立即失效，写操作全部关闭；任何一层已有字段终局决议后不能取消。请输入取消原因（可留空）：', '');
+  if (reason === null || state.busy) return;
+  try {
+    const result = await api('POST', `/api/mediation-packages/${encodeURIComponent(packageId)}/cancel`, { reason });
+    state.mediationPackages = result.mediationPackages || state.mediationPackages;
+    showAlert('调解包已取消，历史记录保留。', 'warning');
+    await boot();
+  } catch (error) {
+    showAlert(`取消调解包失败：${error.message}`, 'error');
+  }
+}
+
+async function acceptMediationField(packageId, fieldId) {
+  const ok = window.confirm(
+    '接受该字段后，本层意见将进入一个新的更正办理，同时关联调解包、上一层结论与原批次来源：\n\n'
+    + '· 提出意见的处理人数必须达到本层冻结的接受阈值；\n'
+    + '· 第一层接受字段不再交付仲裁；第一层驳回字段达到升级条件才开放第二层；\n'
+    + '· 同一调解包至多一份进行中的更正；原批次、申诉回合与原回执保持冻结。',
+  );
+  if (!ok || state.busy) return;
+  try {
+    const result = await api('POST', `/api/mediation-packages/${encodeURIComponent(packageId)}/fields/${encodeURIComponent(fieldId)}/accept`, {});
+    showAlert(result.escalated
+      ? '第一层驳回字段已达到升级条件：第二层仲裁已按冻结快照开放。'
+      : result.createdCorrection
+        ? '已创建新的更正办理，并关联调解包、上一层结论与原批次来源。'
+        : '已关联到该调解包进行中的同源更正办理。', result.escalated ? 'warning' : 'success');
+    await boot();
+  } catch (error) {
+    showAlert(`接受失败：${error.message}`, 'error');
+    await boot();
+  }
+}
+
+async function rejectMediationField(packageId, fieldId) {
+  const reason = window.prompt('请填写驳回理由（2-200 字）。驳回需要本层已校验但未提出意见的处理人数达到驳回阈值。', '');
+  if (reason === null || state.busy) return;
+  const trimmed = String(reason).trim();
+  if (trimmed.length < 2 || trimmed.length > 200) {
+    showAlert('驳回理由需为 2-200 个字符。', 'error');
+    return;
+  }
+  try {
+    const result = await api('POST', `/api/mediation-packages/${encodeURIComponent(packageId)}/fields/${encodeURIComponent(fieldId)}/reject`, { reason: trimmed });
+    showAlert(result.escalated
+      ? '已驳回且第一层达到升级条件：第二层仲裁已按冻结快照开放。'
+      : result.packageCompleted
+        ? '已驳回，调解包按本层终局完成（未达到升级条件）。'
+        : '驳回理由已保存。', 'warning');
+    await boot();
+  } catch (error) {
+    showAlert(`驳回失败：${error.message}`, 'error');
+    await boot();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 争议调解包构建器（办理人侧）：从已完成申诉回合的驳回字段中选择，
+// 配置两层各自的字段范围、阈值、限时、超时策略与一次性邀请
+// ---------------------------------------------------------------------------
+async function openMediationBuilder(roundId) {
+  if (state.busy) return;
+  let data;
+  try {
+    data = await api('GET', `/api/review-appeals/${encodeURIComponent(roundId)}/mediatable-fields`);
+  } catch (error) {
+    showAlert(`读取可生成调解包的字段失败：${error.message}`, 'error');
+    return;
+  }
+  const source = data.source;
+  if (!source || !source.frozen) {
+    showAlert('只能为已完成全部字段决议的申诉回合生成调解包。', 'warning');
+    return;
+  }
+  const fields = source.fields || [];
+  if (!fields.length) {
+    showAlert('该申诉回合没有已驳回字段可生成调解包。', 'warning');
+    return;
+  }
+  const slot = document.querySelector(`[data-mediation-builder="${CSS.escape(roundId)}"]`);
+  if (!slot) return;
+  slot.innerHTML = '';
+
+  const builder = document.createElement('div');
+  builder.className = 'batch-builder card-inner mediation-builder';
+  const fieldRows = fields.map((field) => {
+    const evidence = (field.evidence || []).map((ev) => `
+      <label class="appeal-evidence-row">
+        <input type="checkbox" data-evidence value="${escapeHtml(ev.id)}">
+        <span>${escapeHtml(ev.alias)}：${escapeHtml((ev.reason || '').slice(0, 60))}…</span>
+      </label>`).join('');
+    return `<div class="appeal-field-row" data-key="${escapeHtml(field.key)}">
+      <label class="bb-field-name">
+        <input type="checkbox" data-pkg-field="${escapeHtml(field.key)}" checked>
+        <b>${escapeHtml(field.label)}</b>
+        <span class="muted small">（${escapeHtml(field.key)}，申诉已驳回）</span>
+      </label>
+      <div class="muted small">申诉驳回理由：${escapeHtml(field.appealDecisionReason || '—')}</div>
+      <details class="appeal-evidence-box">
+        <summary>调解包中选中的申诉授权证据（${(field.evidence || []).length} 条可选；原复核人匿名）</summary>
+        ${evidence || '<p class="muted small">该申诉字段没有可披露的证据。</p>'}
+      </details>
+    </div>`;
+  }).join('');
+
+  const layerSection = (tier, title, minInvites, maxInvites, policies) => {
+    const checkedFields = selectedKeys();
+    const fieldThresholds = checkedFields.map((key) => `
+      <label class="appeal-scope-row">
+        <input type="checkbox" data-${tier}-field="${escapeHtml(key)}" checked>
+        ${escapeHtml(key)}
+        <span class="bb-thresholds">接受≥<input type="number" min="1" max="${maxInvites}" value="2" data-${tier}-accept="${escapeHtml(key)}">
+        驳回≥<input type="number" min="1" max="${maxInvites}" value="2" data-${tier}-reject="${escapeHtml(key)}"></span>
+      </label>`).join('');
+    const policyOptions = Object.entries(policies).map(([value, label]) => `<option value="${value}">${label}</option>`).join('');
+    const escalation = tier === 'l1' ? `
+      <label>升级条件：第一层驳回字段 ≥
+        <input type="number" min="1" max="5" value="1" data-l1-escalation> 时开放第二层
+      </label>` : '';
+    return `<div class="mediation-tier-config" data-tier-config="${tier}">
+      <h4>${title}</h4>
+      <label>本层限时（分钟，5-10080）<input type="number" data-${tier}-ttl value="60" min="5" max="10080"></label>
+      <label>超时策略<select data-${tier}-policy>${policyOptions}</select></label>
+      ${escalation}
+      <div class="muted small">字段范围与阈值（必须是调解包选中字段的子集）</div>
+      <div class="appeal-scope" data-${tier}-fields>${fieldThresholds || '<span class="muted small">请先勾选上方调解包字段</span>'}</div>
+      <div class="form-actions">
+        <button class="button secondary" type="button" data-${tier}-add-invite>增加一个邀请</button>
+        <span class="muted small">${minInvites}-${maxInvites} 个一次性邀请</span>
+      </div>
+      <div data-${tier}-invites></div>
+    </div>`;
+  };
+  const selectedKeys = () => [...builder.querySelectorAll('input[data-pkg-field]:checked')].map((i) => i.dataset.pkgField);
+
+  builder.innerHTML = `
+    <h3>生成争议调解包</h3>
+    <p class="muted small">
+      调解包是只读冻结快照：原批次决议、申诉意见、授权证据与当前更正来源在生成瞬间固定；
+      原批次与申诉回合历史不能被改写。第一层 2-5 位新调解人独立收集意见；
+      只有第一层驳回字段达到升级条件，第二层 3-5 位仲裁人才会按冻结快照开放。
+    </p>
+    <label>备注（可选）<input type="text" data-note maxlength="200" placeholder="例如：跨部门争议终局调解"></label>
+    <div class="bb-section">
+      <strong>① 选择进入调解包的申诉驳回字段与证据</strong>
+      <div class="bb-fields">${fieldRows}</div>
+    </div>
+    <div class="bb-section">
+      <strong>② 第一层（调解）配置</strong>
+      <div data-tier-l1></div>
+    </div>
+    <div class="bb-section">
+      <strong>③ 第二层（仲裁）配置（第一层升级后才开放；字段必须是第一层子集）</strong>
+      <div data-tier-l2></div>
+    </div>
+    <div class="alert error hidden" data-error></div>
+    <div class="form-actions">
+      <button class="button primary" type="button" data-create>生成调解包并返回两层一次性链接</button>
+      <button class="button secondary" type="button" data-close>取消</button>
+    </div>`;
+  slot.append(builder);
+
+  const l1Policies = { escalate: '超时自动升级第二层', revoke_unused: '撤销未使用邀请', fail: '超时终结调解包' };
+  const l2Policies = { complete: '超时自动驳回并完成', revoke_unused: '撤销未使用邀请', fail: '超时终结调解包' };
+  builder.querySelector('[data-tier-l1]').innerHTML = layerSection('l1', '第一层 · 调解（2-5 位调解人）', 2, 5, l1Policies);
+  builder.querySelector('[data-tier-l2]').innerHTML = layerSection('l2', '第二层 · 仲裁（3-5 位仲裁人）', 3, 5, l2Policies);
+
+  const syncTierFields = () => {
+    const selected = selectedKeys();
+    for (const tier of ['l1', 'l2']) {
+      const box = builder.querySelector(`[data-${tier}-fields]`);
+      const previous = new Set([...box.querySelectorAll('input:checked')].map((i) => i.dataset[`${tier}Field`]));
+      const maxInvites = tier === 'l1' ? 5 : 5;
+      box.innerHTML = selected.map((key) => `
+        <label class="appeal-scope-row">
+          <input type="checkbox" data-${tier}-field="${escapeHtml(key)}" ${previous.has(key) || tier === 'l1' ? 'checked' : ''}>
+          ${escapeHtml(key)}
+          <span class="bb-thresholds">接受≥<input type="number" min="1" max="${maxInvites}" value="2" data-${tier}-accept="${escapeHtml(key)}">
+          驳回≥<input type="number" min="1" max="${maxInvites}" value="2" data-${tier}-reject="${escapeHtml(key)}"></span>
+        </label>`).join('') || '<span class="muted small">请先勾选上方调解包字段</span>';
+      builder.querySelectorAll(`[data-${tier}-invites] .bb-invite`).forEach((invite) => {
+        const holder = invite.querySelector('[data-invite-fields]');
+        const checked = new Set([...holder.querySelectorAll('input:checked')].map((i) => i.value));
+        holder.innerHTML = selected.filter((key) => {
+          const tierField = box.querySelector(`[data-${tier}-field="${CSS.escape(key)}"]`);
+          return tierField?.checked;
+        }).map((key) => `
+          <label class="appeal-scope-row"><input type="checkbox" value="${escapeHtml(key)}" ${checked.has(key) || checked.size === 0 ? 'checked' : ''}> ${escapeHtml(key)}</label>
+        `).join('');
+      });
+    }
+  };
+  builder.querySelector('.bb-fields').addEventListener('change', syncTierFields);
+
+  const addInvite = (tier, minCount) => {
+    const box = builder.querySelector(`[data-${tier}-invites]`);
+    const count = box.children.length;
+    const maxInvites = tier === 'l1' ? 5 : 5;
+    if (count >= maxInvites) { showAlert(`第${tier === 'l1' ? '一' : '二'}层最多 ${maxInvites} 个邀请。`, 'warning'); return; }
+    const div = document.createElement('div');
+    div.className = 'bb-invite card-inner';
+    const defaultLabel = `${tier === 'l1' ? '调解人' : '仲裁人'}${count + 1}`;
+    div.innerHTML = `
+      <label>名称<input data-invite-label maxlength="60" value="${defaultLabel}"></label>
+      <div class="muted small">授权字段：</div>
+      <div class="appeal-scope" data-invite-fields></div>`;
+    box.append(div);
+    syncTierFields();
+  };
+  builder.querySelector('[data-l1-add-invite]').addEventListener('click', () => addInvite('l1'));
+  builder.querySelector('[data-l2-add-invite]').addEventListener('click', () => addInvite('l2'));
+  addInvite('l1'); addInvite('l1'); addInvite('l1');
+  addInvite('l2'); addInvite('l2'); addInvite('l2');
+  syncTierFields();
+
+  builder.querySelector('[data-close]').addEventListener('click', () => { slot.innerHTML = ''; });
+  builder.querySelector('[data-create]').addEventListener('click', async () => {
+    const errBox = builder.querySelector('[data-error]');
+    errBox.classList.add('hidden');
+    const fail = (message) => { errBox.textContent = message; errBox.classList.remove('hidden'); };
+    const selected = selectedKeys();
+    if (!selected.length) return fail('请至少选择一个申诉驳回字段。');
+    const collectLayer = (tier) => {
+      const keys = [...builder.querySelectorAll(`input[data-${tier}-field]:checked`)].map((i) => i.dataset[`${tier}Field`]);
+      return {
+        ttlMinutes: Number(builder.querySelector(`[data-${tier}-ttl]`).value),
+        timeoutPolicy: builder.querySelector(`[data-${tier}-policy]`).value,
+        fields: keys.map((key) => ({
+          key,
+          acceptThreshold: Number(builder.querySelector(`[data-${tier}-accept="${CSS.escape(key)}"]`).value),
+          rejectThreshold: Number(builder.querySelector(`[data-${tier}-reject="${CSS.escape(key)}"]`).value),
+        })),
+        invitations: [...builder.querySelectorAll(`[data-${tier}-invites] .bb-invite`)].map((invite) => ({
+          label: String(invite.querySelector('[data-invite-label]').value || '').trim(),
+          fields: [...invite.querySelectorAll('[data-invite-fields] input:checked')].map((i) => i.value),
+        })),
+      };
+    };
+    const layer1 = collectLayer('l1');
+    const layer2 = collectLayer('l2');
+    layer1.escalateRejectedCount = Number(builder.querySelector('[data-l1-escalation]').value);
+    const packageFields = selected.map((key) => {
+      const row = builder.querySelector(`.appeal-field-row[data-key="${CSS.escape(key)}"]`);
+      return { key, evidenceOpinionIds: [...row.querySelectorAll('input[data-evidence]:checked')].map((i) => i.value) };
+    });
+    try {
+      const result = await api('POST', '/api/mediation-packages', {
+        roundId,
+        note: String(builder.querySelector('[data-note]').value || ''),
+        fields: packageFields,
+        layer1,
+        layer2,
+      });
+      state.mediationPackages = result.mediationPackages || state.mediationPackages;
+      state.timeline = result.timeline || state.timeline;
+      const links = (result.links || []).map((l) =>
+        `${l.tier === 1 ? '第一层调解人' : '第二层仲裁人'} ${l.label}：${location.origin}${l.url}`).join('\n');
+      window.prompt('调解包已生成（只读冻结）。两层一次性链接仅展示这一次，第二层链接需在第一层升级后才能使用：', links);
+      slot.innerHTML = '';
+      render();
+    } catch (error) {
+      fail(error.message || '生成调解包失败');
+    }
+  });
 }

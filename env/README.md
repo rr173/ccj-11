@@ -44,6 +44,7 @@ docker compose up -d --build
 - **多方复核批次：批次状态、2-5 个限时一次性邀请、逐邀请字段授权、逐字段阈值、合并字段意见、逐字段决议与“接受意见→同一份更正→新回执”来源关系**
 - **分阶段复核编排：阶段顺序与状态、每阶段邀请/字段范围与阈值、开始时冻结的超时策略与倒计时、超时落定结果、编排配置版本与完整变更历史**
 - **复核申诉回合：只能针对原批次已驳回字段发起；独立限时与一次性新邀请、逐邀请字段授权、独立接受/驳回阈值；只引用原批次冻结快照（脱敏字段+原驳回决议+显式授权并匿名化的证据摘要）；申诉意见合并/幂等、逐字段决议、“接受申诉→同一份更正→关联申诉意见与原批次来源→新回执”、取消/过期写拒绝与完整审计时间线**
+- **争议调解包（两层处理）：只能从【已完成】申诉回合的驳回字段生成只读调解包，冻结原批次决议、申诉意见、授权证据与当前更正来源（原批次/申诉历史永不改写）；第一层 2-5 名新调解人独立限时意见，第一层驳回字段达到升级条件后，第二层 3-5 名仲裁人才按冻结快照开放（只能看到第一层允许披露的结论摘要与选中证据）；仲裁接受同时关联调解包、上一层结论与原批次来源进入新的更正办理，同一调解包至多一份进行中更正；取消/超时写拒绝、超时策略只落定一次、服务重启后两层关系与时间线完整（`review.mediation.*` 事件）**
 - **回执核验码密钥 `receipt-secret.key`（核验能力依赖它，务必随数据卷备份）**
 
 默认监听 3000。若由反向代理终止 HTTPS，请设置：
@@ -239,6 +240,22 @@ COOKIE_SECURE: "1"
 - **取消与过期**：办理人可在**尚无任何字段决议**时取消（`POST /api/review-appeals/{id}/cancel`），未使用邀请立即失效、写操作全部关闭；已有字段完成决议后历史不能删除，取消得 `409 APPEAL_HAS_DECISIONS`。独立限时到达时回合整体 `expired`（后台扫描、启动恢复与接口惰性检查三路触发，条件更新保证只落定一次），之后复核人提交与办理人决议都得到 410（`APPEAL_DEADLINE_PASSED` / `APPEAL_INVITATION_EXPIRED`）；已校验会话保留只读，已提交意见原样留档；取消/过期后可对同一驳回字段重新发起回合。
 - **办理人页面**展示原批次↔申诉回合关系、邀请状态、独立倒计时、证据摘要、阈值进度、处理人与逐字段决议；**回执时间线**在原批次条目之后插入 `kind: 'reviewAppeal'` 条目，区分原批次决议（`review.batch.*` 事件）、申诉事件（`review.appeal.created/started/invitation.consumed/opinion.submitted/field.accepted|rejected/cancelled/expired/completed/correction.completed`）与后续更正回执；全部状态在刷新、重新登录、服务重启后保持一致（申诉免登录会话同样持久化）。
 
+## 争议调解包（mediation package，两层处理）
+
+申诉回合**全部字段已决议**后，办理人可从其中的**申诉驳回字段**里选择一个或多个字段，生成一份**只读冻结调解包**。调解包只引用不修改：原批次决议、申诉意见、授权证据摘要与“当前更正来源”在生成瞬间复制冻结，之后原批次、申诉回合的任何变化都不影响调解包，调解包也绝不回写它们；未被选中的字段与未授权证据一律不进入调解包。
+
+- **生成条件与并发**：`GET /api/review-appeals/{id}/mediatable-fields` 只对 `status='completed'` 的申诉回合返回其中 `decision='rejected'` 的字段（含其申诉意见与已授权证据）；对进行中/取消/过期回合生成返回 `409 MEDIATION_SOURCE_NOT_FROZEN`，选入申诉未驳回字段返回 `MEDIATION_FIELD_NOT_REJECTED`，证据白名单引用不存在/不属于该字段的证据得 `400 INVALID_MEDIATION_EVIDENCE`。同一申诉回合至多一个未终结调解包，两个办理页面并发只成功一个，另一个得 `409 MEDIATION_ALREADY_OPEN`（部分唯一索引 + `BEGIN IMMEDIATE` 双保险）。
+- **两层配置（启动即冻结）**：`POST /api/mediation-packages { roundId, note, fields:[{key, evidenceOpinionIds}], layer1, layer2 }`。
+  - 第一层 `layer1`：2-5 名**新调解人**一次性邀请、逐邀请字段授权（第一层字段的子集，每字段至少一个邀请）、字段级接受/驳回阈值（1..邀请数）、独立限时与超时策略（`escalate` 超时自动升级/`revoke_unused` 撤销未使用邀请/`fail` 超时终结）、以及**升级条件** `escalateRejectedCount`（1..第一层字段数）；
+  - 第二层 `layer2`：3-5 名**仲裁人**一次性邀请、独立阈值/限时/超时策略（`complete`/`revoke_unused`/`fail`），**字段必须是第一层字段子集**。第一层创建即激活、冻结策略并起算倒计时；第二层保持 `pending`，邀请使用远期占位有效期。
+- **严格的层级门控**：第一层未达到升级条件前，仲裁链接**不能校验、不能查看、不能提交**（`409 ARBITRATION_NOT_OPEN`）。第一层每出现一个终局字段即检查“驳回字段数 ≥ 升级条件”：达到则第一层立即冻结完成（其余未决字段按策略自动驳回、留档为 `decided_by_policy='timeout_mediation'`），并**按第一层结束时的冻结快照**为每个第二层字段生成“允许向仲裁人披露的第一层结论摘要”（只有聚合结论/阈值结果/选中证据，**不含第一层调解人身份与逐字意见**），同时冻结第二层策略、起算倒计时、重定仲裁邀请有效期；未达到条件且第一层全部手工终局，则调解包按第一层终局完成，第二层标记 `skipped` 永不开放。第一层冻结后其结果不可修改（重复决议返回同一结果，`MEDIATION_FIELD_ALREADY_DECIDED`），第一层邀请链接也不再可校验。
+- **两层各自的一次性邀请与脱敏视图**：第一层链接 `/mediation-review?t=…`（Cookie `mid/mcsrf`），第二层链接 `/arbitration-review?t=…`（Cookie `arb/accsrf2`）；令牌 256 位随机、库存哈希，重复使用/过期/撤销分别返回对应 `*_ALREADY_USED/_EXPIRED/_REVOKED`，校验接口按 IP 限流。调解人只能看到本邀请授权的脱敏字段、原批次与申诉的驳回结论、调解包选中的冻结证据（原复核人匿名）；仲裁人只能看到仲裁授权字段、第一层结论摘要与透传的选中证据。越权字段读取/提交得 `403 *_FIELD_NOT_AUTHORIZED`，无会话/CSRF 缺失分别 `401/403`，携带他份回执得 `403 *_RECEIPT_MISMATCH`。
+- **意见幂等**：同一处理人对同一字段的意见支持幂等重试（同键同指纹返回同一条，换指纹 `OBJECTION_DUPLICATE_KEY`），每邀请每字段至多一份（`*_FIELD_DUPLICATE_OPINION`，UNIQUE 兜底并发）。
+- **逐字段终局决议**：接受需本层提出意见的不同处理人数 ≥ 该层冻结接受阈值（不足 `ACCEPT_THRESHOLD_NOT_MET`）；驳回需本层已校验未提意见人数 ≥ 驳回阈值（不足 `REJECT_THRESHOLD_NOT_MET`），理由 2-200 字持久化；并发决议以 `WHERE decision IS NULL` 判定，只有一个成功。
+- **仲裁接受必须三源关联**：仲裁接受在新的更正办理中同时写入**调解包、上一层结论（`mediation_disclosures`）与原批次/申诉回合来源**（`correction_objections.mediation_opinion_id/source_package_id/source_batch_id/source_round_id/source_tier=2` 与 `mediation_corrections.disclosure_id`）。**同一调解包只能产生一份进行中的更正**：部分唯一索引 `idx_mediation_corrections_one_open` 保证两个办理页面并发接受只成功一个，另一个得 `409 MEDIATION_CORRECTION_IN_PROGRESS`；存在进行中的其他办理时 `409 OPEN_WORKFLOW_EXISTS`。更正完成后新回执回填字段/意见/来源关系并关闭调解包；放弃更正只清理进行中关系（终局历史保留）。
+- **取消与超时**：任何一层尚无字段终局决议时可取消（未使用邀请立即失效、写操作全部 `410`）；已有终局决议后只能保留历史（`409 MEDIATION_HAS_DECISIONS`）。层级超时由后台 5 秒扫描、启动恢复与接口惰性检查三路触发，以 `timeout_fired_at IS NULL` 条件更新为唯一判定，**重复触发不产生第二次结果**；`revoke_unused` 只撤销未使用邀请（办理人仍须用已收集意见决议），`fail` 终结调解包，第一层 `escalate` 与第二层 `complete` 会自动驳回未决字段（留档）后升级/完成。
+- **审计与持久化**：办理人页面展示调解包↔申诉回合↔原批次↔更正办理关系、两层状态/邀请状态/倒计时/证据摘要/阈值进度/处理人；时间线在申诉回合条目之后插入 `kind: 'mediationPackage'` 条目，事件类型为 `review.mediation.created/tier.completed/tier.timeout/escalated/field.* /arbitration.invitation.consumed/arbitration.opinion.submitted/arbitration.field.*/correction.completed/cancelled`。刷新、重新登录、服务重启后冻结版本、两层状态、意见、决议、来源关系、超时结果和完整时间线保持一致（两层免登录会话均持久化）。
+
 ## 多方复核批次（可配置的多方复核与决议编排）
 
 办理人可在**已签发回执**上创建一个多方复核批次：同一份回执配 2～5 个**限时、一次性**邀请，每个邀请有独立的**可查看字段范围**，批次对每个纳入编排的字段配置**接受阈值 / 驳回阈值**。批次只有在全部邀请完成一次性校验后才能进入复核；复核人只能针对**本邀请被授权的字段**提交意见；同一字段的多份意见**合并展示但逐字保留每位复核人的原始说明**；办理人逐字段作出接受或驳回决议时**必须满足对应阈值**；被接受字段的全部意见进入**同一份**新的更正办理并关联全部意见。
@@ -379,12 +396,29 @@ COOKIE_SECURE: "1"
 | GET | `/api/appeal-review/context` | 否 | 仅本回合本邀请授权字段的脱敏视图、原驳回决议、证据摘要与合并意见 |
 | POST | `/api/appeal-review/opinions` | 否 | 新复核人提交申诉意见（需申诉会话 + CSRF，幂等） |
 | POST | `/api/appeal-review/logout` | 否 | 退出并清除本机申诉会话 |
+| GET | `/api/review-appeals/{id}/mediatable-fields` | 是 | 已完成申诉回合中可生成调解包的驳回字段、申诉意见与授权证据 |
+| POST | `/api/mediation-packages` | 是 | 生成只读争议调解包（两层配置：第一层 2-5 调解人、第二层 3-5 仲裁人、字段范围/阈值/限时/超时策略/升级条件，返回两层一次性链接） |
+| GET | `/api/mediation-packages` | 是 | 调解包清单（可按 `roundId`/`receiptNo` 过滤） |
+| GET | `/api/mediation-packages/{id}` | 是 | 调解包详情（冻结快照、两层状态、邀请、字段意见与决议、倒计时、更正来源） |
+| POST | `/api/mediation-packages/{id}/cancel` | 是 | 取消调解包（任何一层已有字段终局决议则失败，历史保留） |
+| POST | `/api/mediation-packages/{id}/fields/{fieldId}/accept` | 是 | 接受本层字段意见（达到冻结接受阈值；仲裁接受关联调解包+第一层结论+原批次来源进入新更正） |
+| POST | `/api/mediation-packages/{id}/fields/{fieldId}/reject` | 是 | 驳回本层字段（满足冻结驳回阈值，理由必填；第一层驳回字段达到升级条件即开放第二层） |
+| POST | `/api/mediation-review/validate` | 否 | 第一层调解邀请一次性校验（第二层未升级时调解链接之外的入口不可用） |
+| GET | `/api/mediation-review/context` | 否 | 仅本层本邀请授权字段的脱敏视图、原批次/申诉驳回结论、选中证据与本层合并意见 |
+| POST | `/api/mediation-review/opinions` | 否 | 调解人提交第一层意见（需调解会话 `mid/mcsrf` + CSRF，幂等） |
+| POST | `/api/mediation-review/logout` | 否 | 退出并清除本机调解会话 |
+| POST | `/api/arbitration-review/validate` | 否 | 第二层仲裁邀请一次性校验（第一层未达升级条件返回 `ARBITRATION_NOT_OPEN`） |
+| GET | `/api/arbitration-review/context` | 否 | 仅仲裁授权字段的脱敏视图、第一层结论摘要（无第一层调解人身份/逐字意见）与选中证据 |
+| POST | `/api/arbitration-review/opinions` | 否 | 仲裁人提交第二层意见（需仲裁会话 `arb/accsrf2` + CSRF，幂等） |
+| POST | `/api/arbitration-review/logout` | 否 | 退出并清除本机仲裁会话 |
 | POST | `/api/verify` | 否 | 编号+核验码核验，仅返回脱敏结果，按 IP 限流 |
 | GET | `/api/public/receipts/{no}/print?code=` | 否 | 脱敏可打印回执文档 |
 | GET | `/verify` | 否 | 免登录核验页面 |
 | GET | `/review` | 否 | 免登录复核页面（先完成邀请校验） |
 | GET | `/batch-review` | 否 | 免登录多方批次复核页面（先完成批次邀请校验） |
 | GET | `/appeal-review` | 否 | 免登录复核申诉评议页面（先完成申诉邀请校验，只展示本回合授权内容） |
+| GET | `/mediation-review` | 否 | 免登录第一层调解评议页面（先完成调解邀请校验，只展示本层授权内容） |
+| GET | `/arbitration-review` | 否 | 免登录第二层仲裁评议页面（第一层升级后才开放） |
 
 所有非 GET 的登录态接口要求 `X-CSRF-Token`。会话 Cookie 为 `HttpOnly; SameSite=Lax`，HTTPS 环境可启用 `Secure`。
 
@@ -409,10 +443,18 @@ COOKIE_SECURE: "1"
 - `review_appeal_invitations` / `review_appeal_invitation_fields` / `review_appeal_sessions`：申诉回合 2-5 个限时一次性邀请（令牌只存哈希）、逐邀请字段授权、独立 Cookie（aid/accsrf）的免登录会话
 - `review_appeal_opinions`：申诉意见（每邀请每申诉字段唯一、幂等键、脱敏值快照）；查询时按字段合并展示
 - `review_appeal_evidence`：办理人显式授权向新复核人披露的原批次证据摘要（原意见引用 + 匿名别名“原复核人N” + 脱敏值快照与逐字说明）；未授权的原意见不出现
-- `correction_objections`：批次字段意见/普通异议/申诉意见与更正办理的统一来源关联（新增 `appeal_opinion_id` 与 `source_batch_id/source_round_id`；完成更正时据此回填新回执编号、放弃更正时据此回收决议）
+- `mediation_packages`：争议调解包（状态 `mediating/arbitrating/completed/cancelled/expired/failed`、生成瞬间的冻结快照 `frozen_snapshot_json`（原批次决议/申诉决议/证据选择/更正来源/两层配置），部分唯一索引保证同一申诉回合至多一个未终结调解包）
+- `mediation_tiers`：两个顺序处理层级（`tier=1` 调解 / `tier=2` 仲裁；状态 `pending/active/completed/skipped/cancelled/timed_out/failed`、邀请数、限时、开始时冻结的策略、开始/截止/完成时间、升级条件 `escalate_rejected_count`、超时落定时间与结果）；第二层创建时为 `pending`，升级时才激活
+- `mediation_fields`：两层逐字段配置（`tier`、引用申诉字段与原批次字段、l1/l2 两套接受/驳回阈值）与逐字段终局决议（含系统按冻结策略自动驳回标记 `decided_by_policy='timeout_mediation'`、理由、处理人、关联更正办理与新回执）；`UNIQUE(package_id, tier, step, field)`
+- `mediation_frozen_opinions` / `mediation_frozen_evidence`：调解包生成瞬间冻结复制的申诉意见与选中的授权证据摘要（匿名别名、脱敏值快照）；未选中字段/证据不写入
+- `mediation_invitations` / `mediation_invitation_fields` / `mediation_sessions`：两层各自的限时一次性邀请（令牌只存哈希；第二层邀请升级前为远期占位有效期，升级时重定截止）、逐邀请字段授权，以及独立 Cookie（第一层 `mid/mcsrf`、第二层 `arb/accsrf2`）的免登录会话
+- `mediation_opinions`：第一层调解意见与第二层仲裁意见（每邀请每字段唯一、幂等键、脱敏值快照）
+- `mediation_disclosures`：第一层升级到第二层时按冻结快照生成的“允许向仲裁人披露的第一层结论摘要”（聚合结论与选中证据，不含第一层调解人身份/逐字意见），每个第二层字段唯一
+- `mediation_corrections`：调解包接受与更正办理的来源关系（原批次/申诉回合/层级/第一层结论引用）；部分唯一索引保证同一调解包至多一份进行中的更正
+- `correction_objections`：批次字段意见/普通异议/申诉意见/调解意见与更正办理的统一来源关联（新增 `mediation_opinion_id`、`source_package_id`、`source_tier`；完成更正时据此回填新回执编号；放弃更正时调解包终局保留、仅清理进行中关系）
 - `tokens`：令牌哈希、绑定维度、过期、使用、撤销状态
 - `submissions`：幂等键、请求指纹、提交和确认结果
-- `events`：创建、草稿、确认、退回、签发回执、撤销、更正创建、复核邀请/异议/处理、多方批次阶段/决议、复核申诉回合等审计事件
+- `events`：创建、草稿、确认、退回、签发回执、撤销、更正创建、复核邀请/异议/处理、多方批次阶段/决议、复核申诉回合、争议调解包两层处理等审计事件
 
 SQLite 启用 WAL 和外键；所有推进与回执签发都在同步 `BEGIN IMMEDIATE` 事务中完成。首次用新版启动旧版数据库时会自动迁移表结构并为已完成记录补签回执。
 

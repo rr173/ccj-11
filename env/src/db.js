@@ -27,6 +27,13 @@ import {
   listAppealRoundsForOwner,
   bindAppealCorrectionFactory,
 } from './appealStore.js';
+import {
+  attachCorrectionReceiptForMediation,
+  resolveMediationCorrectionAbandonment,
+  buildMediationTimelineEntries,
+  listMediationPackagesForOwner,
+  bindMediationCorrectionFactory,
+} from './mediationStore.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -561,6 +568,241 @@ CREATE TABLE IF NOT EXISTS review_appeal_evidence (
   UNIQUE(appeal_field_id, source_opinion_id)
 );
 CREATE INDEX IF NOT EXISTS idx_review_appeal_evidence_field ON review_appeal_evidence(appeal_field_id);
+
+-- ---------------------------------------------------------------------------
+-- 争议调解包：从已完成（全部字段已决议）的申诉回合中选择字段生成的只读包。
+-- 冻结原批次决议、申诉意见、授权证据摘要与当前更正来源；原批次/申诉回合的
+-- 历史永远不被本模块修改（无任何对其行的 UPDATE）。
+-- 状态机：mediating（第一层进行/等待升级判定）→ arbitrating（第二层开放）
+--         → completed；终态 cancelled / expired（第一层 fail）/ failed（第二层 fail）。
+-- 同一申诉回合至多一个未终结调解包（部分唯一索引 + 事务双保险）。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS mediation_packages (
+  id TEXT PRIMARY KEY,
+  round_id TEXT NOT NULL,
+  batch_id TEXT NOT NULL,
+  receipt_no TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'mediating'
+    CHECK (status IN ('mediating', 'arbitrating', 'completed', 'cancelled', 'expired', 'failed')),
+  note TEXT NOT NULL DEFAULT '',
+  frozen_snapshot_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  cancelled_at INTEGER,
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  completed_at INTEGER,
+  expired_at INTEGER,
+  escalated_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_mediation_packages_round ON mediation_packages(round_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_mediation_packages_receipt ON mediation_packages(receipt_no, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mediation_packages_one_open
+  ON mediation_packages(round_id) WHERE status IN ('mediating', 'arbitrating');
+
+-- 两个按顺序执行的处理层级：第一层调解（2-5 邀请），第二层仲裁（3-5 邀请）。
+-- 阈值、字段范围、限时、超时策略在各自层级开始时冻结；第二层开始时按第一层的
+-- 冻结快照开放，不能修改第一层结果。
+CREATE TABLE IF NOT EXISTS mediation_tiers (
+  id TEXT PRIMARY KEY,
+  package_id TEXT NOT NULL REFERENCES mediation_packages(id) ON DELETE CASCADE,
+  tier INTEGER NOT NULL CHECK (tier IN (1, 2)),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'active', 'completed', 'skipped', 'cancelled', 'timed_out', 'failed')),
+  escalate_rejected_count INTEGER NOT NULL DEFAULT 0,
+  invitation_count INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL,
+  timeout_policy TEXT NOT NULL DEFAULT '',
+  frozen_policy TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  deadline_at INTEGER,
+  completed_at INTEGER,
+  final_decision TEXT NOT NULL DEFAULT '',
+  timeout_fired_at INTEGER,
+  timeout_result TEXT NOT NULL DEFAULT '',
+  UNIQUE(package_id, tier)
+);
+CREATE INDEX IF NOT EXISTS idx_mediation_tiers_package ON mediation_tiers(package_id, tier);
+
+-- 调解逐字段配置与决议：l1_* 为第一层（调解），l2_* 为第二层（仲裁）。
+-- 一个字段最多属于一层一次（UNIQUE(package_id, tier, step, field)）。
+CREATE TABLE IF NOT EXISTS mediation_fields (
+  id TEXT PRIMARY KEY,
+  package_id TEXT NOT NULL REFERENCES mediation_packages(id) ON DELETE CASCADE,
+  tier_id TEXT NOT NULL REFERENCES mediation_tiers(id) ON DELETE CASCADE,
+  round_id TEXT NOT NULL,
+  appeal_field_id TEXT NOT NULL,
+  source_field_id TEXT NOT NULL,
+  tier INTEGER NOT NULL,
+  ordinal INTEGER NOT NULL DEFAULT 0,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  field_label TEXT NOT NULL DEFAULT '',
+  l1_accept_threshold INTEGER NOT NULL DEFAULT 0,
+  l1_reject_threshold INTEGER NOT NULL DEFAULT 0,
+  l2_accept_threshold INTEGER NOT NULL DEFAULT 0,
+  l2_reject_threshold INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'accepted', 'rejected', 'skipped', 'cancelled', 'timed_out')),
+  decision TEXT CHECK (decision IS NULL OR decision IN ('accepted', 'rejected')),
+  decided_at INTEGER,
+  decided_by_user_id TEXT,
+  decision_reason TEXT NOT NULL DEFAULT '',
+  decided_by_policy TEXT NOT NULL DEFAULT '',
+  correction_workflow_id TEXT,
+  correction_receipt_no TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE(package_id, tier, step, field)
+);
+CREATE INDEX IF NOT EXISTS idx_mediation_fields_package ON mediation_fields(package_id, tier);
+CREATE INDEX IF NOT EXISTS idx_mediation_fields_appeal ON mediation_fields(appeal_field_id);
+
+-- 冻结的申诉意见（调解包生成瞬间复制；原申诉意见之后的任何变化都不影响调解包）
+CREATE TABLE IF NOT EXISTS mediation_frozen_opinions (
+  id TEXT PRIMARY KEY,
+  package_id TEXT NOT NULL REFERENCES mediation_packages(id) ON DELETE CASCADE,
+  mediation_field_id TEXT NOT NULL REFERENCES mediation_fields(id) ON DELETE CASCADE,
+  tier INTEGER NOT NULL,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  source_appeal_opinion_id TEXT NOT NULL,
+  source_alias TEXT NOT NULL DEFAULT '',
+  source_value_snapshot TEXT NOT NULL DEFAULT '',
+  source_reason TEXT NOT NULL DEFAULT '',
+  source_created_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(mediation_field_id, source_appeal_opinion_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mediation_frozen_opinions_field ON mediation_frozen_opinions(mediation_field_id);
+
+-- 冻结的授权证据摘要（办理人在调解包中显式选择的申诉回合授权证据；
+-- 未被选中的证据不进入调解包）。原复核人以“原复核人N”匿名化。
+CREATE TABLE IF NOT EXISTS mediation_frozen_evidence (
+  id TEXT PRIMARY KEY,
+  package_id TEXT NOT NULL REFERENCES mediation_packages(id) ON DELETE CASCADE,
+  mediation_field_id TEXT NOT NULL REFERENCES mediation_fields(id) ON DELETE CASCADE,
+  tier INTEGER NOT NULL,
+  source_evidence_id TEXT NOT NULL,
+  source_alias TEXT NOT NULL DEFAULT '',
+  source_value_snapshot TEXT NOT NULL DEFAULT '',
+  source_reason TEXT NOT NULL DEFAULT '',
+  source_created_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(mediation_field_id, source_evidence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mediation_frozen_evidence_field ON mediation_frozen_evidence(mediation_field_id);
+
+-- 两层各自的限时一次性邀请（令牌只存哈希）；第二层邀请在第一层升级前为 pending，
+-- 使用“远期占位”有效期，升级瞬间按冻结快照重定为第二层截止时间。
+CREATE TABLE IF NOT EXISTS mediation_invitations (
+  id TEXT PRIMARY KEY,
+  package_id TEXT NOT NULL REFERENCES mediation_packages(id) ON DELETE CASCADE,
+  tier_id TEXT NOT NULL REFERENCES mediation_tiers(id) ON DELETE CASCADE,
+  tier INTEGER NOT NULL,
+  ordinal INTEGER NOT NULL DEFAULT 0,
+  receipt_no TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL DEFAULT '',
+  token_hash BLOB NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'used', 'revoked', 'expired')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER,
+  used_ip TEXT NOT NULL DEFAULT '',
+  revoked_at INTEGER,
+  revoke_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mediation_invitations_package ON mediation_invitations(package_id, tier, created_at);
+
+-- 逐邀请字段授权：只能查看/评价本层本邀请被授权的字段
+CREATE TABLE IF NOT EXISTS mediation_invitation_fields (
+  invitation_id TEXT NOT NULL REFERENCES mediation_invitations(id) ON DELETE CASCADE,
+  mediation_field_id TEXT NOT NULL REFERENCES mediation_fields(id) ON DELETE CASCADE,
+  tier INTEGER NOT NULL,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  PRIMARY KEY (invitation_id, tier, step, field)
+);
+CREATE INDEX IF NOT EXISTS idx_mediation_inv_fields_field ON mediation_invitation_fields(mediation_field_id);
+
+-- 两层邀请校验后的免登录会话（第一层 Cookie mid/mcsrf，第二层 Cookie arb/accsrf2）
+CREATE TABLE IF NOT EXISTS mediation_sessions (
+  id TEXT PRIMARY KEY,
+  package_id TEXT NOT NULL REFERENCES mediation_packages(id) ON DELETE CASCADE,
+  tier_id TEXT NOT NULL REFERENCES mediation_tiers(id) ON DELETE CASCADE,
+  invitation_id TEXT NOT NULL REFERENCES mediation_invitations(id) ON DELETE CASCADE,
+  tier INTEGER NOT NULL,
+  receipt_no TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '',
+  token_hash BLOB NOT NULL UNIQUE,
+  csrf_secret TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mediation_sessions_invitation ON mediation_sessions(invitation_id);
+
+-- 逐字段意见：每邀请每字段至多一条（UNIQUE 兜底并发）；幂等键网络重试
+CREATE TABLE IF NOT EXISTS mediation_opinions (
+  id TEXT PRIMARY KEY,
+  package_id TEXT NOT NULL REFERENCES mediation_packages(id) ON DELETE CASCADE,
+  mediation_field_id TEXT NOT NULL REFERENCES mediation_fields(id) ON DELETE CASCADE,
+  invitation_id TEXT NOT NULL REFERENCES mediation_invitations(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES mediation_sessions(id) ON DELETE CASCADE,
+  tier INTEGER NOT NULL,
+  receipt_no TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  reviewer_label TEXT NOT NULL DEFAULT '',
+  field_label TEXT NOT NULL DEFAULT '',
+  value_snapshot TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL,
+  correction_receipt_no TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  request_hash TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE(invitation_id, mediation_field_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mediation_opinions_receipt ON mediation_opinions(receipt_no, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mediation_opinions_idempotency
+  ON mediation_opinions(session_id, idempotency_key) WHERE idempotency_key <> '';
+
+-- 第一层结束升级到第二层时，按冻结快照生成的“允许向仲裁人披露的第一层结论摘要”。
+-- 只含结论/阈值结果等聚合信息，不含第一层调解人的逐字意见与身份。
+CREATE TABLE IF NOT EXISTS mediation_disclosures (
+  id TEXT PRIMARY KEY,
+  package_id TEXT NOT NULL REFERENCES mediation_packages(id) ON DELETE CASCADE,
+  l1_mediation_field_id TEXT NOT NULL REFERENCES mediation_fields(id) ON DELETE CASCADE,
+  l2_mediation_field_id TEXT NOT NULL REFERENCES mediation_fields(id) ON DELETE CASCADE,
+  tier INTEGER NOT NULL,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  UNIQUE(l2_mediation_field_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mediation_disclosures_package ON mediation_disclosures(package_id);
+
+-- 调解包接受（第一层或第二层）与因此进入的更正办理的来源关系。
+-- 无外键约束（更正被放弃时工作流行会删除，关系行一并清理，历史通过审计事件保留）；
+-- 部分唯一索引保证同一调解包至多一份进行中的更正，两个办理页面并发只放行一个。
+CREATE TABLE IF NOT EXISTS mediation_corrections (
+  id TEXT PRIMARY KEY,
+  package_id TEXT NOT NULL REFERENCES mediation_packages(id) ON DELETE CASCADE,
+  workflow_id TEXT NOT NULL,
+  source_batch_id TEXT NOT NULL DEFAULT '',
+  source_round_id TEXT NOT NULL DEFAULT '',
+  source_tier INTEGER NOT NULL,
+  disclosure_id TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  correction_receipt_no TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mediation_corrections_one_open
+  ON mediation_corrections(package_id) WHERE completed_at IS NULL;
 `);
 
 // 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
@@ -667,8 +909,11 @@ if (columnInfo('review_batch_stages').length > 0) {
         objection_id TEXT,
         batch_opinion_id TEXT,
         appeal_opinion_id TEXT,
+        mediation_opinion_id TEXT,
         source_batch_id TEXT NOT NULL DEFAULT '',
         source_round_id TEXT NOT NULL DEFAULT '',
+        source_package_id TEXT NOT NULL DEFAULT '',
+        source_tier INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL
       );
       CREATE UNIQUE INDEX idx_correction_objections_obj
@@ -677,6 +922,8 @@ if (columnInfo('review_batch_stages').length > 0) {
         ON correction_objections(workflow_id, batch_opinion_id) WHERE batch_opinion_id IS NOT NULL;
       CREATE UNIQUE INDEX idx_correction_objections_appeal
         ON correction_objections(workflow_id, appeal_opinion_id) WHERE appeal_opinion_id IS NOT NULL;
+      CREATE UNIQUE INDEX idx_correction_objections_mediation
+        ON correction_objections(workflow_id, mediation_opinion_id) WHERE mediation_opinion_id IS NOT NULL;
     `);
   } else if (!columns.some((c) => c.name === 'batch_opinion_id')) {
     db.exec(`
@@ -692,6 +939,15 @@ if (columnInfo('review_batch_stages').length > 0) {
   if (columns.length > 0 && !columns.some((c) => c.name === 'source_round_id')) {
     db.exec("ALTER TABLE correction_objections ADD COLUMN source_round_id TEXT NOT NULL DEFAULT '';");
   }
+  if (columns.length > 0 && !columns.some((c) => c.name === 'mediation_opinion_id')) {
+    db.exec('ALTER TABLE correction_objections ADD COLUMN mediation_opinion_id TEXT;');
+  }
+  if (columns.length > 0 && !columns.some((c) => c.name === 'source_package_id')) {
+    db.exec("ALTER TABLE correction_objections ADD COLUMN source_package_id TEXT NOT NULL DEFAULT '';");
+  }
+  if (columns.length > 0 && !columns.some((c) => c.name === 'source_tier')) {
+    db.exec('ALTER TABLE correction_objections ADD COLUMN source_tier INTEGER NOT NULL DEFAULT 0;');
+  }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_objections_obj
       ON correction_objections(workflow_id, objection_id) WHERE objection_id IS NOT NULL;
@@ -699,6 +955,8 @@ if (columnInfo('review_batch_stages').length > 0) {
       ON correction_objections(workflow_id, batch_opinion_id) WHERE batch_opinion_id IS NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_objections_appeal
       ON correction_objections(workflow_id, appeal_opinion_id) WHERE appeal_opinion_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_objections_mediation
+      ON correction_objections(workflow_id, mediation_opinion_id) WHERE mediation_opinion_id IS NOT NULL;
   `);
 }
 
@@ -897,6 +1155,7 @@ export function insertCorrectionWorkflowTx(source) {
 // 注入给多方复核批次模块在其事务内复用（打破 ESM 循环依赖的初始化时序）
 bindCorrectionFactory(insertCorrectionWorkflowTx);
 bindAppealCorrectionFactory(insertCorrectionWorkflowTx);
+bindMediationCorrectionFactory(insertCorrectionWorkflowTx);
 
 // 放弃进行中的更正：只删除更正产生的新办理记录及其草稿/令牌/提交，
 // 原回执（冻结快照、状态、核验码）与原办理记录完全不受影响。
@@ -945,6 +1204,9 @@ export function abandonCorrectionWorkflow({ userId }) {
     if (reopenedAppealFieldIds.length > 0) {
       addReviewEvent(workflow.user_id, sourceReceiptNo, 'review.appeal.fields.reopened', { appealFieldIds: reopenedAppealFieldIds });
     }
+    // 争议调解包：调解接受进入的更正被放弃时，按调解包不可改写规则只清理来源关系，
+    // 第一层终局保留（第二层是否已开放决定是否还能回收第一层决议）；仲裁接受不回收。
+    resolveMediationCorrectionAbandonment(workflow.id);
     // 显式清理子表（同时有外键级联兜底）
     db.prepare('DELETE FROM submissions WHERE workflow_id = ?').run(workflow.id);
     db.prepare('DELETE FROM tokens WHERE workflow_id = ?').run(workflow.id);
@@ -1137,6 +1399,8 @@ export function confirmStep({ workflowId, userId, sessionId, pageId, step, token
       attachCorrectionReceiptForBatch({ workflowId, receiptNo: receipt.receiptNo });
       // 复核申诉回合：接受申诉进入的更正完成后，回填新回执编号与来源关系
       attachCorrectionReceiptForAppeal({ workflowId, receiptNo: receipt.receiptNo });
+      // 争议调解包：仲裁/调解接受进入的更正完成后，回填新回执编号并关闭调解包
+      attachCorrectionReceiptForMediation({ workflowId, receiptNo: receipt.receiptNo });
     }
     addEvent(workflowId, isFinal ? 'workflow.completed' : 'step.confirmed', step, { submissionId });
 
@@ -1881,6 +2145,12 @@ export function getTimelineForUser(userId) {
     if (!appealEntriesByBatch.has(appealEntry.batchId)) appealEntriesByBatch.set(appealEntry.batchId, []);
     appealEntriesByBatch.get(appealEntry.batchId).push(appealEntry);
   }
+  // 调解包按申诉回合归组：时间线中紧跟其申诉回合条目（不修改原批次/申诉条目）
+  const mediationEntriesByRound = new Map();
+  for (const mediationEntry of buildMediationTimelineEntries(userId)) {
+    if (!mediationEntriesByRound.has(mediationEntry.roundId)) mediationEntriesByRound.set(mediationEntry.roundId, []);
+    mediationEntriesByRound.get(mediationEntry.roundId).push(mediationEntry);
+  }
   for (const entry of entries) {
     withReviews.push(entry);
     if (entry.kind !== 'receipt') continue;
@@ -1895,6 +2165,9 @@ export function getTimelineForUser(userId) {
         withReviews.push({ sequence: entry.sequence, ...item.batch });
         for (const appealEntry of appealEntriesByBatch.get(item.batch.batchId) || []) {
           withReviews.push({ sequence: entry.sequence, ...appealEntry });
+          for (const mediationEntry of mediationEntriesByRound.get(appealEntry.roundId) || []) {
+            withReviews.push({ sequence: entry.sequence, ...mediationEntry });
+          }
         }
         continue;
       }
@@ -1972,6 +2245,7 @@ export function getStateForUser(userId) {
   };
   envelope.reviewBatches = listBatchesForOwner(userId);
   envelope.reviewAppeals = listAppealRoundsForOwner(userId);
+  envelope.mediationPackages = listMediationPackagesForOwner(userId);
   return envelope;
 }
 
@@ -2009,3 +2283,19 @@ export {
   decideAppealField,
   sweepAppealTimeouts,
 } from './appealStore.js';
+
+// 争议调解包：统一从 db.js 重导出
+export {
+  listMediatableAppealFields,
+  createMediationPackage,
+  listMediationPackagesForOwner,
+  getMediationPackageForOwner,
+  cancelMediationPackage,
+  decideMediationField,
+  consumeMediationInvitation,
+  getValidMediationSession,
+  deleteMediationSession,
+  getMediationReviewerContext,
+  submitMediationOpinion,
+  sweepMediationTimeouts,
+} from './mediationStore.js';

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>争议调解 · 第二层仲裁</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell narrow-shell">
+    <header class="topbar">
+      <div>
+        <h1>争议调解 · 第二层仲裁</h1>
+        <p class="subtitle">你是办理人邀请的仲裁人；无需登录，但必须先通过一次性仲裁邀请校验。只有第一层达到升级条件后，第二层才会开放</p>
+      </div>
+    </header>
+
+    <section id="validateView" class="card">
+      <h2>仲裁邀请校验</h2>
+      <p class="muted small">点击办理人发来的仲裁链接即可自动校验。链接只能使用一次；第一层未达到升级条件时，仲裁链接无法校验；本层限时独立计时。</p>
+      <form id="validateForm">
+        <label>仲裁邀请令牌（也可粘贴完整链接）
+          <textarea name="token" rows="3" required placeholder="/arbitration-review?t=……"></textarea>
+        </label>
+        <div id="validateError" class="alert error hidden"></div>
+        <button class="button primary" type="submit">完成校验并进入仲裁</button>
+      </form>
+    </section>
+
+    <section id="reviewView" class="hidden">
+      <div id="reviewAlert" class="alert hidden"></div>
+
+      <section class="card">
+        <div class="receipt-head">
+          <h2>第二层仲裁（脱敏视图）</h2>
+          <span id="reviewStatus" class="status-pill completed"></span>
+        </div>
+        <div class="receipt-meta">
+          <div><span class="muted">你的仲裁身份</span><b id="reviewerLabel"></b></div>
+          <div><span class="muted">调解包状态</span><b id="roundStatus"></b></div>
+          <div><span class="muted">本层截止</span><b id="deadlineAt"></b></div>
+          <div><span class="muted">倒计时</span><b id="countdown">—</b></div>
+          <div><span class="muted">回执编号</span><b id="receiptNo" class="mono selectable"></b></div>
+          <div><span class="muted">仲裁会话截止</span><b id="expiresAt"></b></div>
+        </div>
+        <p class="muted small">
+          仲裁只展示<strong>第一层允许披露的结论摘要</strong>（不含第一层调解人的身份与逐字意见）、办理人选中的证据摘要，
+          以及本仲裁邀请被授权字段的脱敏值。你无法查看其他字段或任何层处理人的未授权隐私。
+        </p>
+        <div id="gateNotice" class="alert warning hidden"></div>
+        <div id="reviewFields"></div>
+      </section>
+
+      <section class="card" id="opinionCard">
+        <h2>提交仲裁意见</h2>
+        <p class="muted small">只能针对本邀请被授权的仲裁字段；每个字段你只能提交一份意见。办理人将按本层冻结的接受/驳回阈值逐字段作出终局决议；仲裁接受将同时关联调解包、第一层结论与原批次来源并进入新的更正办理。</p>
+        <form id="opinionForm">
+          <label>有意见的字段
+            <select name="field" id="opinionField" required></select>
+          </label>
+          <label>仲裁意见说明（2-500 字）
+            <textarea name="reason" rows="4" required minlength="2" maxlength="500" placeholder="请说明是否支持该字段的争议更正（请勿填写完整证件号码等敏感信息）"></textarea>
+          </label>
+          <div id="opinionError" class="alert error hidden"></div>
+          <button class="button primary" type="submit">提交仲裁意见</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>本层仲裁意见与终局结果</h2>
+        <p class="muted small">同一字段的仲裁意见按仲裁人合并展示；办理人的逐字段终局决议与后续更正回执编号会显示在这里。</p>
+        <div id="mergedList"></div>
+      </section>
+
+      <div class="form-actions">
+        <button class="button secondary" id="exitReview" type="button">退出仲裁（清除本机会话）</button>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="/arbitration-review.js"></script>
+</body>
+</html>
