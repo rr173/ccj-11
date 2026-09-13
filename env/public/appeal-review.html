@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>复核申诉评议</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell narrow-shell">
+    <header class="topbar">
+      <div>
+        <h1>复核申诉评议</h1>
+        <p class="subtitle">你是办理人邀请的新复核人；无需登录，但必须先通过申诉邀请的一次性校验。页面只展示本回合授权内容</p>
+      </div>
+    </header>
+
+    <section id="validateView" class="card">
+      <h2>申诉邀请校验</h2>
+      <p class="muted small">点击办理人发来的申诉链接即可自动校验。链接只能使用一次；申诉回合限时独立计时，取消或过期后将明确失败。</p>
+      <form id="validateForm">
+        <label>申诉邀请令牌（也可粘贴完整链接）
+          <textarea name="token" rows="3" required placeholder="/appeal-review?t=……"></textarea>
+        </label>
+        <div id="validateError" class="alert error hidden"></div>
+        <button class="button primary" type="submit">完成校验并进入评议</button>
+      </form>
+    </section>
+
+    <section id="reviewView" class="hidden">
+      <div id="reviewAlert" class="alert hidden"></div>
+
+      <section class="card">
+        <div class="receipt-head">
+          <h2>申诉回合（脱敏视图）</h2>
+          <span id="reviewStatus" class="status-pill completed"></span>
+        </div>
+        <div class="receipt-meta">
+          <div><span class="muted">你的复核身份</span><b id="reviewerLabel"></b></div>
+          <div><span class="muted">回合状态</span><b id="roundStatus"></b></div>
+          <div><span class="muted">申诉理由</span><b id="reasonSummary"></b></div>
+          <div><span class="muted">回合截止</span><b id="deadlineAt"></b></div>
+          <div><span class="muted">倒计时</span><b id="countdown">—</b></div>
+          <div><span class="muted">回执编号</span><b id="receiptNo" class="mono selectable"></b></div>
+          <div><span class="muted">复核会话截止</span><b id="expiresAt"></b></div>
+        </div>
+        <p class="muted small">
+          本申诉只能引用原批次的冻结快照：以下仅包含<strong>本邀请被授权查看的申诉字段</strong>（敏感值已在服务端遮罩），
+          以及原字段的既有驳回决议与办理人允许披露的证据摘要。你无法查看其他字段或原复核人的未授权隐私。
+        </p>
+        <div id="gateNotice" class="alert warning hidden"></div>
+        <div id="reviewFields"></div>
+      </section>
+
+      <section class="card" id="opinionCard">
+        <h2>提交申诉意见</h2>
+        <p class="muted small">只能针对本邀请被授权的申诉字段；每个字段你只能提交一份意见。办理人将按本回合独立阈值逐字段作出接受或驳回决议。</p>
+        <form id="opinionForm">
+          <label>有意见的字段
+            <select name="field" id="opinionField" required></select>
+          </label>
+          <label>申诉意见说明（2-500 字）
+            <textarea name="reason" rows="4" required minlength="2" maxlength="500" placeholder="请说明是否支持该字段的申诉（请勿填写完整证件号码等敏感信息）"></textarea>
+          </label>
+          <div id="opinionError" class="alert error hidden"></div>
+          <button class="button primary" type="submit">提交申诉意见</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>申诉意见合并视图与处理结果</h2>
+        <p class="muted small">同一字段的申诉意见按新复核人合并展示；办理人的逐字段决议与后续更正回执编号会显示在这里。</p>
+        <div id="mergedList"></div>
+      </section>
+
+      <div class="form-actions">
+        <button class="button secondary" id="exitReview" type="button">退出评议（清除本机会话）</button>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="/appeal-review.js"></script>
+</body>
+</html>

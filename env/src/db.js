@@ -20,6 +20,13 @@ import {
   listBatchesForOwner,
   bindCorrectionFactory,
 } from './batchStore.js';
+import {
+  attachCorrectionReceiptForAppeal,
+  reopenAppealDecisionsForWorkflow,
+  buildAppealTimelineEntries,
+  listAppealRoundsForOwner,
+  bindAppealCorrectionFactory,
+} from './appealStore.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -408,6 +415,152 @@ CREATE TABLE IF NOT EXISTS review_batch_opinions (
 CREATE INDEX IF NOT EXISTS idx_review_batch_opinions_receipt ON review_batch_opinions(receipt_no, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_review_batch_opinions_idempotency
   ON review_batch_opinions(session_id, idempotency_key) WHERE idempotency_key <> '';
+
+-- ---------------------------------------------------------------------------
+-- 复核申诉回合：办理人针对原批次【已驳回】字段发起的一次独立复核。
+-- 只能引用原批次冻结快照；原批次的意见/决议/超时结果不被修改。
+-- 状态机：collecting（邀请校验中）→ in_review → completed；终态 cancelled / expired。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS review_appeal_rounds (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES review_batches(id),
+  receipt_no TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'collecting'
+    CHECK (status IN ('collecting', 'in_review', 'completed', 'cancelled', 'expired')),
+  reason_summary TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  started_at INTEGER,
+  completed_at INTEGER,
+  cancelled_at INTEGER,
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  expired_at INTEGER,
+  invitation_count INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_appeal_rounds_batch ON review_appeal_rounds(batch_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_appeal_rounds_receipt ON review_appeal_rounds(receipt_no, created_at);
+
+-- 同一批次至多一个未终结（collecting/in_review）的申诉回合（两个页面并发只放行一个）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_appeal_rounds_one_open
+  ON review_appeal_rounds(batch_id) WHERE status IN ('collecting', 'in_review');
+
+-- 申诉逐字段配置：独立的接受/驳回阈值、申诉理由、原驳回决议摘要、逐字段决议与更正来源
+CREATE TABLE IF NOT EXISTS review_appeal_fields (
+  id TEXT PRIMARY KEY,
+  round_id TEXT NOT NULL REFERENCES review_appeal_rounds(id) ON DELETE CASCADE,
+  source_field_id TEXT NOT NULL REFERENCES review_batch_fields(id),
+  batch_id TEXT NOT NULL,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  field_label TEXT NOT NULL DEFAULT '',
+  reason_code TEXT NOT NULL DEFAULT '',
+  accept_threshold INTEGER NOT NULL,
+  reject_threshold INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'collecting'
+    CHECK (status IN ('collecting', 'in_review', 'accepted', 'rejected', 'expired', 'cancelled')),
+  decision TEXT CHECK (decision IS NULL OR decision IN ('accepted', 'rejected')),
+  decided_at INTEGER,
+  decided_by_user_id TEXT,
+  decision_reason TEXT NOT NULL DEFAULT '',
+  correction_workflow_id TEXT,
+  correction_receipt_no TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE(round_id, source_field_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_appeal_fields_round ON review_appeal_fields(round_id);
+CREATE INDEX IF NOT EXISTS idx_review_appeal_fields_source ON review_appeal_fields(source_field_id);
+
+-- 每个被申诉字段（原批次字段）在【未终结】回合中至多出现一次
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_appeal_fields_one_open
+  ON review_appeal_fields(source_field_id) WHERE status IN ('collecting', 'in_review');
+
+-- 申诉回合的限时一次性邀请（令牌只存哈希）
+CREATE TABLE IF NOT EXISTS review_appeal_invitations (
+  id TEXT PRIMARY KEY,
+  round_id TEXT NOT NULL REFERENCES review_appeal_rounds(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL DEFAULT 0,
+  receipt_no TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL DEFAULT '',
+  token_hash BLOB NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'used', 'revoked', 'expired')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER,
+  used_ip TEXT NOT NULL DEFAULT '',
+  revoked_at INTEGER,
+  revoke_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_review_appeal_invitations_round ON review_appeal_invitations(round_id, created_at);
+
+-- 每个申诉邀请可查看/可评价的申诉字段范围
+CREATE TABLE IF NOT EXISTS review_appeal_invitation_fields (
+  invitation_id TEXT NOT NULL REFERENCES review_appeal_invitations(id) ON DELETE CASCADE,
+  appeal_field_id TEXT NOT NULL REFERENCES review_appeal_fields(id) ON DELETE CASCADE,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  PRIMARY KEY (invitation_id, step, field)
+);
+CREATE INDEX IF NOT EXISTS idx_review_appeal_inv_fields_field ON review_appeal_invitation_fields(appeal_field_id);
+
+-- 申诉邀请校验后的免登录会话（独立 Cookie aid / CSRF accsrf）
+CREATE TABLE IF NOT EXISTS review_appeal_sessions (
+  id TEXT PRIMARY KEY,
+  round_id TEXT NOT NULL REFERENCES review_appeal_rounds(id) ON DELETE CASCADE,
+  appeal_invitation_id TEXT NOT NULL REFERENCES review_appeal_invitations(id) ON DELETE CASCADE,
+  receipt_no TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '',
+  token_hash BLOB NOT NULL UNIQUE,
+  csrf_secret TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_appeal_sessions_invitation ON review_appeal_sessions(appeal_invitation_id);
+
+-- 申诉意见：每邀请每申诉字段至多一条（UNIQUE 兜底并发），幂等键重放
+CREATE TABLE IF NOT EXISTS review_appeal_opinions (
+  id TEXT PRIMARY KEY,
+  round_id TEXT NOT NULL REFERENCES review_appeal_rounds(id) ON DELETE CASCADE,
+  appeal_field_id TEXT NOT NULL REFERENCES review_appeal_fields(id) ON DELETE CASCADE,
+  appeal_invitation_id TEXT NOT NULL REFERENCES review_appeal_invitations(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES review_appeal_sessions(id) ON DELETE CASCADE,
+  receipt_no TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  step INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  reviewer_label TEXT NOT NULL DEFAULT '',
+  field_label TEXT NOT NULL DEFAULT '',
+  value_snapshot TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL,
+  correction_receipt_no TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  request_hash TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE(appeal_invitation_id, appeal_field_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_appeal_opinions_receipt ON review_appeal_opinions(receipt_no, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_appeal_opinions_idempotency
+  ON review_appeal_opinions(session_id, idempotency_key) WHERE idempotency_key <> '';
+
+-- 允许向新复核人披露的原批次证据摘要：原复核人匿名化（source_alias 为本回合内稳定别名），
+-- 仅保留原意见的脱敏值快照与说明，不含任何未授权隐私。
+CREATE TABLE IF NOT EXISTS review_appeal_evidence (
+  id TEXT PRIMARY KEY,
+  round_id TEXT NOT NULL REFERENCES review_appeal_rounds(id) ON DELETE CASCADE,
+  appeal_field_id TEXT NOT NULL REFERENCES review_appeal_fields(id) ON DELETE CASCADE,
+  source_opinion_id TEXT NOT NULL REFERENCES review_batch_opinions(id),
+  source_alias TEXT NOT NULL DEFAULT '',
+  source_value_snapshot TEXT NOT NULL DEFAULT '',
+  source_reason TEXT NOT NULL DEFAULT '',
+  source_created_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(appeal_field_id, source_opinion_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_appeal_evidence_field ON review_appeal_evidence(appeal_field_id);
 `);
 
 // 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
@@ -513,23 +666,39 @@ if (columnInfo('review_batch_stages').length > 0) {
         workflow_id TEXT NOT NULL,
         objection_id TEXT,
         batch_opinion_id TEXT,
+        appeal_opinion_id TEXT,
+        source_batch_id TEXT NOT NULL DEFAULT '',
+        source_round_id TEXT NOT NULL DEFAULT '',
         created_at INTEGER NOT NULL
       );
       CREATE UNIQUE INDEX idx_correction_objections_obj
         ON correction_objections(workflow_id, objection_id) WHERE objection_id IS NOT NULL;
       CREATE UNIQUE INDEX idx_correction_objections_batch
         ON correction_objections(workflow_id, batch_opinion_id) WHERE batch_opinion_id IS NOT NULL;
+      CREATE UNIQUE INDEX idx_correction_objections_appeal
+        ON correction_objections(workflow_id, appeal_opinion_id) WHERE appeal_opinion_id IS NOT NULL;
     `);
   } else if (!columns.some((c) => c.name === 'batch_opinion_id')) {
     db.exec(`
       ALTER TABLE correction_objections ADD COLUMN batch_opinion_id TEXT;
     `);
   }
+  if (columns.length > 0 && !columns.some((c) => c.name === 'appeal_opinion_id')) {
+    db.exec('ALTER TABLE correction_objections ADD COLUMN appeal_opinion_id TEXT;');
+  }
+  if (columns.length > 0 && !columns.some((c) => c.name === 'source_batch_id')) {
+    db.exec("ALTER TABLE correction_objections ADD COLUMN source_batch_id TEXT NOT NULL DEFAULT '';");
+  }
+  if (columns.length > 0 && !columns.some((c) => c.name === 'source_round_id')) {
+    db.exec("ALTER TABLE correction_objections ADD COLUMN source_round_id TEXT NOT NULL DEFAULT '';");
+  }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_objections_obj
       ON correction_objections(workflow_id, objection_id) WHERE objection_id IS NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_objections_batch
       ON correction_objections(workflow_id, batch_opinion_id) WHERE batch_opinion_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_objections_appeal
+      ON correction_objections(workflow_id, appeal_opinion_id) WHERE appeal_opinion_id IS NOT NULL;
   `);
 }
 
@@ -727,6 +896,7 @@ export function insertCorrectionWorkflowTx(source) {
 }
 // 注入给多方复核批次模块在其事务内复用（打破 ESM 循环依赖的初始化时序）
 bindCorrectionFactory(insertCorrectionWorkflowTx);
+bindAppealCorrectionFactory(insertCorrectionWorkflowTx);
 
 // 放弃进行中的更正：只删除更正产生的新办理记录及其草稿/令牌/提交，
 // 原回执（冻结快照、状态、核验码）与原办理记录完全不受影响。
@@ -769,6 +939,11 @@ export function abandonCorrectionWorkflow({ userId }) {
     db.prepare('DELETE FROM correction_objections WHERE workflow_id = ?').run(workflow.id);
     if (reopenedBatchFieldIds.length > 0) {
       addReviewEvent(workflow.user_id, sourceReceiptNo, 'review.batch.fields.reopened', { batchFieldIds: reopenedBatchFieldIds });
+    }
+    // 复核申诉回合：因接受申诉而进入的更正被放弃，申诉字段决议回收（原批次驳回决议不变）
+    const reopenedAppealFieldIds = reopenAppealDecisionsForWorkflow(workflow.id);
+    if (reopenedAppealFieldIds.length > 0) {
+      addReviewEvent(workflow.user_id, sourceReceiptNo, 'review.appeal.fields.reopened', { appealFieldIds: reopenedAppealFieldIds });
     }
     // 显式清理子表（同时有外键级联兜底）
     db.prepare('DELETE FROM submissions WHERE workflow_id = ?').run(workflow.id);
@@ -960,6 +1135,8 @@ export function confirmStep({ workflowId, userId, sessionId, pageId, step, token
       }
       // 多方复核批次：接受字段进入的更正完成后，回填新回执编号与来源关系
       attachCorrectionReceiptForBatch({ workflowId, receiptNo: receipt.receiptNo });
+      // 复核申诉回合：接受申诉进入的更正完成后，回填新回执编号与来源关系
+      attachCorrectionReceiptForAppeal({ workflowId, receiptNo: receipt.receiptNo });
     }
     addEvent(workflowId, isFinal ? 'workflow.completed' : 'step.confirmed', step, { submissionId });
 
@@ -1698,6 +1875,12 @@ export function getTimelineForUser(userId) {
     if (!batchEntriesByReceipt.has(batchEntry.receiptNo)) batchEntriesByReceipt.set(batchEntry.receiptNo, []);
     batchEntriesByReceipt.get(batchEntry.receiptNo).push(batchEntry);
   }
+  // 申诉回合按原批次归组：时间线中紧跟其原批次条目，区分原批次决议与申诉事件
+  const appealEntriesByBatch = new Map();
+  for (const appealEntry of buildAppealTimelineEntries(userId)) {
+    if (!appealEntriesByBatch.has(appealEntry.batchId)) appealEntriesByBatch.set(appealEntry.batchId, []);
+    appealEntriesByBatch.get(appealEntry.batchId).push(appealEntry);
+  }
   for (const entry of entries) {
     withReviews.push(entry);
     if (entry.kind !== 'receipt') continue;
@@ -1710,6 +1893,9 @@ export function getTimelineForUser(userId) {
     for (const item of reviewLike) {
       if (item.type === 'reviewBatch') {
         withReviews.push({ sequence: entry.sequence, ...item.batch });
+        for (const appealEntry of appealEntriesByBatch.get(item.batch.batchId) || []) {
+          withReviews.push({ sequence: entry.sequence, ...appealEntry });
+        }
         continue;
       }
       const inv = item.inv;
@@ -1785,6 +1971,7 @@ export function getStateForUser(userId) {
     objections: listObjectionsForOwner(userId),
   };
   envelope.reviewBatches = listBatchesForOwner(userId);
+  envelope.reviewAppeals = listAppealRoundsForOwner(userId);
   return envelope;
 }
 
@@ -1806,3 +1993,19 @@ export {
   getBatchOrchestrationHistory,
   sweepBatchTimeouts,
 } from './batchStore.js';
+
+// 复核申诉回合：同样统一从 db.js 重导出
+export {
+  createAppealRound,
+  listAppealRoundsForOwner,
+  getAppealRoundForOwner,
+  listAppealableFields,
+  cancelAppealRound,
+  consumeAppealInvitation,
+  getValidAppealSession,
+  deleteAppealSession,
+  getAppealReviewerContext,
+  submitAppealOpinion,
+  decideAppealField,
+  sweepAppealTimeouts,
+} from './appealStore.js';

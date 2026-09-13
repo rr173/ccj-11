@@ -1374,9 +1374,10 @@ export function decideBatchField({ userId, batchId, batchFieldId, action, reason
       }
       for (const opinion of opinions) {
         db.prepare(`
-          INSERT OR IGNORE INTO correction_objections (workflow_id, objection_id, batch_opinion_id, created_at)
-          VALUES (?, NULL, ?, ?)
-        `).run(workflow.id, opinion.id, ts);
+          INSERT OR IGNORE INTO correction_objections
+            (workflow_id, objection_id, batch_opinion_id, source_batch_id, source_round_id, created_at)
+          VALUES (?, NULL, ?, ?, '', ?)
+        `).run(workflow.id, opinion.id, batchId, ts);
       }
       addBatchEvent(batch.receipt_no, 'review.batch.field.accepted', {
         batchId, batchFieldId, stageOrdinal: stage ? stage.ordinal : null,

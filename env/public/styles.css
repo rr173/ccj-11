@@ -190,3 +190,25 @@ a.button { display: inline-block; text-decoration: none; }
   body { background: #fff; }
   .topbar, .side-col, .work-panel > #globalAlert { display: none !important; }
 }
+
+/* 复核申诉回合 */
+.appeal-list { display: grid; gap: 12px; margin-top: 14px; }
+.appeal-group { display: grid; gap: 8px; }
+.appeal-group-title { margin: 4px 0; font-size: 14px; color: #344054; }
+.appeal-card { border-left: 4px solid #7e57d1; }
+.appeal-card.in_review { border-color: #7e57d1; }
+.appeal-card.completed { border-left-color: #1d8a53; }
+.appeal-card.cancelled, .appeal-card.expired { opacity: .75; border-left-color: #d92d20; }
+.appeal-item { border-left: 4px solid #7e57d1; }
+.appeal-field { border-color: #ddd0f5; }
+.appeal-field.accepted { border-color: #1d8a53; background: #f6fef9; }
+.appeal-field.rejected { border-color: #fecdca; background: #fffbfa; }
+.appeal-evidence { border: 1px dashed #c3b0ea; border-radius: 8px; padding: 6px 10px; margin: 4px 0; background: #faf8ff; }
+.evidence-opinion { background: #faf8ff; border-radius: 6px; padding: 4px 8px; }
+.appeal-field-row { border: 1px solid #d8dee9; border-radius: 10px; padding: 10px; margin: 6px 0; background: #fff; display: grid; gap: 6px; }
+.appeal-field-config { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.appeal-field-config input[type="number"] { width: 70px; }
+.appeal-evidence-box { margin-top: 4px; }
+.appeal-evidence-row { display: flex; gap: 6px; align-items: flex-start; font-size: 13px; color: #475467; }
+.appeal-scope { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.appeal-scope-row { font-size: 13px; }

@@ -55,6 +55,8 @@ const state = {
   correction: null,
   reviews: { invitations: [], objections: [] },
   reviewBatches: [],
+  reviewAppeals: [],
+  appealReasons: [],
   batchFieldOptions: [],
   batchMaxInvitations: 5,
   user: null,
@@ -104,6 +106,7 @@ function applyState(result) {
   state.correction = result.correction || null;
   state.reviews = result.reviews || { invitations: [], objections: [] };
   state.reviewBatches = Array.isArray(result.reviewBatches) ? result.reviewBatches : [];
+  state.reviewAppeals = Array.isArray(result.reviewAppeals) ? result.reviewAppeals : [];
 }
 
 async function login(event) {
@@ -133,6 +136,8 @@ async function logout() {
     state.correction = null;
     state.reviews = { invitations: [], objections: [] };
     state.reviewBatches = [];
+    state.reviewAppeals = [];
+    state.appealReasons = [];
     showLogin();
   }
 }
@@ -480,8 +485,83 @@ function renderTimeline() {
           batchActions.append(revokeBtn);
         });
       }
+    } else if (entry.kind === 'reviewAppeal') {
+      li.className = 'record-item appeal-item';
+      const appealStatusMap = {
+        collecting: ['邀请校验中', 'current'],
+        in_review: ['申诉评议中', 'confirmed'],
+        completed: ['已完成决议', 'confirmed'],
+        cancelled: ['已取消', 'invalidated'],
+        expired: ['已过期', 'invalidated'],
+      };
+      const [appealStatusText, appealStatusCls] = appealStatusMap[entry.status] || [entry.status, 'current'];
+      const inviteHtml = (entry.invitations || []).map((inv) => {
+        const invStatus = { active: '待使用', used: '已校验', revoked: '已撤销', expired: '已过期' }[inv.status] || inv.status;
+        return `<li class="muted small">${escapeHtml(inv.label)}：${invStatus} · 授权 ${inv.fieldKeys.length} 个字段${inv.usedAt ? ` · 校验于 ${formatTime(inv.usedAt)}` : ''}</li>`;
+      }).join('');
+      const fieldHtml = (entry.fields || []).map((field) => {
+        const badge = field.decision === 'accepted'
+          ? '<span class="badge confirmed">申诉成立</span>'
+          : field.decision === 'rejected'
+            ? '<span class="badge invalidated">申诉驳回</span>'
+            : '<span class="badge current">待决议</span>';
+        const evidenceHtml = (field.evidence || []).map((ev) => `
+          <li class="batch-opinion evidence-opinion">
+            <div class="record-main"><b>${escapeHtml(ev.alias)}</b><span class="muted small">原复核证据 · ${formatTime(ev.originalSubmittedAt)}</span></div>
+            <div class="small">${escapeHtml(ev.reason)}</div>
+          </li>`).join('');
+        const opinionHtml = (field.opinions || []).map((o) => `
+          <li class="batch-opinion">
+            <div class="record-main"><b>${escapeHtml(o.reviewerLabel)}</b><span class="muted small">${formatTime(o.submittedAt)}</span></div>
+            <div class="small">${escapeHtml(o.reason)}</div>
+          </li>`).join('');
+        const result = field.correctionReceiptNo
+          ? `<div class="small review-obj-result">→ 更正回执 <span class="mono">${escapeHtml(field.correctionReceiptNo)}</span></div>`
+          : field.decision === 'rejected'
+            ? `<div class="small review-obj-result">申诉驳回理由：${escapeHtml(field.decisionReason || '—')} · 处理人 ${escapeHtml(field.decidedBy || '—')}</div>`
+            : '';
+        const original = field.originalDecision;
+        return `
+          <div class="batch-field appeal-field ${field.decision || 'pending'}">
+            <div class="record-main">
+              <span>${escapeHtml(field.label)}
+                <span class="muted small">（申诉理由：${escapeHtml(field.reasonLabel)}，接受阈值 ${field.acceptThreshold} / 驳回阈值 ${field.rejectThreshold}，${field.opinionCount} 份意见）</span>
+              </span>
+              ${badge}
+            </div>
+            <div class="muted small">原批次决议：驳回${original?.decidedByPolicy ? '（超时策略自动驳回）' : ''}${original?.decidedAt ? ` · ${formatTime(original.decidedAt)}` : ''}；原驳回理由：${escapeHtml(original?.reason || '—')}</div>
+            <details class="appeal-evidence-box" ${field.evidence.length ? 'open' : ''}>
+              <summary class="muted small">允许披露的原复核证据（${field.evidence.length} 条，原复核人匿名）</summary>
+              <ul class="batch-opinion-list">${evidenceHtml || '<li class="muted small">未授权披露</li>'}</ul>
+            </details>
+            <div class="muted small">新复核人申诉意见：</div>
+            <ul class="batch-opinion-list">${opinionHtml || '<li class="muted small">暂无申诉意见</li>'}</ul>
+            ${result}
+          </div>`;
+      }).join('');
+      const eventHtml = (entry.events || []).length ? `
+        <details class="batch-history"><summary class="muted small">申诉审计事件（${entry.events.length}）</summary>
+        <ul class="batch-history-list">
+          ${entry.events.map((event) => `<li class="muted small">${formatTime(event.at)} · ${escapeHtml(event.type)}</li>`).join('')}
+        </ul></details>` : '';
+      li.innerHTML = `
+        <div class="record-main">
+          <span>↳ 复核申诉回合（原批次 <span class="mono small">${escapeHtml(entry.batchId.slice(0, 10))}…</span>）</span>
+          <span class="badge ${appealStatusCls}">${appealStatusText} · ${entry.validatedCount}/${entry.invitationCount} · 决议 ${entry.decidedCount}/${entry.fieldCount}</span>
+        </div>
+        <div class="muted small">
+          创建于 ${formatTime(entry.createdAt)} · 截止 ${formatTime(entry.expiresAt)}
+          ${['collecting', 'in_review'].includes(entry.status) ? ` · 剩余 <b data-countdown="${entry.expiresAt}">${formatRemaining(entry.expiresAt)}</b>` : ''}
+          ${entry.cancelledAt ? ` · 取消于 ${formatTime(entry.cancelledAt)}` : ''}
+          ${entry.expiredAt ? ` · 过期于 ${formatTime(entry.expiredAt)}` : ''}
+          ${entry.completedAt ? ` · 完成于 ${formatTime(entry.completedAt)}` : ''}
+        </div>
+        <div class="muted small">申诉理由：${escapeHtml(entry.reasonSummary || '—')} · 针对回执 <span class="mono">${escapeHtml(entry.receiptNo)}</span></div>
+        <ul class="batch-invite-list">${inviteHtml}</ul>
+        <div class="batch-fields">${fieldHtml}</div>
+        ${eventHtml}
+      `;
     } else {
-      const isCorrection = entry.kind === 'correction';
       li.className = 'record-item in-progress';
       li.innerHTML = `
         <div class="record-main">
@@ -1407,15 +1487,144 @@ function renderBatchPanel() {
     </p>
     <div data-batch-builder></div>
     <div class="batch-list"></div>
+    <div class="appeal-list"></div>
   `;
   panel.querySelector('[data-action="new-batch"]').addEventListener('click', () => openBatchBuilder(receiptNo));
   panel.querySelector('[data-action="new-staged-batch"]').addEventListener('click', () => openStagedBuilder(receiptNo));
   const list = panel.querySelector('.batch-list');
   if (!batches.length) {
     list.innerHTML = '<p class="muted small">尚无复核批次。</p>';
+  } else {
+    batches.forEach((batch) => list.append(renderBatchCard(batch)));
+  }
+  renderAppealSection(panel.querySelector('.appeal-list'), batches, receiptNo);
+}
+
+// 申诉回合区块：展示原批次↔申诉回合关系、邀请状态、倒计时、证据摘要、阈值进度与处理人
+function renderAppealSection(container, batches, receiptNo) {
+  const rounds = (state.reviewAppeals || []).filter((round) => round.receiptNo === receiptNo);
+  if (!batches.length || !rounds.length) {
+    container.innerHTML = '';
     return;
   }
-  batches.forEach((batch) => list.append(renderBatchCard(batch)));
+  const blocks = batches.map((batch) => {
+    const batchRounds = rounds.filter((round) => round.batchId === batch.id);
+    if (!batchRounds.length) return '';
+    const cards = batchRounds.map((round) => renderAppealRoundCard(round, batch)).join('');
+    return `<div class="appeal-group">
+      <h3 class="appeal-group-title">批次 <span class="mono small">${escapeHtml(batch.id.slice(0, 12))}…</span> 的复核申诉回合</h3>
+      ${cards}
+    </div>`;
+  }).join('');
+  container.innerHTML = blocks;
+  container.querySelectorAll('[data-appeal-create]').forEach((btn) => {
+    btn.addEventListener('click', () => openAppealBuilder(btn.dataset.appealCreate));
+  });
+  container.querySelectorAll('[data-appeal-copy]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      showAlert('出于安全设计，完整申诉链接只在创建回合当次展示；如链接丢失，请取消本回合并重新发起。', 'warning');
+    });
+  });
+  container.querySelectorAll('[data-appeal-cancel]').forEach((btn) => {
+    btn.addEventListener('click', () => cancelAppealRound(btn.dataset.appealCancel));
+  });
+  container.querySelectorAll('[data-appeal-accept]').forEach((btn) => {
+    btn.addEventListener('click', () => acceptAppealField(btn.dataset.appealAccept.split('|')[0], btn.dataset.appealAccept.split('|')[1]));
+  });
+  container.querySelectorAll('[data-appeal-reject]').forEach((btn) => {
+    btn.addEventListener('click', () => rejectAppealField(btn.dataset.appealReject.split('|')[0], btn.dataset.appealReject.split('|')[1]));
+  });
+}
+
+const APPEAL_STATUS_TEXT = {
+  collecting: '邀请校验中', in_review: '申诉评议中', completed: '已完成决议', cancelled: '已取消', expired: '已过期',
+};
+
+function renderAppealRoundCard(round, batch) {
+  const statusCls = {
+    collecting: 'current', in_review: 'confirmed', completed: 'confirmed', cancelled: 'invalidated', expired: 'invalidated',
+  }[round.status] || 'current';
+  const invites = round.invitations.map((inv) => {
+    const invStatus = { active: '待使用', used: '已校验', revoked: '已撤销', expired: '已过期' }[inv.status] || inv.status;
+    const linkBtn = inv.status === 'active' && ['collecting', 'in_review'].includes(round.status)
+      ? `<button class="link-button" type="button" data-appeal-copy="${escapeHtml(inv.id)}">复制链接</button>`
+      : '';
+    return `<li class="muted small">
+      <b>${escapeHtml(inv.label)}</b> · ${invStatus} · 授权字段：${inv.fields.map((f) => escapeHtml(f.label)).join('、')}
+      ${inv.usedAt ? ` · 校验于 ${formatTime(inv.usedAt)}` : ''}
+      <span class="record-actions">${linkBtn}</span>
+    </li>`;
+  }).join('');
+  const fields = round.fields.map((field) => {
+    const opinions = field.opinions.map((o) => `
+      <li class="batch-opinion">
+        <div class="record-main"><b>${escapeHtml(o.reviewerLabel)}</b><span class="muted small">${formatTime(o.submittedAt)}</span></div>
+        <div class="small">${escapeHtml(o.reason)}</div>
+      </li>`).join('');
+    const badge = field.decision === 'accepted'
+      ? '<span class="badge confirmed">申诉成立·已接受</span>'
+      : field.decision === 'rejected'
+        ? '<span class="badge invalidated">申诉驳回</span>'
+        : '<span class="badge current">待决议</span>';
+    const original = field.originalDecision;
+    const originalLine = original ? `
+      <div class="small muted">原批次决议：驳回${original.decidedByPolicy ? '（超时策略自动驳回）' : ''}${original.decidedAt ? ` · ${formatTime(original.decidedAt)}` : ''} · 处理人 ${escapeHtml(original.decidedBy || '系统')}</div>
+      ${original.reason ? `<div class="small muted">原驳回理由：${escapeHtml(original.reason)}</div>` : ''}` : '';
+    const evidence = (field.evidence || []).map((ev) => `
+      <li class="batch-opinion evidence-opinion">
+        <div class="record-main"><b>${escapeHtml(ev.alias)}</b><span class="muted small">原复核证据 · ${formatTime(ev.originalSubmittedAt)}</span></div>
+        <div class="small">${escapeHtml(ev.reason)}</div>
+      </li>`).join('');
+    const corr = field.correctionReceiptNo
+      ? `<div class="small review-obj-result">→ 更正回执 <span class="mono">${escapeHtml(field.correctionReceiptNo)}</span></div>`
+      : field.decision === 'rejected'
+        ? `<div class="small review-obj-result">申诉驳回理由：${escapeHtml(field.decisionReason || '—')}</div>`
+        : '';
+    const actions = (!field.decision && round.status === 'in_review')
+      ? `<span class="record-actions">
+           <button class="link-button" type="button" data-appeal-accept="${escapeHtml(round.id)}|${escapeHtml(field.id)}">接受申诉（阈值 ${field.acceptThreshold}）</button>
+           <button class="link-button muted-link" type="button" data-appeal-reject="${escapeHtml(round.id)}|${escapeHtml(field.id)}">驳回申诉（阈值 ${field.rejectThreshold}）</button>
+         </span>`
+      : '';
+    return `<li class="batch-field appeal-field ${field.decision || 'pending'}">
+      <div class="record-main">
+        <b>${escapeHtml(field.label)}</b>
+        <span class="muted small">申诉理由：${escapeHtml(field.reasonLabel)} · 接受≥${field.acceptThreshold} / 驳回≥${field.rejectThreshold} · ${field.opinionCount} 份申诉意见</span>
+        ${badge}
+      </div>
+      ${originalLine}
+      <div class="muted small">允许披露原证据 ${field.evidence.length} 条（原复核人匿名）</div>
+      <ul class="batch-opinion-list">${evidence || '<li class="muted small">未授权披露原复核证据</li>'}</ul>
+      <div class="muted small">新复核人申诉意见：</div>
+      <ul class="batch-opinion-list">${opinions || '<li class="muted small">暂无申诉意见</li>'}</ul>
+      ${corr}${actions}
+    </li>`;
+  }).join('');
+  const canCreate = ['completed', 'in_review'].includes(batch.status);
+  const remaining = ['collecting', 'in_review'].includes(round.status) ? formatRemaining(round.expiresAt) : null;
+  return `<div class="objection-item batch-card appeal-card ${round.status}">
+    <div class="record-main">
+      <span>申诉回合 <span class="mono small">${escapeHtml(round.id.slice(0, 12))}…</span> · 来自批次 <span class="mono small">${escapeHtml(batch.id.slice(0, 8))}…</span></span>
+      <span class="badge ${statusCls}">${APPEAL_STATUS_TEXT[round.status] || round.status} · ${round.validatedCount}/${round.invitationCount} · 决议 ${round.decidedCount}/${round.fieldCount}</span>
+    </div>
+    <div class="muted small">
+      申诉理由：${escapeHtml(round.reasonSummary || '—')}
+      · 创建于 ${formatTime(round.createdAt)} · 截止 ${formatTime(round.expiresAt)}
+      ${remaining ? ` · 剩余 <b data-countdown="${round.expiresAt}">${remaining}</b>` : ''}
+      ${round.completedAt ? ` · 完成于 ${formatTime(round.completedAt)}` : ''}
+      ${round.cancelledAt ? ` · 取消于 ${formatTime(round.cancelledAt)}（${escapeHtml(round.cancelReason || '—')}）` : ''}
+      ${round.expiredAt ? ` · 过期于 ${formatTime(round.expiredAt)}` : ''}
+      ${round.note ? ` · 备注：${escapeHtml(round.note)}` : ''}
+    </div>
+    <ul class="batch-invite-list">${invites}</ul>
+    <ul class="batch-field-list">${fields}</ul>
+    <div class="record-actions">
+      ${['collecting', 'in_review'].includes(round.status) && round.decidedCount === 0
+        ? `<button class="link-button danger-link" type="button" data-appeal-cancel="${escapeHtml(round.id)}">取消申诉回合（尚无字段决议时可取消）</button>`
+        : ''}
+      ${canCreate ? '' : ''}
+    </div>
+  </div>`;
 }
 
 function renderBatchCard(batch) {
@@ -1508,6 +1717,9 @@ function renderBatchCard(batch) {
         <button class="link-button" type="button" data-start>${batch.staged ? '启动第一阶段（冻结策略、开始倒计时）' : '进入复核（需全部校验）'}</button>
         ${batch.staged ? `<button class="link-button" type="button" data-reconfigure>调整编排（基于 v${batch.configVersion}）</button>` : ''}
         <button class="link-button danger-link" type="button" data-cancel>取消批次</button>` : ''}
+      ${batch.status === 'completed' || batch.status === 'in_review'
+        ? '<button class="link-button" type="button" data-appeal-launch>对驳回字段发起申诉回合</button>'
+        : ''}
     </div>
   `;
   card.querySelectorAll('[data-copy]').forEach((btn) => {
@@ -1525,6 +1737,7 @@ function renderBatchCard(batch) {
   card.querySelector('[data-start]')?.addEventListener('click', () => startBatch(batch.id));
   card.querySelector('[data-cancel]')?.addEventListener('click', () => cancelBatch(batch.id));
   card.querySelector('[data-reconfigure]')?.addEventListener('click', () => reconfigureBatch(batch.id, batch.configVersion));
+  card.querySelector('[data-appeal-launch]')?.addEventListener('click', () => openAppealBuilder(batch.id));
   return card;
 }
 
@@ -1972,4 +2185,238 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[char]));
+}
+
+// ---------------------------------------------------------------------------
+// 复核申诉回合（办理人侧）
+// ---------------------------------------------------------------------------
+
+async function openAppealBuilder(batchId) {
+  if (state.busy) return;
+  const panel = els.batchPanel;
+  if (!panel) return;
+  let data;
+  try {
+    data = await api('GET', `/api/review-batches/${encodeURIComponent(batchId)}/appealable-fields`);
+  } catch (error) {
+    showAlert(`读取可申诉字段失败：${error.message}`, 'error');
+    return;
+  }
+  const fields = data.fields || [];
+  const reasons = data.reasons || [];
+  if (!fields.length) {
+    showAlert('该批次没有可申诉的字段：只能针对已经作出驳回决议的字段发起申诉。', 'warning');
+    return;
+  }
+  const existing = document.getElementById('appealBuilder');
+  if (existing) existing.remove();
+
+  const builder = document.createElement('div');
+  builder.id = 'appealBuilder';
+  builder.className = 'batch-builder card-inner';
+  const reasonOptions = reasons.map((r) => `<option value="${escapeHtml(r.code)}">${escapeHtml(r.label)}</option>`).join('');
+  const fieldRows = fields.map((field) => {
+    const evidence = (field.opinions || []).map((op, index) => `
+      <label class="appeal-evidence-row">
+        <input type="checkbox" data-evidence="${escapeHtml(field.sourceFieldId)}" value="${escapeHtml(op.id)}">
+        <span>原复核人${index + 1}（${escapeHtml(op.label)}，仅对办理人显示）：${escapeHtml((op.reason || '').slice(0, 60))}…</span>
+      </label>`).join('');
+    return `<div class="appeal-field-row" data-source-field="${escapeHtml(field.sourceFieldId)}" data-key="${escapeHtml(field.key)}">
+      <label class="bb-field-name">
+        <input type="checkbox" data-appeal-field="${escapeHtml(field.key)}">
+        <b>${escapeHtml(field.label)}</b>
+        <span class="muted small">（${escapeHtml(field.key)}，原批次已驳回${field.decidedByPolicy ? '·超时策略自动驳回' : ''}）</span>
+      </label>
+      <div class="appeal-field-config">
+        <label>申诉理由
+          <select data-reason="${escapeHtml(field.key)}">${reasonOptions}</select>
+        </label>
+        <span class="bb-thresholds">
+          接受≥<input type="number" min="1" max="5" value="1" data-accept="${escapeHtml(field.key)}" disabled>
+          驳回≥<input type="number" min="1" max="5" value="1" data-reject="${escapeHtml(field.key)}" disabled>
+        </span>
+      </div>
+      <div class="muted small">原驳回理由：${escapeHtml(field.reason || '—')}</div>
+      <details class="appeal-evidence-box">
+        <summary>允许新复核人查看的原复核证据（${(field.opinions || []).length} 条可选；原复核人将匿名化）</summary>
+        ${evidence || '<p class="muted small">该字段原批次没有可披露的证据意见。</p>'}
+      </details>
+    </div>`;
+  }).join('');
+  builder.innerHTML = `
+    <h3>发起复核申诉回合</h3>
+    <p class="muted small">
+      申诉回合有独立限时、2-5 个一次性新邀请与独立阈值；只能引用原批次冻结快照，
+      不能修改原批次的意见、决议或超时结果。只有原批次的驳回字段可被申诉，每个字段至多一次进行中的申诉。
+    </p>
+    <label>回合限时（分钟，5-10080）
+      <input type="number" id="abTtl" value="60" min="5" max="10080">
+    </label>
+    <label>备注（可选）
+      <input type="text" id="abNote" maxlength="200" placeholder="例如：补充关键证据后的二次复核">
+    </label>
+    <div class="bb-section">
+      <strong>① 选择申诉字段、申诉理由、证据授权与阈值</strong>
+      <div class="bb-fields">${fieldRows}</div>
+    </div>
+    <div class="bb-section">
+      <strong>② 配置 2-5 位新复核人邀请</strong>
+      <div class="form-actions">
+        <button class="button secondary" type="button" data-add-invite>增加一个邀请</button>
+        <span class="muted small">每个新邀请独立的一次性链接与申诉字段授权。</span>
+      </div>
+      <div class="bb-invites"></div>
+    </div>
+    <div id="abError" class="alert error hidden"></div>
+    <div class="form-actions">
+      <button class="button primary" type="button" data-create>创建申诉回合并生成一次性链接</button>
+      <button class="button secondary" type="button" data-close>取消</button>
+    </div>`;
+  panel.insertBefore(builder, panel.querySelector('.appeal-list'));
+
+  const fieldsBox = builder.querySelector('.bb-fields');
+  const syncSelected = () => {
+    const selected = [...fieldsBox.querySelectorAll('input[data-appeal-field]:checked')].map((i) => i.dataset.appealField);
+    fieldsBox.querySelectorAll('input[type=checkbox][data-appeal-field]').forEach((box) => {
+      const key = box.dataset.appealField;
+      fieldsBox.querySelector(`[data-accept="${CSS.escape(key)}"]`).disabled = !box.checked;
+      fieldsBox.querySelector(`[data-reject="${CSS.escape(key)}"]`).disabled = !box.checked;
+    });
+    builder.querySelectorAll('[data-invite-fields]').forEach((holder) => {
+      holder.innerHTML = selected.map((key) => `
+        <label class="appeal-scope-row">
+          <input type="checkbox" value="${escapeHtml(key)}" checked> ${escapeHtml(key)}
+        </label>`).join('');
+    });
+    return selected;
+  };
+  fieldsBox.addEventListener('change', syncSelected);
+
+  const invitesBox = builder.querySelector('.bb-invites');
+  const addInvite = () => {
+    const count = invitesBox.children.length;
+    if (count >= 5) { showAlert('最多 5 个邀请。', 'warning'); return; }
+    const div = document.createElement('div');
+    div.className = 'bb-invite card-inner';
+    div.innerHTML = `
+      <label>新复核人名称<input data-invite-label maxlength="60" value="申诉复核人${count + 1}"></label>
+      <div class="muted small">授权字段：</div>
+      <div class="appeal-scope" data-invite-fields></div>`;
+    invitesBox.append(div);
+    syncSelected();
+  };
+  builder.querySelector('[data-add-invite]').addEventListener('click', addInvite);
+  addInvite();
+  addInvite();
+
+  builder.querySelector('[data-close]').addEventListener('click', () => builder.remove());
+  builder.querySelector('[data-create]').addEventListener('click', async () => {
+    const err = builder.querySelector('#abError');
+    err.classList.add('hidden');
+    const ttlMinutes = Number(builder.querySelector('#abTtl').value);
+    const appealFields = [...fieldsBox.querySelectorAll('.appeal-field-row')].flatMap((row) => {
+      const key = row.dataset.key;
+      if (!row.querySelector(`[data-appeal-field="${CSS.escape(key)}"]`).checked) return [];
+      const sourceField = fields.find((f) => f.key === key);
+      const evidenceOpinionIds = [...row.querySelectorAll('input[data-evidence]:checked')].map((i) => i.value);
+      return [{
+        key,
+        reason: row.querySelector(`[data-reason="${CSS.escape(key)}"]`).value,
+        acceptThreshold: Number(row.querySelector(`[data-accept="${CSS.escape(key)}"]`).value),
+        rejectThreshold: Number(row.querySelector(`[data-reject="${CSS.escape(key)}"]`).value),
+        evidenceOpinionIds,
+      }].map((item) => ({ ...item, _source: sourceField }));
+    });
+    if (!appealFields.length) {
+      err.textContent = '请至少选择一个驳回字段发起申诉。';
+      err.classList.remove('hidden');
+      return;
+    }
+    const invitations = [...invitesBox.children].map((row) => ({
+      label: String(row.querySelector('[data-invite-label]').value || '').trim(),
+      fields: [...row.querySelectorAll('[data-invite-fields] input:checked')].map((i) => i.value),
+    }));
+    if (invitations.length < 2 || invitations.length > 5) {
+      err.textContent = '申诉回合必须配置 2-5 个新复核人邀请。';
+      err.classList.remove('hidden');
+      return;
+    }
+    try {
+      const result = await api('POST', '/api/review-appeals', {
+        batchId,
+        ttlMinutes,
+        note: String(builder.querySelector('#abNote').value || ''),
+        fields: appealFields.map(({ _source, ...rest }) => rest),
+        invitations,
+      });
+      state.reviewAppeals = result.reviewAppeals || state.reviewAppeals;
+      state.timeline = result.timeline || state.timeline;
+      const links = (result.links || []).map((l) => `${l.label}：${location.origin}${l.url}`).join('\n');
+      window.prompt('申诉回合已创建。完整一次性链接仅展示这一次，请立即复制分发：', links);
+      builder.remove();
+      render();
+    } catch (error) {
+      err.textContent = error.message || '创建申诉回合失败';
+      err.classList.remove('hidden');
+    }
+  });
+
+  syncSelected();
+}
+
+async function cancelAppealRound(roundId) {
+  const reason = window.prompt('取消后所有未使用邀请立即失效，写操作全部关闭；已有字段完成申诉决议后不能取消。请输入取消原因（可留空）：', '');
+  if (reason === null || state.busy) return;
+  try {
+    const result = await api('POST', `/api/review-appeals/${encodeURIComponent(roundId)}/cancel`, { reason });
+    state.reviewAppeals = result.reviewAppeals || state.reviewAppeals;
+    showAlert('申诉回合已取消，历史记录保留。', 'warning');
+    render();
+  } catch (error) {
+    showAlert(`取消申诉回合失败：${error.message}`, 'error');
+  }
+}
+
+async function acceptAppealField(roundId, fieldId) {
+  const ok = window.confirm(
+    '接受该申诉字段后，申诉意见将在同一个新的更正办理中与原批次来源关联：\n\n'
+    + '· 提出申诉意见的新复核人数必须达到本回合接受阈值；\n'
+    + '· 原批次与原回执保持冻结，不会被修改；\n'
+    + '· 更正完成后生成新回执并回填来源关系。',
+  );
+  if (!ok || state.busy) return;
+  try {
+    const result = await api('POST', `/api/review-appeals/${encodeURIComponent(roundId)}/fields/${encodeURIComponent(fieldId)}/accept`, {});
+    state.reviewAppeals = result.reviewAppeals || state.reviewAppeals;
+    state.timeline = result.timeline || state.timeline;
+    showAlert(result.createdCorrection
+      ? '申诉成立：已创建新的更正办理并关联申诉意见与原批次来源。'
+      : '申诉成立：已关联到进行中的同源更正办理。', 'success');
+    await boot();
+  } catch (error) {
+    if (error.body?.alreadyDecided) showAlert('该申诉字段已被另一个页面决议，已刷新为同一结果。', 'warning');
+    else showAlert(`接受申诉失败：${error.message}`, 'error');
+    await boot();
+  }
+}
+
+async function rejectAppealField(roundId, fieldId) {
+  const reason = window.prompt('请填写申诉驳回理由（2-200 字）。驳回需要未提出申诉意见的新复核人数达到本回合驳回阈值。', '');
+  if (reason === null || state.busy) return;
+  const trimmed = String(reason).trim();
+  if (trimmed.length < 2 || trimmed.length > 200) {
+    showAlert('驳回理由需为 2-200 个字符。', 'error');
+    return;
+  }
+  try {
+    const result = await api('POST', `/api/review-appeals/${encodeURIComponent(roundId)}/fields/${encodeURIComponent(fieldId)}/reject`, { reason: trimmed });
+    state.reviewAppeals = result.reviewAppeals || state.reviewAppeals;
+    state.timeline = result.timeline || state.timeline;
+    showAlert(result.roundCompleted ? '申诉已驳回，回合全部字段决议完成。' : '申诉已驳回，理由已保存。', 'warning');
+    await boot();
+  } catch (error) {
+    if (error.body?.alreadyDecided) showAlert('该申诉字段已被另一个页面决议，已刷新为同一结果。', 'warning');
+    else showAlert(`驳回申诉失败：${error.message}`, 'error');
+    await boot();
+  }
 }

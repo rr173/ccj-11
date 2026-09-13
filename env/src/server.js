@@ -54,6 +54,18 @@ import {
   reconfigureBatch,
   getBatchOrchestrationHistory,
   sweepBatchTimeouts,
+  createAppealRound,
+  listAppealRoundsForOwner,
+  getAppealRoundForOwner,
+  listAppealableFields,
+  cancelAppealRound,
+  consumeAppealInvitation,
+  getValidAppealSession,
+  deleteAppealSession,
+  getAppealReviewerContext,
+  submitAppealOpinion,
+  decideAppealField,
+  sweepAppealTimeouts,
 } from './db.js';
 import { validateDraft, validateStepPayload } from './validation.js';
 import { stableStringify } from './crypto.js';
@@ -71,6 +83,7 @@ import {
 } from './receipts.js';
 import { INVITATION_ERRORS, isValidTtlMinutes } from './reviews.js';
 import { parseBatchInput, BATCH_ERRORS, BATCH_SESSION_COOKIE, BATCH_CSRF_COOKIE, ALL_BATCH_FIELDS, BATCH_MAX_INVITATIONS } from './batchReviews.js';
+import { parseAppealCreateInput, APPEAL_ERRORS, APPEAL_SESSION_COOKIE, APPEAL_CSRF_COOKIE, APPEAL_REASONS } from './appealReviews.js';
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -90,6 +103,22 @@ const server = createServer(async (req, res) => {
     // 多方复核批次：免登录复核人页面与接口
     if (url.pathname === '/batch-review' && req.method === 'GET') {
       return serveStaticFile(req, res, '/batch-review.html');
+    }
+    // 复核申诉回合：免登录新复核人页面与接口（只展示本回合授权内容）
+    if (url.pathname === '/appeal-review' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/appeal-review.html');
+    }
+    if (url.pathname === '/api/appeal-review/validate' && req.method === 'POST') {
+      return appealReviewValidate(req, res);
+    }
+    if (url.pathname === '/api/appeal-review/logout' && req.method === 'POST') {
+      return appealReviewLogout(req, res);
+    }
+    if (url.pathname === '/api/appeal-review/context' && req.method === 'GET') {
+      return appealReviewContext(req, res);
+    }
+    if (url.pathname === '/api/appeal-review/opinions' && req.method === 'POST') {
+      return appealReviewSubmit(req, res);
     }
     if (url.pathname === '/api/batch-review/validate' && req.method === 'POST') {
       return batchReviewValidate(req, res);
@@ -285,6 +314,36 @@ async function handleApi(req, res, url) {
     const history = getBatchOrchestrationHistory({ userId: user.id, batchId: decodeURIComponent(batchHistoryMatch[1]) });
     if (!history) return sendJson(res, 404, { error: { code: 'BATCH_NOT_FOUND', message: '复核批次不存在' } });
     return sendJson(res, 200, history);
+  }
+
+  // 复核申诉回合（办理人）
+  if (url.pathname === '/api/review-appeals' && req.method === 'POST') {
+    return createAppeal(req, res, user);
+  }
+  if (url.pathname === '/api/review-appeals' && req.method === 'GET') {
+    const batchId = url.searchParams.get('batchId') || '';
+    const receiptNo = url.searchParams.get('receiptNo') || '';
+    return sendJson(res, 200, { appeals: listAppealRoundsForOwner(user.id, { batchId, receiptNo }) });
+  }
+  const appealableMatch = /^\/api\/review-batches\/([^/]+)\/appealable-fields$/.exec(url.pathname);
+  if (appealableMatch && req.method === 'GET') {
+    const fields = listAppealableFields({ userId: user.id, batchId: decodeURIComponent(appealableMatch[1]) });
+    if (!fields) return sendJson(res, 404, { error: { code: 'BATCH_NOT_FOUND', message: '复核批次不存在' } });
+    return sendJson(res, 200, { fields, reasons: APPEAL_REASONS });
+  }
+  const appealGetMatch = /^\/api\/review-appeals\/([^/]+)$/.exec(url.pathname);
+  if (appealGetMatch && req.method === 'GET') {
+    const round = getAppealRoundForOwner({ userId: user.id, roundId: decodeURIComponent(appealGetMatch[1]) });
+    if (!round) return sendJson(res, 404, { error: { code: 'APPEAL_NOT_FOUND', message: '申诉回合不存在' } });
+    return sendJson(res, 200, { round });
+  }
+  const appealCancelMatch = /^\/api\/review-appeals\/([^/]+)\/cancel$/.exec(url.pathname);
+  if (appealCancelMatch && req.method === 'POST') {
+    return cancelAppeal(req, res, user, appealCancelMatch[1]);
+  }
+  const appealFieldDecideMatch = /^\/api\/review-appeals\/([^/]+)\/fields\/([^/]+)\/(accept|reject)$/.exec(url.pathname);
+  if (appealFieldDecideMatch && req.method === 'POST') {
+    return decideAppealFieldRoute(req, res, user, appealFieldDecideMatch[1], appealFieldDecideMatch[2], appealFieldDecideMatch[3]);
   }
 
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
@@ -815,6 +874,113 @@ async function reconfigureBatchRoute(req, res, user, rawBatchId) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// 复核申诉回合：办理人侧
+// ---------------------------------------------------------------------------
+
+async function createAppeal(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const batchId = String(body.batchId || '');
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(batchId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_BATCH_ID' } });
+  }
+  const maxMinutes = Math.floor(config.reviewInviteMaxTtlMs / 60000);
+  const minMinutes = Math.max(1, Math.ceil(config.reviewInviteMinTtlMs / 60000));
+  const parsed = parseAppealCreateInput(body, { minMinutes, maxMinutes });
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = createAppealRound({
+    userId: user.id,
+    batchId,
+    config: parsed.value,
+    ttlMs: parsed.value.ttlMinutes * 60000,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '创建申诉回合失败' },
+      round: result.round || null,
+    });
+  }
+  const round = getAppealRoundForOwner({ userId: user.id, roundId: result.roundId });
+  const links = result.invitations.map((invite) => ({
+    invitationId: invite.id,
+    label: invite.label,
+    token: invite.token,
+    url: `/appeal-review?t=${encodeURIComponent(invite.token)}`,
+  }));
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    round,
+    links,
+    timeline: state.timeline,
+    reviewAppeals: state.reviewAppeals,
+    reviewBatches: state.reviewBatches,
+  });
+}
+
+async function cancelAppeal(req, res, user, rawRoundId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const roundId = decodeURIComponent(rawRoundId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(roundId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_APPEAL_ID' } });
+  }
+  const result = cancelAppealRound({ userId: user.id, roundId, reason: String(body.reason || '') });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '取消申诉回合失败' },
+      round: result.round || null,
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    round: result.round,
+    timeline: state.timeline,
+    reviewAppeals: state.reviewAppeals,
+  });
+}
+
+async function decideAppealFieldRoute(req, res, user, rawRoundId, rawFieldId, action) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const roundId = decodeURIComponent(rawRoundId);
+  const appealFieldId = decodeURIComponent(rawFieldId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(roundId) || !/^[A-Za-z0-9_-]{20,200}$/.test(appealFieldId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_ID' } });
+  }
+  const result = decideAppealField({
+    userId: user.id,
+    roundId,
+    appealFieldId,
+    action,
+    reason: String(body.reason || ''),
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '申诉决议失败' },
+      field: result.field || null,
+      round: result.round || null,
+      workflow: result.workflow || null,
+      alreadyDecided: result.code === 'APPEAL_FIELD_ALREADY_DECIDED',
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    field: result.field,
+    workflow: result.workflow || null,
+    createdCorrection: Boolean(result.created),
+    roundCompleted: Boolean(result.roundCompleted),
+    round: result.round,
+    records: state.records,
+    timeline: state.timeline,
+    reviewAppeals: state.reviewAppeals,
+    correction: state.correction,
+  });
+}
+
 function batchCookies(req) {
   return parseCookies(req.headers.cookie);
 }
@@ -910,10 +1076,12 @@ const BATCH_TIMEOUT_SWEEP_MS = Number(process.env.BATCH_TIMEOUT_SWEEP_MS || 5000
 let batchSweepTimer = null;
 function startBatchTimeoutSweep() {
   if (batchSweepTimer || process.env.NO_BATCH_SWEEP === '1') return;
-  // 启动时先恢复一次：服务在阶段限时内重启后，到点的阶段仍会被落定
+  // 启动时先恢复一次：服务在限时内重启后，到点的批次阶段/申诉回合仍会被落定
   try { sweepBatchTimeouts(); } catch { /* 记录但不阻塞启动 */ }
+  try { sweepAppealTimeouts(); } catch { /* 同上 */ }
   batchSweepTimer = setInterval(() => {
     try { sweepBatchTimeouts(); } catch (error) { console.error('batch timeout sweep failed', error); }
+    try { sweepAppealTimeouts(); } catch (error) { console.error('appeal timeout sweep failed', error); }
   }, BATCH_TIMEOUT_SWEEP_MS);
   batchSweepTimer.unref?.();
 }
@@ -954,7 +1122,132 @@ async function batchReviewSubmit(req, res) {
   return sendJson(res, 200, { ok: true, replay: Boolean(result.replay), opinion: result.opinion });
 }
 
+// ---------------------------------------------------------------------------
+// 复核申诉回合：免登录新复核人侧（独立 Cookie aid / CSRF accsrf，只展示本回合授权内容）
+// ---------------------------------------------------------------------------
 
+function appealCookies(req) {
+  return parseCookies(req.headers.cookie);
+}
+
+function appealSessionFromReq(req) {
+  const cookies = appealCookies(req);
+  if (!cookies[APPEAL_SESSION_COOKIE]) return null;
+  return getValidAppealSession(cookies[APPEAL_SESSION_COOKIE]);
+}
+
+function setAppealSessionCookies(res, { sessionToken, csrf, expiresAt }) {
+  const secure = config.cookieSecure ? '; Secure' : '';
+  const maxAge = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+  res.setHeader('Set-Cookie', [
+    `${APPEAL_SESSION_COOKIE}=${sessionToken}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`,
+    `${APPEAL_CSRF_COOKIE}=${csrf}; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`,
+  ]);
+}
+
+function clearAppealSessionCookies(res) {
+  res.setHeader('Set-Cookie', [
+    `${APPEAL_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`,
+    `${APPEAL_CSRF_COOKIE}=; SameSite=Lax; Path=/; Max-Age=0`,
+  ]);
+}
+
+function checkAppealCsrf(req, review) {
+  const header = req.headers['x-csrf-token'];
+  const cookies = appealCookies(req);
+  const secret = review.session.csrf_secret;
+  return Boolean(header && cookies[APPEAL_CSRF_COOKIE] && header === secret && timingSafeEqualBuffer(header, secret));
+}
+
+async function appealReviewValidate(req, res) {
+  const clientIp = req.socket.remoteAddress || 'unknown';
+  const limitKey = `appeal-review-validate:${clientIp}`;
+  const rate = { windowMs: config.verifyRateWindowMs, max: config.verifyRateMax };
+  const preview = peekRateLimit(limitKey, rate);
+  if (!preview.allowed) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(preview.retryAfterMs / 1000))));
+    return sendJson(res, 429, { error: { code: 'TOO_MANY_REQUESTS', message: '校验尝试过于频繁，请稍后再试' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const token = String(body.token || '').trim();
+  if (!/^[A-Za-z0-9_-]{20,512}$/.test(token)) {
+    recordFailure(limitKey, rate);
+    return sendJson(res, 400, { error: { code: 'INVALID_INVITATION', message: APPEAL_ERRORS.APPEAL_INVITATION_NOT_FOUND } });
+  }
+  const result = consumeAppealInvitation({ rawToken: token, clientIp });
+  if (!result.ok) {
+    recordFailure(limitKey, rate);
+    return sendJson(res, result.status, {
+      error: { code: result.code, message: result.message || APPEAL_ERRORS[result.code] || '邀请校验失败' },
+    });
+  }
+  setAppealSessionCookies(res, { sessionToken: result.sessionToken, csrf: result.csrf, expiresAt: result.expiresAt });
+  return sendJson(res, 200, {
+    ok: true,
+    roundId: result.roundId,
+    receiptNo: result.receiptNo,
+    label: result.label,
+    csrfToken: result.csrf,
+    expiresAt: result.expiresAt,
+    autoStarted: result.autoStarted,
+  });
+}
+
+async function appealReviewLogout(req, res) {
+  const cookies = appealCookies(req);
+  if (cookies[APPEAL_SESSION_COOKIE]) deleteAppealSession(cookies[APPEAL_SESSION_COOKIE]);
+  clearAppealSessionCookies(res);
+  return sendJson(res, 200, { ok: true });
+}
+
+function requireAppealSession(req, res, { write = false } = {}) {
+  const review = appealSessionFromReq(req);
+  if (!review) {
+    sendJson(res, 401, { error: { code: 'APPEAL_SESSION_REQUIRED', message: APPEAL_ERRORS.APPEAL_SESSION_REQUIRED } });
+    return null;
+  }
+  if (write && !checkAppealCsrf(req, review)) {
+    sendJson(res, 403, { error: { code: 'APPEAL_CSRF_INVALID', message: APPEAL_ERRORS.APPEAL_CSRF_INVALID } });
+    return null;
+  }
+  return review;
+}
+
+async function appealReviewContext(req, res) {
+  const review = requireAppealSession(req, res);
+  if (!review) return;
+  const context = getAppealReviewerContext(review);
+  if (!context) {
+    clearAppealSessionCookies(res);
+    return sendJson(res, 404, { error: { code: 'APPEAL_NOT_FOUND', message: APPEAL_ERRORS.APPEAL_NOT_FOUND } });
+  }
+  return sendJson(res, 200, { ok: true, csrfToken: review.session.csrf_secret, context });
+}
+
+async function appealReviewSubmit(req, res) {
+  const review = requireAppealSession(req, res, { write: true });
+  if (!review) return;
+  const body = await readJson(req, res);
+  if (!body) return;
+  const key = String(body.key || '');
+  const reason = String(body.reason || '');
+  const idempotencyKey = String(body.idempotencyKey || '');
+  if (!/^[A-Za-z0-9_-]{8,100}$/.test(idempotencyKey)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_IDEMPOTENCY_KEY', message: '提交编号格式不正确' } });
+  }
+  if (body.receiptNo !== undefined && formatReceiptNoInput(String(body.receiptNo)) !== review.session.receipt_no) {
+    return sendJson(res, 403, { error: { code: 'APPEAL_RECEIPT_MISMATCH', message: APPEAL_ERRORS.APPEAL_RECEIPT_MISMATCH } });
+  }
+  const requestHash = requestFingerprint({ key, reason });
+  const result = submitAppealOpinion({ review, key, reason, idempotencyKey, requestHash });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || APPEAL_ERRORS[result.code] || '提交失败' },
+    });
+  }
+  return sendJson(res, 200, { ok: true, replay: Boolean(result.replay), opinion: result.opinion });
+}
 
 function reviewCookies(req) {
   return parseCookies(req.headers.cookie);

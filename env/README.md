@@ -43,6 +43,7 @@ docker compose up -d --build
 - **复核邀请、免登录复核会话、字段异议与处理结果、异议→更正→新回执来源关系**
 - **多方复核批次：批次状态、2-5 个限时一次性邀请、逐邀请字段授权、逐字段阈值、合并字段意见、逐字段决议与“接受意见→同一份更正→新回执”来源关系**
 - **分阶段复核编排：阶段顺序与状态、每阶段邀请/字段范围与阈值、开始时冻结的超时策略与倒计时、超时落定结果、编排配置版本与完整变更历史**
+- **复核申诉回合：只能针对原批次已驳回字段发起；独立限时与一次性新邀请、逐邀请字段授权、独立接受/驳回阈值；只引用原批次冻结快照（脱敏字段+原驳回决议+显式授权并匿名化的证据摘要）；申诉意见合并/幂等、逐字段决议、“接受申诉→同一份更正→关联申诉意见与原批次来源→新回执”、取消/过期写拒绝与完整审计时间线**
 - **回执核验码密钥 `receipt-secret.key`（核验能力依赖它，务必随数据卷备份）**
 
 默认监听 3000。若由反向代理终止 HTTPS，请设置：
@@ -220,6 +221,24 @@ COOKIE_SECURE: "1"
 - 时间线的批次条目包含：阶段事件、配置版本、每阶段最终决议（`finalDecision`）、倒计时截止与超时结果、逐字段意见/阈值进度、更正回执来源，以及完整配置变更历史（`changeHistory` 与逐版本 `config_json`）。
 - 分阶段批次创建后处于 `collecting`，需办理人显式“启动第一阶段”才开始倒计时与冻结策略；启动前可凭版本号反复调整编排。
 
+## 复核申诉回合（traceable appeal rounds）
+
+在多方复核批次（含分阶段批次）之上，办理人可针对**原批次已经作出驳回决议的字段**发起一次**独立的申诉回合**。申诉回合只能**引用原批次的冻结快照**：原批次的意见、决议与超时结果永远不被修改；新复核人只能看到本邀请被授权的脱敏字段、原字段的既有驳回决议与办理人显式允许披露的证据摘要（原复核人以“原复核人N”匿名化，邀请名称等未授权隐私不下发）。
+
+- **只能针对驳回字段**：`GET /api/review-batches/{id}/appealable-fields` 只返回原批次中 `decision='rejected'`（含超时策略自动驳回）的字段；对未驳回字段发起返回 `409 APPEAL_FIELD_NOT_REJECTED`。同一字段在一个未终结回合中只能申诉一次（部分唯一索引兜底并发）。
+- **独立配置**：`POST /api/review-appeals { batchId, ttlMinutes, note, fields:[{key, reason, acceptThreshold, rejectThreshold, evidenceOpinionIds}], invitations:[{label, fields}] }`
+  - 申诉理由 `reason` 四选一：`new_evidence`（出现新的关键证据）/ `misjudged`（认定事实有误）/ `procedural`（程序或授权瑕疵）/ `other`；
+  - **2-5 个全新的一次性邀请**，逐邀请字段授权（必须是本回合字段的子集，每个字段至少一个邀请授权）；独立的接受/驳回阈值（1..邀请数）与**独立限时**（创建即起算，默认 5 分钟～7 天）；
+  - `evidenceOpinionIds` 为办理人显式允许向新复核人披露的**原批次证据意见**白名单（可空=不披露任何原证据；引用了不存在/不属于该字段的意见得 `400 INVALID_APPEAL_EVIDENCE`）；
+  - 回合从创建即开放复核（独立限时起算），新复核人在限时内陆续校验、提交；同一回执/批次至多一个未终结回合，两个页面并发发起只有一个成功，另一个得 `409 APPEAL_ALREADY_OPEN`（唯一索引 + `BEGIN IMMEDIATE` 双保险）。
+- **独立限时一次性邀请**：新链接形如 `/appeal-review?t=…`，独立 Cookie（`aid`/`accsrf`），令牌 256 位随机、库存哈希；校验一次性，重复使用 `410 APPEAL_INVITATION_ALREADY_USED`，过期 `410 APPEAL_INVITATION_EXPIRED`，回合取消/回执撤销分别返回 `410 APPEAL_INVITATION_REVOKED / RECEIPT_REVOKED`，校验接口按 IP 限流。
+- **复核页面只展示本回合授权内容**：`GET /api/appeal-review/context` 返回授权脱敏字段（敏感值服务端遮罩）、原字段既有驳回决议（理由、时间、是否超时策略自动驳回；**不含原处理人身份**）、授权证据摘要（匿名“原复核人N”+脱敏值快照+逐字说明）与本字段申诉意见合并视图。越权读取拿不到其他字段；越权提交得 `403 APPEAL_FIELD_NOT_AUTHORIZED`；无会话/CSRF 缺失分别 `401/403`；携带他份回执编号得 `403 APPEAL_RECEIPT_MISMATCH`。
+- **申诉意见按复核人合并、幂等重试**：每邀请每字段至多一份意见（重复 `409 APPEAL_FIELD_DUPLICATE_OPINION`，UNIQUE 兜底）；同一幂等键+同指纹的网络重试返回同一条意见（`replay:true`），换指纹得 `409 OBJECTION_DUPLICATE_KEY`。
+- **独立阈值的逐字段决议**（办理人）：接受要求提出申诉意见的不同新复核人数 ≥ `acceptThreshold`（不足 `ACCEPT_THRESHOLD_NOT_MET`）；驳回要求“已校验且未提意见”的新复核人数 ≥ `rejectThreshold`（不足 `REJECT_THRESHOLD_NOT_MET`），且驳回理由 2-200 字持久化。终局更新以 `WHERE … AND decision IS NULL` 为唯一判定，重复/并发决议只有一个成功，另一个得到 `409 APPEAL_FIELD_ALREADY_DECIDED` 与同一条已存在结果。
+- **接受必须在同一个新的更正办理中关联申诉意见与原批次来源**：接受复用进行中的同源更正或当场新建 `source_receipt_no` 指向原回执的更正；全部申诉意见写入 `correction_objections`（`appeal_opinion_id` + 显式 `source_batch_id/source_round_id`）；再接受其他字段复用同一份更正；存在进行中的**其他**办理时 `409 OPEN_WORKFLOW_EXISTS`。更正完成后新回执编号回填申诉字段与意见；放弃更正则接受决议回收为待决议（原批次驳回决议始终不变）。
+- **取消与过期**：办理人可在**尚无任何字段决议**时取消（`POST /api/review-appeals/{id}/cancel`），未使用邀请立即失效、写操作全部关闭；已有字段完成决议后历史不能删除，取消得 `409 APPEAL_HAS_DECISIONS`。独立限时到达时回合整体 `expired`（后台扫描、启动恢复与接口惰性检查三路触发，条件更新保证只落定一次），之后复核人提交与办理人决议都得到 410（`APPEAL_DEADLINE_PASSED` / `APPEAL_INVITATION_EXPIRED`）；已校验会话保留只读，已提交意见原样留档；取消/过期后可对同一驳回字段重新发起回合。
+- **办理人页面**展示原批次↔申诉回合关系、邀请状态、独立倒计时、证据摘要、阈值进度、处理人与逐字段决议；**回执时间线**在原批次条目之后插入 `kind: 'reviewAppeal'` 条目，区分原批次决议（`review.batch.*` 事件）、申诉事件（`review.appeal.created/started/invitation.consumed/opinion.submitted/field.accepted|rejected/cancelled/expired/completed/correction.completed`）与后续更正回执；全部状态在刷新、重新登录、服务重启后保持一致（申诉免登录会话同样持久化）。
+
 ## 多方复核批次（可配置的多方复核与决议编排）
 
 办理人可在**已签发回执**上创建一个多方复核批次：同一份回执配 2～5 个**限时、一次性**邀请，每个邀请有独立的**可查看字段范围**，批次对每个纳入编排的字段配置**接受阈值 / 驳回阈值**。批次只有在全部邀请完成一次性校验后才能进入复核；复核人只能针对**本邀请被授权的字段**提交意见；同一字段的多份意见**合并展示但逐字保留每位复核人的原始说明**；办理人逐字段作出接受或驳回决议时**必须满足对应阈值**；被接受字段的全部意见进入**同一份**新的更正办理并关联全部意见。
@@ -349,11 +368,23 @@ COOKIE_SECURE: "1"
 | GET | `/api/batch-review/context` | 否 | 仅本邀请授权字段的脱敏视图、合并意见与本人意见 |
 | POST | `/api/batch-review/opinions` | 否 | 复核人提交字段意见（需批次会话 + CSRF，幂等） |
 | POST | `/api/batch-review/logout` | 否 | 退出并清除本机批次会话 |
+| GET | `/api/review-batches/{id}/appealable-fields` | 是 | 原批次中可申诉的驳回字段、原证据意见与申诉理由选项 |
+| POST | `/api/review-appeals` | 是 | 创建复核申诉回合（2-5 个新邀请、字段授权、独立阈值与限时、证据白名单，返回一次性链接） |
+| GET | `/api/review-appeals?batchId=` | 是 | 申诉回合清单（可按批次/回执过滤） |
+| GET | `/api/review-appeals/{id}` | 是 | 申诉回合详情（邀请、证据授权、合并意见、决议、倒计时） |
+| POST | `/api/review-appeals/{id}/cancel` | 是 | 取消申诉回合（已有字段决议则失败，历史不删除） |
+| POST | `/api/review-appeals/{id}/fields/{fieldId}/accept` | 是 | 接受申诉（达到接受阈值，进入同一份更正并关联原批次来源） |
+| POST | `/api/review-appeals/{id}/fields/{fieldId}/reject` | 是 | 驳回申诉（满足驳回阈值，理由必填） |
+| POST | `/api/appeal-review/validate` | 否 | 申诉邀请一次性校验，成功后建立免登录申诉会话 |
+| GET | `/api/appeal-review/context` | 否 | 仅本回合本邀请授权字段的脱敏视图、原驳回决议、证据摘要与合并意见 |
+| POST | `/api/appeal-review/opinions` | 否 | 新复核人提交申诉意见（需申诉会话 + CSRF，幂等） |
+| POST | `/api/appeal-review/logout` | 否 | 退出并清除本机申诉会话 |
 | POST | `/api/verify` | 否 | 编号+核验码核验，仅返回脱敏结果，按 IP 限流 |
 | GET | `/api/public/receipts/{no}/print?code=` | 否 | 脱敏可打印回执文档 |
 | GET | `/verify` | 否 | 免登录核验页面 |
 | GET | `/review` | 否 | 免登录复核页面（先完成邀请校验） |
 | GET | `/batch-review` | 否 | 免登录多方批次复核页面（先完成批次邀请校验） |
+| GET | `/appeal-review` | 否 | 免登录复核申诉评议页面（先完成申诉邀请校验，只展示本回合授权内容） |
 
 所有非 GET 的登录态接口要求 `X-CSRF-Token`。会话 Cookie 为 `HttpOnly; SameSite=Lax`，HTTPS 环境可启用 `Secure`。
 
@@ -373,10 +404,15 @@ COOKIE_SECURE: "1"
 - `review_batch_invitations` / `review_batch_invitation_fields`：批次的 2-5 个限时一次性邀请（令牌只存哈希、所属阶段）与逐邀请字段授权；阶段未开始时邀请不能使用
 - `review_batch_sessions`：批次邀请校验后的免登录会话（只存令牌哈希、独立 CSRF、绑定单个邀请与字段授权、有效期不超过阶段截止）
 - `review_batch_opinions`：字段意见（每邀请每字段唯一，逐字保留原始说明、脱敏值快照、幂等键）；同一字段的多份意见在查询时合并。阶段超时失败/取消时会话只置为过期、不删除，避免外键级联删除需要留档的意见
-- `correction_opinions`：批次字段意见/普通异议与更正办理的统一来源关联（完成更正时据此回填新回执编号、放弃更正时据此回收决议）
+- `review_appeal_rounds`：复核申诉回合（状态 `in_review/completed/cancelled/expired`、独立限时 `expires_at`、申诉理由摘要、取消/过期时间，部分唯一索引保证同一批次至多一个未终结回合）
+- `review_appeal_fields`：申诉逐字段配置（引用原批次字段 `source_field_id`、独立接受/驳回阈值、申诉理由、逐字段决议/理由/处理人、关联更正办理与新回执）；部分唯一索引保证每个驳回字段在未终结回合中至多被申诉一次
+- `review_appeal_invitations` / `review_appeal_invitation_fields` / `review_appeal_sessions`：申诉回合 2-5 个限时一次性邀请（令牌只存哈希）、逐邀请字段授权、独立 Cookie（aid/accsrf）的免登录会话
+- `review_appeal_opinions`：申诉意见（每邀请每申诉字段唯一、幂等键、脱敏值快照）；查询时按字段合并展示
+- `review_appeal_evidence`：办理人显式授权向新复核人披露的原批次证据摘要（原意见引用 + 匿名别名“原复核人N” + 脱敏值快照与逐字说明）；未授权的原意见不出现
+- `correction_objections`：批次字段意见/普通异议/申诉意见与更正办理的统一来源关联（新增 `appeal_opinion_id` 与 `source_batch_id/source_round_id`；完成更正时据此回填新回执编号、放弃更正时据此回收决议）
 - `tokens`：令牌哈希、绑定维度、过期、使用、撤销状态
 - `submissions`：幂等键、请求指纹、提交和确认结果
-- `events`：创建、草稿、确认、退回、签发回执、撤销、更正创建、复核邀请/异议/处理等审计事件
+- `events`：创建、草稿、确认、退回、签发回执、撤销、更正创建、复核邀请/异议/处理、多方批次阶段/决议、复核申诉回合等审计事件
 
 SQLite 启用 WAL 和外键；所有推进与回执签发都在同步 `BEGIN IMMEDIATE` 事务中完成。首次用新版启动旧版数据库时会自动迁移表结构并为已完成记录补签回执。
 
