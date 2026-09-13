@@ -322,9 +322,15 @@ function renderTimeline() {
         in_review: ['复核中', 'confirmed'],
         completed: ['已完成决议', 'confirmed'],
         cancelled: ['已取消', 'invalidated'],
+        timed_out: ['已超时失败', 'invalidated'],
       };
       const [statusText, statusCls] = statusMap[entry.status] || [entry.status, 'current'];
-      const fieldHtml = (entry.fields || []).map((field) => {
+      const corrHtml = (field) => field.correctionReceiptNo
+        ? `<div class="small review-obj-result">→ 更正回执 <span class="mono">${escapeHtml(field.correctionReceiptNo)}</span></div>`
+        : field.decision === 'rejected'
+          ? `<div class="small review-obj-result">${field.decidedByPolicy ? '系统自动驳回：' : '驳回理由：'}${escapeHtml(field.decisionReason || '—')}</div>`
+          : '';
+      const fieldBlock = (field) => {
         const badge = field.decision === 'accepted'
           ? '<span class="badge confirmed">已接受</span>'
           : field.decision === 'rejected'
@@ -335,11 +341,6 @@ function renderTimeline() {
             <div class="record-main"><b>${escapeHtml(o.reviewerLabel)}</b><span class="muted small">${formatTime(o.submittedAt)}</span></div>
             <div class="small">${escapeHtml(o.reason)}</div>
           </li>`).join('');
-        const corr = field.correctionReceiptNo
-          ? `<div class="small review-obj-result">→ 更正回执 <span class="mono">${escapeHtml(field.correctionReceiptNo)}</span></div>`
-          : field.decision === 'rejected'
-            ? `<div class="small review-obj-result">驳回理由：${escapeHtml(field.decisionReason || '—')}</div>`
-            : '';
         return `
           <div class="batch-field ${field.decision || 'pending'}">
             <div class="record-main">
@@ -347,34 +348,86 @@ function renderTimeline() {
               ${badge}
             </div>
             <ul class="batch-opinion-list">${opinionHtml || '<li class="muted small">暂无意见</li>'}</ul>
-            ${corr}
+            ${corrHtml(field)}
             <div class="record-actions" data-bf-actions data-bf-batch="${escapeHtml(entry.batchId)}" data-bf-field="${escapeHtml(field.id)}"></div>
           </div>`;
+      };
+      // 分阶段批次：按阶段分组渲染字段、邀请、倒计时与阶段最终决议
+      const STAGE_STATUS = {
+        pending: '未开始', active: '进行中', active_deadline_passed: '限时已到',
+        completed: '已完成', timed_out: '已超时', failed: '已失败',
+      };
+      const POLICY_TEXT = { advance: '超时自动进入下一阶段', revoke_unused: '超时撤销未使用邀请', fail: '超时标记批次失败' };
+      const stageHtml = (entry.stages || []).map((stage) => {
+        const countdown = (stage.status === 'active' || stage.status === 'active_deadline_passed') && stage.deadlineAt
+          ? `<span class="muted small"> · 剩余 <b data-countdown="${stage.deadlineAt}">${formatRemaining(stage.deadlineAt)}</b></span>`
+          : '';
+        const timeoutLine = stage.timeoutFiredAt
+          ? `<div class="small review-obj-result">超时策略（开始时冻结：${escapeHtml(POLICY_TEXT[stage.frozenPolicy || stage.timeoutPolicy] || stage.timeoutPolicy)}）已于 ${formatTime(stage.timeoutFiredAt)} 触发，结果：${escapeHtml(stage.timeoutResult || '—')}</div>`
+          : '';
+        const stageFieldIds = new Set((entry.fields || []).filter((f) => f.stageId === stage.id).map((f) => f.id));
+        const stageFields = (entry.fields || []).filter((f) => f.stageId === stage.id);
+        const stageInvites = (entry.invitations || []).filter((inv) => inv.stageId === stage.id);
+        const invHtml = stageInvites.map((inv) => {
+          const invStatus = { active: '待使用', used: '已校验', revoked: '已撤销', expired: '已过期' }[inv.status] || inv.status;
+          return `<li class="muted small">${escapeHtml(inv.label)}：${invStatus} · 授权 ${inv.fieldKeys.length} 个字段${inv.usedAt ? ` · 校验于 ${formatTime(inv.usedAt)}` : ''}${inv.revokedAt ? ` · 撤销于 ${formatTime(inv.revokedAt)}` : ''}</li>`;
+        }).join('');
+        return `
+          <div class="batch-stage ${escapeHtml(stage.status)}">
+            <div class="record-main">
+              <b>阶段 ${stage.ordinal + 1} · ${escapeHtml(stage.name)}</b>
+              <span class="badge ${stage.status === 'active' ? 'confirmed' : stage.status === 'pending' ? 'current' : 'invalidated'}">${STAGE_STATUS[stage.status] || stage.status}</span>
+            </div>
+            <div class="muted small">
+              限时 ${Math.round(stage.durationMs / 60000)} 分钟 · 策略：${escapeHtml(POLICY_TEXT[stage.timeoutPolicy] || stage.timeoutPolicy)}
+              ${stage.startedAt ? ` · 开始于 ${formatTime(stage.startedAt)}` : ''}
+              ${stage.deadlineAt ? ` · 截止 ${formatTime(stage.deadlineAt)}` : ''}
+              ${countdown}
+              ${stage.completedAt ? ` · 结束于 ${formatTime(stage.completedAt)}` : ''}
+              · 邀请 ${stage.validatedCount}/${stage.invitationCount}
+              · 字段决议 ${stage.acceptedCount + stage.rejectedCount}/${stage.fieldCount}
+              ${stage.finalDecision ? ` · 最终决议：${escapeHtml(stage.finalDecision)}` : ''}
+            </div>
+            ${timeoutLine}
+            <ul class="batch-invite-list">${invHtml}</ul>
+            <div class="batch-fields">${stageFields.map(fieldBlock).join('')}</div>
+          </div>`;
       }).join('');
-      const inviteHtml = (entry.invitations || []).map((inv) => {
+      const flatInviteHtml = (entry.invitations || []).map((inv) => {
         const invStatus = {
           active: '待使用', used: '已校验', revoked: '已撤销', expired: '已过期',
         }[inv.status] || inv.status;
         return `<li class="muted small">${escapeHtml(inv.label)}：${invStatus} · 授权 ${inv.fieldKeys.length} 个字段${inv.usedAt ? ` · 校验于 ${formatTime(inv.usedAt)}` : ''}</li>`;
       }).join('');
+      const historyHtml = (entry.changeHistory || []).length ? `
+        <details class="batch-history"><summary class="muted small">配置版本 v${entry.configVersion} · 变更历史（${entry.changeHistory.length}）</summary>
+        <ul class="batch-history-list">
+          ${entry.changeHistory.map((h) => `<li class="muted small">${formatTime(h.at)} · ${escapeHtml(historyTypeText(h.type))}${h.fromVersion ? ` v${h.fromVersion}→v${h.toVersion}` : ` v${h.toVersion}`}</li>`).join('')}
+        </ul></details>` : `<div class="muted small">配置版本 v${entry.configVersion}</div>`;
       li.innerHTML = `
         <div class="record-main">
-          <span>多方复核批次</span>
-          <span class="badge ${statusCls}">${statusText}</span>
+          <span>${entry.staged ? '多方分阶段复核批次' : '多方复核批次'}</span>
+          <span class="badge ${statusCls}">${statusText}${entry.staged && entry.currentStageOrdinal !== null && entry.status === 'in_review' ? ` · 第 ${entry.currentStageOrdinal + 1} 阶段` : ''}</span>
         </div>
         <div class="muted small">
           创建于 ${formatTime(entry.createdAt)} · 有效期至 ${formatTime(entry.expiresAt)}
           · 邀请 ${entry.validatedCount}/${entry.invitationCount} 已完成校验
           ${entry.cancelledAt ? `· 取消于 ${formatTime(entry.cancelledAt)}` : ''}
           ${entry.completedAt ? `· 完成于 ${formatTime(entry.completedAt)}` : ''}
+          ${entry.timeoutResult ? `· 超时结果：${escapeHtml(entry.timeoutResult)}` : ''}
         </div>
         <div class="muted small">针对回执 <span class="mono">${escapeHtml(entry.receiptNo)}</span>${entry.note ? ` · 备注：${escapeHtml(entry.note)}` : ''}</div>
-        <ul class="batch-invite-list">${inviteHtml}</ul>
-        <div class="batch-fields">${fieldHtml}</div>
+        ${entry.staged ? stageHtml : `<ul class="batch-invite-list">${flatInviteHtml}</ul><div class="batch-fields">${(entry.fields || []).map(fieldBlock).join('')}</div>`}
+        ${historyHtml}
         <div class="record-actions" data-batch-actions="${escapeHtml(entry.batchId)}"></div>
       `;
+      // 只有“当前进行中阶段”的待决议字段显示决议按钮
+      const currentStageId = entry.stages && entry.currentStageOrdinal !== null && entry.stages[entry.currentStageOrdinal]
+        ? entry.stages[entry.currentStageOrdinal].id
+        : null;
       (entry.fields || []).forEach((field) => {
         if (entry.status !== 'in_review' || field.decision) return;
+        if (entry.staged && field.stageId !== currentStageId) return;
         const box = li.querySelector(`[data-bf-field="${cssEscape(field.id)}"]`);
         if (!box) return;
         const acceptBtn = document.createElement('button');
@@ -391,13 +444,25 @@ function renderTimeline() {
         box.append(rejectBtn);
       });
       const batchActions = li.querySelector(`[data-batch-actions="${cssEscape(entry.batchId)}"]`);
-      if (entry.status === 'collecting') {
+      // 分阶段批次：第一阶段尚未开始时可“启动第一阶段/调整编排/取消”；平面批次：收集期可进入复核/取消
+      const firstStage = entry.staged && entry.stages ? entry.stages[0] : null;
+      const canStartStaged = entry.staged && firstStage && firstStage.status === 'pending'
+        && !(entry.stages || []).some((s) => s.status !== 'pending');
+      if (entry.status === 'collecting' || canStartStaged) {
         const startBtn = document.createElement('button');
         startBtn.type = 'button';
         startBtn.className = 'link-button';
-        startBtn.textContent = '全部已校验，进入复核';
+        startBtn.textContent = entry.staged ? '启动第一阶段（开始倒计时并冻结策略）' : '全部已校验，进入复核';
         startBtn.addEventListener('click', () => startBatch(entry.batchId));
         batchActions.append(startBtn);
+        if (entry.staged) {
+          const editBtn = document.createElement('button');
+          editBtn.type = 'button';
+          editBtn.className = 'link-button';
+          editBtn.textContent = '调整编排（需当前版本号）';
+          editBtn.addEventListener('click', () => reconfigureBatch(entry.batchId, entry.configVersion));
+          batchActions.append(editBtn);
+        }
         const cancelBtn = document.createElement('button');
         cancelBtn.type = 'button';
         cancelBtn.className = 'link-button danger-link';
@@ -406,6 +471,7 @@ function renderTimeline() {
         batchActions.append(cancelBtn);
         (entry.invitations || []).forEach((inv) => {
           if (inv.status !== 'active') return;
+          if (entry.staged && inv.stageOrdinal !== null && inv.stageOrdinal !== 0) return;
           const revokeBtn = document.createElement('button');
           revokeBtn.type = 'button';
           revokeBtn.className = 'link-button danger-link';
@@ -812,6 +878,36 @@ function formatTime(epochMs) {
   if (!epochMs) return '—';
   return new Date(epochMs).toLocaleString('zh-CN', { hour12: false });
 }
+
+function formatRemaining(deadlineMs) {
+  const ms = Math.max(0, deadlineMs - Date.now());
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (ms <= 0) return '已到限时';
+  if (h > 0) return `${h} 小时 ${m} 分 ${s} 秒`;
+  if (m > 0) return `${m} 分 ${s} 秒`;
+  return `${s} 秒`;
+}
+
+function historyTypeText(type) {
+  return ({
+    'batch.created': '创建批次',
+    'batch.reconfigured': '调整编排',
+    'batch.cancelled': '取消批次',
+    'batch.stage.started': '阶段开始',
+    'batch.stage.completed': '阶段完成',
+    'batch.stage.timeout': '阶段超时落定',
+  }[type]) || type;
+}
+
+// 倒计时与阶段状态每秒刷新（页面打开期间）
+setInterval(() => {
+  document.querySelectorAll('[data-countdown]').forEach((el) => {
+    el.textContent = formatRemaining(Number(el.dataset.countdown));
+  });
+}, 1000);
 
 function openReceiptDoc(receiptNo) {
   window.open(`/api/receipts/${encodeURIComponent(receiptNo)}/print`, '_blank', 'noopener');
@@ -1299,16 +1395,21 @@ function renderBatchPanel() {
   panel.innerHTML = `
     <div class="receipt-head">
       <h2>多方复核批次</h2>
-      <button class="button secondary" type="button" data-action="new-batch">创建复核批次（2-5 方）</button>
+      <span class="record-actions">
+        <button class="button secondary" type="button" data-action="new-batch">创建复核批次（2-5 方）</button>
+        <button class="button secondary" type="button" data-action="new-staged-batch">创建分阶段批次</button>
+      </span>
     </div>
     <p class="muted small">
       为同一份回执创建包含 2-5 个限时、一次性邀请的复核批次，逐字段配置接受/驳回阈值；
       全部邀请完成校验后批次才进入复核，复核人只能查看并评价各自被授权的脱敏字段。
+      分阶段批次可把复核拆成按顺序执行的多个阶段，逐阶段配置邀请范围、字段范围、阈值、限时与超时策略。
     </p>
     <div data-batch-builder></div>
     <div class="batch-list"></div>
   `;
   panel.querySelector('[data-action="new-batch"]').addEventListener('click', () => openBatchBuilder(receiptNo));
+  panel.querySelector('[data-action="new-staged-batch"]').addEventListener('click', () => openStagedBuilder(receiptNo));
   const list = panel.querySelector('.batch-list');
   if (!batches.length) {
     list.innerHTML = '<p class="muted small">尚无复核批次。</p>';
@@ -1321,11 +1422,30 @@ function renderBatchCard(batch) {
   const card = document.createElement('div');
   card.className = `objection-item batch-card ${batch.status}`;
   const statusText = {
-    collecting: '邀请校验中', in_review: '复核中', completed: '已完成决议', cancelled: '已取消',
+    collecting: '邀请校验中', in_review: '复核中', completed: '已完成决议', cancelled: '已取消', timed_out: '已超时失败',
   }[batch.status] || batch.status;
   const statusCls = {
-    collecting: 'current', in_review: 'confirmed', completed: 'confirmed', cancelled: 'invalidated',
+    collecting: 'current', in_review: 'confirmed', completed: 'confirmed', cancelled: 'invalidated', timed_out: 'invalidated',
   }[batch.status] || 'current';
+  const STAGE_STATUS = {
+    pending: '未开始', active: '进行中', active_deadline_passed: '限时已到',
+    completed: '已完成', timed_out: '已超时', failed: '已失败',
+  };
+  const POLICY_TEXT = { advance: '自动进入下一阶段', revoke_unused: '撤销未使用邀请', fail: '标记超时失败' };
+  const stageBlocks = (batch.staged && Array.isArray(batch.stages)) ? batch.stages.map((stage) => {
+    const countdown = (stage.status === 'active' || stage.status === 'active_deadline_passed') && stage.deadlineAt
+      ? ` · 剩余 <b data-countdown="${stage.deadlineAt}">${formatRemaining(stage.deadlineAt)}</b>`
+      : '';
+    const timeoutLine = stage.timeoutFiredAt
+      ? `<li class="muted small">超时策略（${escapeHtml(POLICY_TEXT[stage.frozenPolicy || stage.timeoutPolicy] || stage.timeoutPolicy)}）已于 ${formatTime(stage.timeoutFiredAt)} 触发，结果：${escapeHtml(stage.timeoutResult)}</li>`
+      : '';
+    return `<li class="batch-stage-summary ${escapeHtml(stage.status)}">
+      <b>阶段 ${stage.ordinal + 1} · ${escapeHtml(stage.name)}</b>
+      <span class="badge ${stage.status === 'active' ? 'confirmed' : stage.status === 'pending' ? 'current' : 'invalidated'}">${STAGE_STATUS[stage.status] || stage.status}</span>
+      <div class="muted small">限时 ${Math.round(stage.durationMs / 60000)} 分钟 · 策略：${escapeHtml(POLICY_TEXT[stage.timeoutPolicy] || stage.timeoutPolicy)}${countdown} · 邀请 ${stage.validatedCount}/${stage.invitationCount} · 决议 ${stage.acceptedCount + stage.rejectedCount}/${stage.fieldCount}${stage.finalDecision ? ` · 最终决议：${escapeHtml(stage.finalDecision)}` : ''}</div>
+      <ul class="batch-opinion-list">${timeoutLine}</ul>
+    </li>`;
+  }).join('') : '';
   const invites = batch.invitations.map((inv) => {
     const invStatus = { active: '待使用', used: '已校验', revoked: '已撤销', expired: '已过期' }[inv.status] || inv.status;
     const linkBtn = inv.status === 'active'
@@ -1337,7 +1457,11 @@ function renderBatchCard(batch) {
       <span class="record-actions">${linkBtn}</span>
     </li>`;
   }).join('');
+  const currentStageId = batch.staged && batch.currentStageOrdinal !== null && batch.stages[batch.currentStageOrdinal]
+    ? batch.stages[batch.currentStageOrdinal].id
+    : null;
   const fields = batch.fields.map((field) => {
+    const stageLocked = batch.staged && field.stageId !== currentStageId;
     const opinions = field.opinions.map((o) => `
       <li class="batch-opinion">
         <div class="record-main"><b>${escapeHtml(o.reviewerLabel)}</b><span class="muted small">${formatTime(o.submittedAt)}</span></div>
@@ -1351,9 +1475,9 @@ function renderBatchCard(batch) {
     const corr = field.correctionReceiptNo
       ? ` → <span class="mono">${escapeHtml(field.correctionReceiptNo)}</span>`
       : field.decision === 'rejected'
-        ? `<div class="small">驳回理由：${escapeHtml(field.decisionReason || '—')}</div>`
+        ? `<div class="small">${field.decidedByPolicy ? '系统自动驳回：' : '驳回理由：'}${escapeHtml(field.decisionReason || '—')}</div>`
         : '';
-    const actions = (!field.decision && batch.status === 'in_review')
+    const actions = (!field.decision && batch.status === 'in_review' && !stageLocked)
       ? `<span class="record-actions">
            <button class="link-button" type="button" data-accept="${escapeHtml(field.id)}">接受（阈值 ${field.acceptThreshold}）</button>
            <button class="link-button muted-link" type="button" data-reject="${escapeHtml(field.id)}">驳回（阈值 ${field.rejectThreshold}）</button>
@@ -1362,24 +1486,27 @@ function renderBatchCard(batch) {
     return `<li class="batch-field ${field.decision || 'pending'}">
       <div class="record-main">
         <b>${escapeHtml(field.label)}</b>
-        <span class="muted small">接受≥${field.acceptThreshold} / 驳回≥${field.rejectThreshold} · ${field.opinionCount} 份意见</span>
+        <span class="muted small">接受≥${field.acceptThreshold} / 驳回≥${field.rejectThreshold} · ${field.opinionCount} 份意见${stageLocked ? ' · 阶段未开放' : ''}</span>
         ${badge}
       </div>
       <ul class="batch-opinion-list">${opinions || '<li class="muted small">暂无意见</li>'}</ul>
       ${corr}${actions}
     </li>`;
   }).join('');
+  const allPending = batch.staged && Array.isArray(batch.stages) && batch.stages.every((s) => s.status === 'pending');
+  const canStart = batch.status === 'collecting' || (batch.staged && allPending && batch.status !== 'completed' && batch.status !== 'cancelled' && batch.status !== 'timed_out');
   card.innerHTML = `
     <div class="record-main">
-      <span>批次 <span class="mono small">${escapeHtml(batch.id.slice(0, 12))}…</span></span>
-      <span class="badge ${statusCls}">${statusText} · ${batch.validatedCount}/${batch.invitationCount}</span>
+      <span>批次 <span class="mono small">${escapeHtml(batch.id.slice(0, 12))}…</span>${batch.staged ? ' · <b>分阶段</b>' : ''}</span>
+      <span class="badge ${statusCls}">${statusText} · ${batch.validatedCount}/${batch.invitationCount} · v${batch.configVersion}</span>
     </div>
-    <div class="muted small">有效期至 ${formatTime(batch.expiresAt)}${batch.note ? ` · 备注：${escapeHtml(batch.note)}` : ''}</div>
-    <ul class="batch-invite-list">${invites}</ul>
+    <div class="muted small">有效期至 ${formatTime(batch.expiresAt)}${batch.note ? ` · 备注：${escapeHtml(batch.note)}` : ''}${batch.timeoutResult ? ` · 超时结果：${escapeHtml(batch.timeoutResult)}` : ''}</div>
+    ${batch.staged ? `<ul class="batch-stage-list">${stageBlocks}</ul>` : `<ul class="batch-invite-list">${invites}</ul>`}
     <ul class="batch-field-list">${fields}</ul>
     <div class="record-actions">
-      ${batch.status === 'collecting' ? `
-        <button class="link-button" type="button" data-start>进入复核（需全部校验）</button>
+      ${canStart ? `
+        <button class="link-button" type="button" data-start>${batch.staged ? '启动第一阶段（冻结策略、开始倒计时）' : '进入复核（需全部校验）'}</button>
+        ${batch.staged ? `<button class="link-button" type="button" data-reconfigure>调整编排（基于 v${batch.configVersion}）</button>` : ''}
         <button class="link-button danger-link" type="button" data-cancel>取消批次</button>` : ''}
     </div>
   `;
@@ -1397,6 +1524,7 @@ function renderBatchCard(batch) {
   });
   card.querySelector('[data-start]')?.addEventListener('click', () => startBatch(batch.id));
   card.querySelector('[data-cancel]')?.addEventListener('click', () => cancelBatch(batch.id));
+  card.querySelector('[data-reconfigure]')?.addEventListener('click', () => reconfigureBatch(batch.id, batch.configVersion));
   return card;
 }
 
@@ -1527,6 +1655,176 @@ async function openBatchBuilder(receiptNo) {
       err.classList.remove('hidden');
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// 分阶段复核编排：创建 / 启动前调整（携带配置版本号，乐观锁）
+// ---------------------------------------------------------------------------
+
+// 打开分阶段编排构建器。editBatch 非空时为“调整编排”：预填当前编排、携带版本号。
+async function openStagedBuilder(receiptNo, editBatch = null) {
+  if (state.busy) return;
+  await ensureBatchFieldOptions();
+  const panel = els.batchPanel.querySelector('[data-batch-builder]');
+  if (!panel) return;
+  const fieldOptions = state.batchFieldOptions;
+  const editStages = editBatch && Array.isArray(editBatch.stages)
+    ? editBatch.stages.map((stage) => ({
+      name: stage.name,
+      ttlMinutes: Math.max(1, Math.round(stage.durationMs / 60000)),
+      timeoutPolicy: stage.timeoutPolicy,
+      fields: stage.fields.map((f) => ({ key: f.key, acceptThreshold: f.acceptThreshold, rejectThreshold: f.rejectThreshold })),
+      invitations: stage.invitations.map((inv) => ({ label: inv.label, fields: inv.fields.map((f) => f.key) })),
+    }))
+    : null;
+
+  panel.innerHTML = `
+    <div class="batch-builder card-inner">
+      <h3>${editBatch ? '调整分阶段复核编排' : '配置分阶段复核批次'}</h3>
+      ${editBatch
+        ? `<p class="muted small">基于配置版本 <b>v${editBatch.configVersion}</b> 调整。任何阶段一旦启动即冻结，不能再修改；两个页面同时保存时只有一个成功。</p>`
+        : '<p class="muted small">把复核拆成按顺序执行的多个阶段；每阶段独立配置邀请范围、字段范围、阈值、限时与超时策略（三选一）。前一阶段未达终局时后续阶段不能校验、查看或提交意见。</p>'}
+      <label>批次备注（可选）<input type="text" id="sbNote" maxlength="200" value="${escapeHtml(editBatch?.note || '')}"></label>
+      <div class="bb-section">
+        <strong>阶段（按顺序执行）</strong>
+        <div class="form-actions"><button class="button secondary" type="button" data-add-stage>增加一个阶段</button></div>
+        <div class="sb-stages"></div>
+      </div>
+      <div id="sbError" class="alert error hidden"></div>
+      <div class="form-actions">
+        <button class="button primary" type="button" data-save>${editBatch ? '保存调整（乐观锁）' : '创建分阶段批次并生成一次性链接'}</button>
+        <button class="button secondary" type="button" data-close>取消</button>
+      </div>
+    </div>`;
+
+  const stagesBox = panel.querySelector('.sb-stages');
+  const fieldChoices = () => fieldOptions.map((opt) => `<option value="${escapeHtml(opt.step + '.' + opt.field)}">${escapeHtml(opt.label)}</option>`).join('');
+
+  function fieldRowHtml(field = null) {
+    return `
+      <div class="sb-field-row" data-sb-field-row>
+        <select data-sb-field-key>${fieldChoices()}</select>
+        接受≥<input type="number" min="1" max="5" value="${field?.acceptThreshold ?? 1}" data-sb-accept>
+        驳回≥<input type="number" min="1" max="5" value="${field?.rejectThreshold ?? 1}" data-sb-reject>
+        <button type="button" class="link-button danger-link" data-sb-remove-field>移除</button>
+      </div>`;
+  }
+  function inviteRowHtml(invite = null) {
+    const selected = new Set(invite?.fields || []);
+    return `
+      <div class="sb-invite" data-sb-invite>
+        <div class="record-main"><b>复核邀请</b><button type="button" class="link-button danger-link" data-sb-remove-invite>移除</button></div>
+        <input type="text" maxlength="60" placeholder="邀请名称（如：财务复核）" data-sb-invite-label value="${escapeHtml(invite?.label || '')}">
+        <div class="sb-scope">${fieldOptions.map((opt) => {
+    const key = opt.step + '.' + opt.field;
+    return `<label class="bb-scope-field"><input type="checkbox" data-sb-scope value="${escapeHtml(key)}" ${selected.has(key) ? 'checked' : ''}>${escapeHtml(opt.label)}</label>`;
+  }).join('')}</div>
+      </div>`;
+  }
+  function stageCardHtml(stage = null, index = 0) {
+    const div = document.createElement('div');
+    div.className = 'sb-stage card-inner';
+    div.dataset.sbStage = '';
+    div.innerHTML = `
+      <div class="record-main">
+        <b>第 <span data-sb-ordinal>${index + 1}</span> 阶段</b>
+        <button type="button" class="link-button danger-link" data-sb-remove-stage>移除阶段</button>
+      </div>
+      <input type="text" maxlength="60" placeholder="阶段名称" data-sb-stage-name value="${escapeHtml(stage?.name || '')}">
+      <label>限时（分钟，5-10080）<input type="number" min="5" max="10080" value="${stage?.ttlMinutes ?? 60}" data-sb-ttl></label>
+      <label>阶段超时策略（开始时冻结）
+        <select data-sb-policy>
+          <option value="advance"${stage?.timeoutPolicy === 'advance' ? ' selected' : ''}>自动转入下一阶段（未决字段自动驳回）</option>
+          <option value="revoke_unused"${stage?.timeoutPolicy === 'revoke_unused' ? ' selected' : ''}>撤销未使用邀请（办理人仍须完成已收集意见的决议）</option>
+          <option value="fail"${stage?.timeoutPolicy === 'fail' ? ' selected' : ''}>标记批次超时失败</option>
+        </select>
+      </label>
+      <div class="sb-fields"><strong>字段范围与阈值</strong><div class="sb-field-list"></div>
+        <button type="button" class="link-button" data-sb-add-field>增加字段</button></div>
+      <div class="sb-invites"><strong>邀请范围</strong><div class="sb-invite-list"></div>
+        <button type="button" class="link-button" data-sb-add-invite>增加邀请</button></div>`;
+    const fieldList = div.querySelector('.sb-field-list');
+    const inviteList = div.querySelector('.sb-invite-list');
+    (stage?.fields || []).forEach((f) => {
+      fieldList.insertAdjacentHTML('beforeend', fieldRowHtml(f));
+      const row = fieldList.lastElementChild;
+      row.querySelector('[data-sb-field-key]').value = f.key;
+    });
+    (stage?.invitations || []).forEach((inv) => inviteList.insertAdjacentHTML('beforeend', inviteRowHtml(inv)));
+    div.addEventListener('click', (event) => {
+      if (event.target.matches('[data-sb-add-field]')) fieldList.insertAdjacentHTML('beforeend', fieldRowHtml());
+      if (event.target.matches('[data-sb-remove-field]')) event.target.closest('[data-sb-field-row]')?.remove();
+      if (event.target.matches('[data-sb-add-invite]')) inviteList.insertAdjacentHTML('beforeend', inviteRowHtml());
+      if (event.target.matches('[data-sb-remove-invite]')) event.target.closest('[data-sb-invite]')?.remove();
+      if (event.target.matches('[data-sb-remove-stage]')) { div.remove(); renumberStages(); }
+    });
+    return div;
+  }
+  function renumberStages() {
+    [...stagesBox.children].forEach((card, i) => {
+      card.querySelector('[data-sb-ordinal]').textContent = i + 1;
+    });
+  }
+  function addStage(stage) {
+    if (stagesBox.children.length >= 5) { showAlert('一个批次最多 5 个阶段。', 'warning'); return; }
+    stagesBox.append(stageCardHtml(stage, stagesBox.children.length));
+  }
+  panel.querySelector('[data-add-stage]').addEventListener('click', () => addStage(null));
+  if (editStages) editStages.forEach(addStage); else { addStage(null); addStage(null); }
+
+  panel.querySelector('[data-close]').addEventListener('click', () => { panel.innerHTML = ''; });
+  panel.querySelector('[data-save]').addEventListener('click', async () => {
+    const stages = [...stagesBox.querySelectorAll('[data-sb-stage]')].map((card) => ({
+      name: card.querySelector('[data-sb-stage-name]').value.trim(),
+      ttlMinutes: Number(card.querySelector('[data-sb-ttl]').value),
+      timeoutPolicy: card.querySelector('[data-sb-policy]').value,
+      fields: [...card.querySelectorAll('[data-sb-field-row]')].map((row) => ({
+        key: row.querySelector('[data-sb-field-key]').value,
+        acceptThreshold: Number(row.querySelector('[data-sb-accept]').value),
+        rejectThreshold: Number(row.querySelector('[data-sb-reject]').value),
+      })),
+      invitations: [...card.querySelectorAll('[data-sb-invite]')].map((inv) => ({
+        label: inv.querySelector('[data-sb-invite-label]').value.trim(),
+        fields: [...inv.querySelectorAll('[data-sb-scope]:checked')].map((box) => box.value),
+      })),
+    }));
+    const body = { receiptNo, note: panel.querySelector('#sbNote').value, stages };
+    const err = panel.querySelector('#sbError');
+    err.classList.add('hidden');
+    try {
+      let result;
+      if (editBatch) {
+        result = await api('POST', `/api/review-batches/${encodeURIComponent(editBatch.id)}/orchestration`, { ...body, expectedVersion: editBatch.configVersion });
+      } else {
+        result = await api('POST', '/api/review-batches', body);
+      }
+      state.reviewBatches = result.reviewBatches || result.batch ? state.reviewBatches.map((b) => (b.id === result.batch.id ? result.batch : b)) : state.reviewBatches;
+      state.timeline = result.timeline || state.timeline;
+      panel.innerHTML = '';
+      showBatchLinks(result);
+      showAlert(editBatch ? `编排已更新到 v${result.version}，新的一次性链接如下（旧链接全部失效）。` : '分阶段复核批次已创建。', 'success');
+      render();
+    } catch (error) {
+      if (error.body?.batch) {
+        state.reviewBatches = state.reviewBatches.map((b) => (b.id === error.body.batch.id ? error.body.batch : b));
+        render();
+      }
+      err.textContent = error.message || '保存失败';
+      err.classList.remove('hidden');
+    }
+  });
+}
+
+// 时间线/批次卡片触发：调整尚未开始的编排（乐观锁版本号）
+async function reconfigureBatch(batchId, expectedVersion) {
+  const batch = (state.reviewBatches || []).find((b) => b.id === batchId)
+    || (await api('GET', `/api/review-batches/${encodeURIComponent(batchId)}`).then((r) => r.batch).catch(() => null));
+  if (!batch) { showAlert('批次不存在或已不可用。', 'error'); return; }
+  if (!batch.staged) {
+    showAlert('该批次不是分阶段编排，暂不支持通过此入口调整；如需变更请取消后重建。', 'warning');
+    return;
+  }
+  await openStagedBuilder(batch.receiptNo, batch);
 }
 
 function showBatchLinks(result) {

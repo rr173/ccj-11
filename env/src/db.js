@@ -50,6 +50,26 @@ if (legacyWorkflows) {
   db.pragma('legacy_alter_table = OFF');
 }
 
+// 分阶段编排升级：在主建表语句（含 stage_id 索引）之前，先给旧库的既有批次表补列，
+// 否则后续 CREATE INDEX ... (stage_id) 会在旧结构上报 “no such column”。
+const STAGE_LEGACY_COLUMNS = [
+  ['review_batches', 'staged', 'INTEGER NOT NULL DEFAULT 0'],
+  ['review_batches', 'config_version', 'INTEGER NOT NULL DEFAULT 1'],
+  ['review_batches', 'timeout_result', "TEXT NOT NULL DEFAULT ''"],
+  ['review_batch_fields', 'stage_id', 'TEXT'],
+  ['review_batch_fields', 'ordinal', 'INTEGER NOT NULL DEFAULT 0'],
+  ['review_batch_fields', 'decided_by_policy', "TEXT NOT NULL DEFAULT ''"],
+  ['review_batch_invitations', 'stage_id', 'TEXT'],
+  ['review_batch_invitations', 'ordinal', 'INTEGER NOT NULL DEFAULT 0'],
+  ['review_batch_invitations', 'revoke_reason', "TEXT NOT NULL DEFAULT ''"],
+];
+for (const [table, column, ddl] of STAGE_LEGACY_COLUMNS) {
+  const cols = columnInfo(table);
+  if (cols.length > 0 && !cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl};`);
+  }
+}
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -218,6 +238,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_review_objections_idempotency
 -- ---------------------------------------------------------------------------
 -- 多方复核批次：办理人为同一份已签发回执编排 2-5 个限时一次性邀请，
 -- 逐字段配置接受/驳回阈值；批次只有在全部邀请校验完成后才能进入复核。
+--
+-- 分阶段编排（stages）：批次可拆成按顺序执行的多个阶段，每阶段独立配置
+-- 邀请范围、字段范围、阈值、限时与超时策略（advance/revoke_unused/fail）。
+-- 阶段状态机：pending → active → completed | timed_out | failed。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS review_batches (
   id TEXT PRIMARY KEY,
@@ -225,8 +249,11 @@ CREATE TABLE IF NOT EXISTS review_batches (
   workflow_id TEXT NOT NULL,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   status TEXT NOT NULL DEFAULT 'collecting'
-    CHECK (status IN ('collecting', 'in_review', 'completed', 'cancelled')),
+    CHECK (status IN ('collecting', 'in_review', 'completed', 'cancelled', 'timed_out')),
   note TEXT NOT NULL DEFAULT '',
+  staged INTEGER NOT NULL DEFAULT 0,
+  config_version INTEGER NOT NULL DEFAULT 1,
+  timeout_result TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
   started_at INTEGER,
@@ -242,15 +269,65 @@ CREATE INDEX IF NOT EXISTS idx_review_batches_user ON review_batches(user_id, cr
 CREATE UNIQUE INDEX IF NOT EXISTS idx_review_batches_one_open_per_receipt
   ON review_batches(receipt_no) WHERE status IN ('collecting', 'in_review');
 
--- 批次逐字段配置与决议：阈值在创建时冻结；决议结果、理由、处理人与时间全部留档
+-- 分阶段编排：顺序、状态、限时与“阶段开始时冻结”的超时策略
+CREATE TABLE IF NOT EXISTS review_batch_stages (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES review_batches(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'active', 'completed', 'timed_out', 'failed')),
+  duration_ms INTEGER NOT NULL,
+  timeout_policy TEXT NOT NULL DEFAULT 'advance'
+    CHECK (timeout_policy IN ('advance', 'revoke_unused', 'fail')),
+  frozen_policy TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  deadline_at INTEGER,
+  completed_at INTEGER,
+  final_decision TEXT NOT NULL DEFAULT '',
+  timeout_fired_at INTEGER,
+  timeout_result TEXT NOT NULL DEFAULT '',
+  UNIQUE(batch_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_review_batch_stages_batch ON review_batch_stages(batch_id, ordinal);
+
+-- 编排配置版本：乐观锁（expectedVersion）与逐版本配置留档
+CREATE TABLE IF NOT EXISTS review_batch_orchestration_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id TEXT NOT NULL REFERENCES review_batches(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  config_json TEXT NOT NULL DEFAULT '{}',
+  change_note TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE(batch_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_review_batch_versions_batch ON review_batch_orchestration_versions(batch_id, version);
+
+-- 配置变更历史（谁、何时、从哪版到哪版）
+CREATE TABLE IF NOT EXISTS review_batch_change_history (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES review_batches(id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  from_version INTEGER,
+  to_version INTEGER,
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_batch_history_batch ON review_batch_change_history(batch_id, created_at);
+
+-- 批次逐字段配置与决议：阈值在所属阶段开始时冻结；决议结果、理由、处理人与时间全部留档
 CREATE TABLE IF NOT EXISTS review_batch_fields (
   id TEXT PRIMARY KEY,
   batch_id TEXT NOT NULL REFERENCES review_batches(id) ON DELETE CASCADE,
+  stage_id TEXT REFERENCES review_batch_stages(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL DEFAULT 0,
   step INTEGER NOT NULL,
   field TEXT NOT NULL,
   field_label TEXT NOT NULL DEFAULT '',
   accept_threshold INTEGER NOT NULL,
   reject_threshold INTEGER NOT NULL,
+  decided_by_policy TEXT NOT NULL DEFAULT '',
   decision TEXT CHECK (decision IS NULL OR decision IN ('accepted', 'rejected')),
   decided_at INTEGER,
   decided_by_user_id TEXT,
@@ -260,10 +337,13 @@ CREATE TABLE IF NOT EXISTS review_batch_fields (
   UNIQUE(batch_id, step, field)
 );
 CREATE INDEX IF NOT EXISTS idx_review_batch_fields_batch ON review_batch_fields(batch_id);
+CREATE INDEX IF NOT EXISTS idx_review_batch_fields_stage ON review_batch_fields(stage_id);
 
 CREATE TABLE IF NOT EXISTS review_batch_invitations (
   id TEXT PRIMARY KEY,
   batch_id TEXT NOT NULL REFERENCES review_batches(id) ON DELETE CASCADE,
+  stage_id TEXT REFERENCES review_batch_stages(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL DEFAULT 0,
   receipt_no TEXT NOT NULL,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   label TEXT NOT NULL DEFAULT '',
@@ -273,9 +353,11 @@ CREATE TABLE IF NOT EXISTS review_batch_invitations (
   expires_at INTEGER NOT NULL,
   used_at INTEGER,
   used_ip TEXT NOT NULL DEFAULT '',
-  revoked_at INTEGER
+  revoked_at INTEGER,
+  revoke_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_review_batch_invitations_batch ON review_batch_invitations(batch_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_batch_invitations_stage ON review_batch_invitations(stage_id);
 
 -- 每个邀请可查看/可提交意见的字段范围（字段必须已纳入批次编排）
 CREATE TABLE IF NOT EXISTS review_batch_invitation_fields (
@@ -334,12 +416,89 @@ db.exec(`
   ON workflows(user_id) WHERE status = 'open';
 `);
 
-// 增量迁移：为早期多方批次表补齐后加列（全新库建表时已包含）
+// 增量迁移：分阶段编排新增列已在主建表前补齐（见 STAGE_LEGACY_COLUMNS）；
+// 这里仅补早期批次意见表的后加列。
 for (const [table, column, ddl] of [
   ['review_batch_opinions', 'correction_receipt_no', "TEXT NOT NULL DEFAULT ''"],
 ]) {
   if (columnInfo(table).length > 0 && !columnInfo(table).some((c) => c.name === column)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl};`);
+  }
+}
+
+// 旧库的 review_batches 状态 CHECK 不含 timed_out：用“改名重建”方式拓宽约束，
+// 子表通过显式表名外键引用，重建期间关闭 foreign_keys（SQLite 不允许事务内切换）。
+{
+  const batchesColumns = columnInfo('review_batches');
+  if (batchesColumns.length > 0) {
+    const checkSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_batches'").get()?.sql || '';
+    if (!checkSql.includes('timed_out')) {
+      db.pragma('foreign_keys = OFF');
+      db.pragma('legacy_alter_table = ON');
+      db.exec('ALTER TABLE review_batches RENAME TO review_batches_old;');
+      db.pragma('legacy_alter_table = OFF');
+      db.exec(`
+        CREATE TABLE review_batches (
+          id TEXT PRIMARY KEY,
+          receipt_no TEXT NOT NULL,
+          workflow_id TEXT NOT NULL,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          status TEXT NOT NULL DEFAULT 'collecting'
+            CHECK (status IN ('collecting', 'in_review', 'completed', 'cancelled', 'timed_out')),
+          note TEXT NOT NULL DEFAULT '',
+          staged INTEGER NOT NULL DEFAULT 0,
+          config_version INTEGER NOT NULL DEFAULT 1,
+          timeout_result TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          started_at INTEGER,
+          completed_at INTEGER,
+          cancelled_at INTEGER,
+          cancel_reason TEXT NOT NULL DEFAULT '',
+          invitation_count INTEGER NOT NULL
+        );
+        INSERT INTO review_batches
+          (id, receipt_no, workflow_id, user_id, status, note, staged, config_version, timeout_result,
+           created_at, expires_at, started_at, completed_at, cancelled_at, cancel_reason, invitation_count)
+        SELECT id, receipt_no, workflow_id, user_id, status, note, 0, 1, '',
+               created_at, expires_at, started_at, completed_at, cancelled_at, cancel_reason, invitation_count
+        FROM review_batches_old;
+        DROP TABLE review_batches_old;
+      `);
+      db.pragma('foreign_keys = ON');
+    }
+  }
+}
+
+// 旧库的既有批次没有阶段记录：为每个批次回填“唯一的统一阶段”，把字段与邀请挂到该阶段，
+// 状态/截止时间沿用批次原值，保证升级后旧批次仍可正常展示、提交与决议。
+if (columnInfo('review_batch_stages').length > 0) {
+  const legacyBatches = db.prepare(`
+    SELECT b.* FROM review_batches b
+    WHERE NOT EXISTS (SELECT 1 FROM review_batch_stages s WHERE s.batch_id = b.id)
+  `).all();
+  for (const batch of legacyBatches) {
+    const stageId = cryptoId();
+    const stageStatus = batch.status === 'completed' ? 'completed'
+      : batch.status === 'cancelled' || batch.status === 'timed_out' ? 'failed'
+        : batch.status === 'in_review' ? 'active'
+          : 'pending';
+    db.prepare(`
+      INSERT INTO review_batch_stages
+        (id, batch_id, ordinal, name, status, duration_ms, timeout_policy, frozen_policy,
+         created_at, started_at, deadline_at, completed_at, final_decision, timeout_fired_at, timeout_result)
+      VALUES (?, ?, 0, '统一复核', ?, ?, 'advance', '', ?, ?, ?, ?, '', NULL, '')
+    `).run(
+      stageId, batch.id, stageStatus,
+      Math.max(0, batch.expires_at - batch.created_at),
+      batch.created_at, batch.started_at,
+      batch.status === 'collecting' ? null : batch.expires_at,
+      batch.completed_at,
+    );
+    db.prepare('UPDATE review_batch_fields SET stage_id = ?, ordinal = 0 WHERE batch_id = ? AND stage_id IS NULL')
+      .run(stageId, batch.id);
+    db.prepare('UPDATE review_batch_invitations SET stage_id = ?, ordinal = 0 WHERE batch_id = ? AND stage_id IS NULL')
+      .run(stageId, batch.id);
   }
 }
 
@@ -1643,4 +1802,7 @@ export {
   getBatchReviewerContext,
   submitBatchOpinion,
   decideBatchField,
+  reconfigureBatch,
+  getBatchOrchestrationHistory,
+  sweepBatchTimeouts,
 } from './batchStore.js';

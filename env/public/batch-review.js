@@ -12,6 +12,11 @@ const els = {
   completedAt: $('#completedAt'),
   expiresAt: $('#expiresAt'),
   gateNotice: $('#gateNotice'),
+  stageNotice: $('#stageNotice'),
+  stageName: $('#stageName'),
+  stageStatus: $('#stageStatus'),
+  stageDeadline: $('#stageDeadline'),
+  stageCountdown: $('#stageCountdown'),
   fields: $('#reviewFields'),
   opinionCard: $('#opinionCard'),
   objectionForm: $('#opinionForm'),
@@ -46,7 +51,38 @@ const BATCH_STATUS_TEXT = {
   in_review: '复核中',
   completed: '已完成全部字段决议',
   cancelled: '已取消',
+  timed_out: '已超时失败',
 };
+const STAGE_STATUS_TEXT = {
+  pending: '未开始（前一阶段尚未完成）',
+  active: '进行中',
+  active_deadline_passed: '限时已到',
+  deadline_passed: '限时已到',
+  completed: '已完成',
+  timed_out: '已超时',
+  failed: '已失败',
+};
+const STAGE_POLICY_TEXT = {
+  advance: '超时自动进入下一阶段（未决字段自动驳回）',
+  revoke_unused: '超时撤销未使用邀请',
+  fail: '超时标记批次失败',
+};
+
+let currentContext = null;
+setInterval(() => {
+  if (currentContext?.stage?.deadlineAt && currentContext.stage.isCurrent) {
+    els.stageCountdown.textContent = formatRemaining(currentContext.stage.deadlineAt);
+  }
+}, 1000);
+function formatRemaining(deadline) {
+  const ms = Math.max(0, deadline - Date.now());
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (ms <= 0) return '已到限时';
+  return h > 0 ? `${h} 小时 ${m} 分 ${s} 秒` : m > 0 ? `${m} 分 ${s} 秒` : `${s} 秒`;
+}
 
 function extractToken(input) {
   const text = String(input || '').trim();
@@ -108,6 +144,7 @@ async function loadContext(forceEnter = false) {
     const data = await res.json();
     csrfToken = data.csrfToken || csrfToken;
     context = data.context;
+    currentContext = context;
     renderReview();
     return true;
   } catch {
@@ -148,20 +185,58 @@ function renderReview() {
   els.completedAt.textContent = formatTime(context.completedAt);
   els.expiresAt.textContent = formatTime(context.expiresAt);
 
+  // 当前阶段信息
+  const stage = context.stage;
+  if (stage) {
+    els.stageName.textContent = `第 ${stage.ordinal + 1}/${stage.stageCount} 阶段 · ${stage.name}`;
+    els.stageStatus.textContent = STAGE_STATUS_TEXT[stage.status] || stage.status;
+    els.stageDeadline.textContent = stage.deadlineAt ? formatTime(stage.deadlineAt) : '—';
+    els.stageCountdown.textContent = stage.isCurrent && stage.deadlineAt ? formatRemaining(stage.deadlineAt) : '—';
+  } else {
+    els.stageName.textContent = '—';
+    els.stageStatus.textContent = '—';
+    els.stageDeadline.textContent = '—';
+    els.stageCountdown.textContent = '—';
+  }
+
   if (context.status === 'revoked' || !context.view) {
-    els.status.textContent = '回执已撤销';
+    els.status.textContent = context.status === 'batch_timed_out' ? '批次已超时失败' : '回执已撤销';
     els.status.className = 'status-pill revoked';
-    els.fields.innerHTML = '<div class="alert error">该回执已被办理人撤销；你已提交意见的处理结果仍可在下方查看。</div>';
+    els.fields.innerHTML = `<div class="alert error">${context.status === 'batch_timed_out'
+      ? '该批次的某个阶段超时并按“标记超时失败”策略终止；你此前已提交的意见仍原样留档。'
+      : '该回执已被办理人撤销；你已提交意见的处理结果仍可在下方查看。'}</div>`;
     els.opinionCard.classList.add('hidden');
+    els.stageNotice.classList.add('hidden');
+    els.gateNotice.classList.add('hidden');
+  } else if (context.stageLocked) {
+    // 后续阶段：前序阶段未达终局，不能查看字段或提交意见
+    els.status.textContent = '阶段尚未开放';
+    els.status.className = 'status-pill revoked';
+    els.fields.innerHTML = '';
+    els.opinionCard.classList.add('hidden');
+    els.stageNotice.textContent = `「${stage?.name || '该阶段'}」尚未开始：需等前一阶段达到终局条件后才开放校验、查看与提交。你已完成邀请校验，请等待办理人推进。`;
+    els.stageNotice.classList.remove('hidden');
+    els.gateNotice.classList.add('hidden');
+  } else if (context.stageClosed) {
+    els.status.textContent = '阶段已结束';
+    els.status.className = 'status-pill revoked';
+    renderFields();
+    els.opinionCard.classList.add('hidden');
+    els.stageNotice.textContent = `「${stage?.name || '该阶段'}」已结束（${STAGE_STATUS_TEXT[stage?.status] || ''}），结果已留档；不能再提交意见。`;
+    els.stageNotice.classList.remove('hidden');
+    els.gateNotice.classList.add('hidden');
   } else {
     els.status.textContent = '批次复核中（脱敏视图）';
     els.status.className = 'status-pill completed';
+    els.stageNotice.classList.add('hidden');
     renderFields();
     if (context.canSubmit) {
       els.gateNotice.classList.add('hidden');
       els.opinionCard.classList.remove('hidden');
     } else {
-      els.gateNotice.textContent = '本批次尚有邀请未完成一次性校验，暂不能提交意见；全部校验完成后会自动进入复核，请稍后刷新页面。';
+      els.gateNotice.textContent = stage?.timeoutResult
+        ? '该阶段限时已过，未使用邀请已按冻结策略撤销；提交通道已关闭，请等待办理人完成决议。'
+        : '本阶段尚不能提交意见（邀请校验未完成或批次未在复核中），请稍后刷新页面。';
       els.gateNotice.classList.remove('hidden');
       els.opinionCard.classList.add('hidden');
     }

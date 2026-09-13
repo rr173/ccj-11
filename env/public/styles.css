@@ -164,6 +164,26 @@ a.button { display: inline-block; text-decoration: none; }
 .batch-link-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 10px; }
 .batch-link-list code { display: block; margin-top: 4px; word-break: break-all; background: #f8fafc; border: 1px dashed #cbd2de; border-radius: 6px; padding: 6px 8px; }
 
+/* 分阶段编排 */
+.batch-stage { border: 1px solid #d8dee9; border-left: 4px solid #94a3b8; border-radius: 10px; padding: 10px 12px; margin: 8px 0; background: #fff; display: grid; gap: 6px; }
+.batch-stage.active { border-left-color: #0e9384; background: #f3fcfa; }
+.batch-stage.completed { border-left-color: #1d8a53; }
+.batch-stage.failed, .batch-stage.timed_out, .batch-stage.active_deadline_passed { border-left-color: #d92d20; background: #fffbfa; }
+.batch-stage.pending { opacity: .75; }
+.batch-stage-list, .batch-history-list { list-style: none; margin: 6px 0; padding: 0; display: grid; gap: 6px; }
+.batch-stage-summary { border: 1px solid #d8dee9; border-radius: 8px; padding: 6px 10px; background: #fff; }
+.batch-stage-summary.active { border-color: #0e9384; }
+.batch-history { margin-top: 8px; }
+.batch-history summary { cursor: pointer; }
+.sb-stages { display: grid; gap: 12px; margin-top: 8px; }
+.sb-stage { display: grid; gap: 8px; }
+.sb-field-list, .sb-invite-list { display: grid; gap: 8px; margin: 6px 0; }
+.sb-field-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.sb-field-row select { flex: 1 1 160px; }
+.sb-invite { border: 1px solid #d8dee9; border-radius: 10px; padding: 10px; background: #fff; display: grid; gap: 8px; }
+.sb-scope { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.sb-stage input[type="number"] { width: 90px; }
+
 .hidden { display: none !important; }
 @media (max-width: 760px) { .app { grid-template-columns: 1fr; } .topbar { align-items: flex-start; } .receipt-meta { grid-template-columns: 1fr; } .top-actions { flex-direction: column; align-items: flex-end; } }
 @media print {

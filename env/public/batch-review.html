@@ -38,14 +38,19 @@
         <div class="receipt-meta">
           <div><span class="muted">你的复核身份</span><b id="reviewerLabel"></b></div>
           <div><span class="muted">批次状态</span><b id="batchStatus"></b></div>
+          <div><span class="muted">当前阶段</span><b id="stageName"></b></div>
+          <div><span class="muted">阶段状态</span><b id="stageStatus"></b></div>
+          <div><span class="muted">阶段截止</span><b id="stageDeadline"></b></div>
+          <div><span class="muted">阶段倒计时</span><b id="stageCountdown">—</b></div>
           <div><span class="muted">回执编号</span><b id="receiptNo" class="mono selectable"></b></div>
           <div><span class="muted">最终完成时间</span><b id="completedAt"></b></div>
           <div><span class="muted">复核会话截止</span><b id="expiresAt"></b></div>
         </div>
         <p class="muted small">
-          以下仅包含<strong>本邀请被授权查看的字段</strong>，姓名、手机号、证件号码与详细地址均已在服务端遮罩；
-          同一字段如已有多位复核人提出意见，会合并展示并逐字保留每位复核人的原始说明。
+          以下仅包含<strong>当前阶段、本邀请被授权查看的字段</strong>，姓名、手机号、证件号码与详细地址均已在服务端遮罩；
+          前一阶段未达到终局条件时，后续阶段不能校验、查看或提交意见。
         </p>
+        <div id="stageNotice" class="alert warning hidden"></div>
         <div id="gateNotice" class="alert warning hidden"></div>
         <div id="reviewFields"></div>
       </section>

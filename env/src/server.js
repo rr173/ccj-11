@@ -51,6 +51,9 @@ import {
   getBatchReviewerContext,
   submitBatchOpinion,
   decideBatchField,
+  reconfigureBatch,
+  getBatchOrchestrationHistory,
+  sweepBatchTimeouts,
 } from './db.js';
 import { validateDraft, validateStepPayload } from './validation.js';
 import { stableStringify } from './crypto.js';
@@ -67,7 +70,7 @@ import {
   CODE_PATTERN,
 } from './receipts.js';
 import { INVITATION_ERRORS, isValidTtlMinutes } from './reviews.js';
-import { parseBatchCreateInput, BATCH_ERRORS, BATCH_SESSION_COOKIE, BATCH_CSRF_COOKIE, ALL_BATCH_FIELDS, BATCH_MAX_INVITATIONS } from './batchReviews.js';
+import { parseBatchInput, BATCH_ERRORS, BATCH_SESSION_COOKIE, BATCH_CSRF_COOKIE, ALL_BATCH_FIELDS, BATCH_MAX_INVITATIONS } from './batchReviews.js';
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -272,6 +275,16 @@ async function handleApi(req, res, url) {
   const batchFieldDecideMatch = /^\/api\/review-batches\/([^/]+)\/fields\/([^/]+)\/(accept|reject)$/.exec(url.pathname);
   if (batchFieldDecideMatch && req.method === 'POST') {
     return decideBatchFieldRoute(req, res, user, batchFieldDecideMatch[1], batchFieldDecideMatch[2], batchFieldDecideMatch[3]);
+  }
+  const batchReconfigureMatch = /^\/api\/review-batches\/([^/]+)\/orchestration$/.exec(url.pathname);
+  if (batchReconfigureMatch && req.method === 'POST') {
+    return reconfigureBatchRoute(req, res, user, batchReconfigureMatch[1]);
+  }
+  const batchHistoryMatch = /^\/api\/review-batches\/([^/]+)\/history$/.exec(url.pathname);
+  if (batchHistoryMatch && req.method === 'GET') {
+    const history = getBatchOrchestrationHistory({ userId: user.id, batchId: decodeURIComponent(batchHistoryMatch[1]) });
+    if (!history) return sendJson(res, 404, { error: { code: 'BATCH_NOT_FOUND', message: '复核批次不存在' } });
+    return sendJson(res, 200, history);
   }
 
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
@@ -620,7 +633,7 @@ async function createBatch(req, res, user) {
   }
   const maxMinutes = Math.floor(config.reviewInviteMaxTtlMs / 60000);
   const minMinutes = Math.max(1, Math.ceil(config.reviewInviteMinTtlMs / 60000));
-  const parsed = parseBatchCreateInput(body, { minMinutes, maxMinutes });
+  const parsed = parseBatchInput(body, { minMinutes, maxMinutes });
   if (parsed.error) {
     return sendJson(res, 400, { error: parsed.error });
   }
@@ -635,7 +648,7 @@ async function createBatch(req, res, user) {
     userId: user.id,
     receipt: receiptRow,
     config: parsed.value,
-    ttlMs: parsed.value.ttlMinutes * 60000,
+    ttlMs: (parsed.value.ttlMinutes || 60) * 60000,
   });
   if (!result.ok) {
     return sendJson(res, result.status || 409, {
@@ -752,6 +765,7 @@ async function decideBatchFieldRoute(req, res, user, rawBatchId, rawFieldId, act
     workflow: result.workflow || null,
     createdCorrection: Boolean(result.created),
     batchCompleted: Boolean(result.batchCompleted),
+    stageAdvanced: Boolean(result.stageAdvanced),
     batch: result.batch,
     records: state.records,
     timeline: state.timeline,
@@ -760,9 +774,46 @@ async function decideBatchFieldRoute(req, res, user, rawBatchId, rawFieldId, act
   });
 }
 
-// ---------------------------------------------------------------------------
-// 多方复核批次：复核人侧（免登录，先完成一次性邀请校验）
-// ---------------------------------------------------------------------------
+// 办理人在“任何阶段开始前”调整编排：必须携带当前配置版本号（乐观锁）
+async function reconfigureBatchRoute(req, res, user, rawBatchId) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const batchId = decodeURIComponent(rawBatchId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(batchId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_BATCH_ID' } });
+  }
+  const expectedVersion = integer(body.expectedVersion);
+  if (!Number.isInteger(expectedVersion)) {
+    return sendJson(res, 409, { error: { code: 'BATCH_CONFIG_VERSION_CONFLICT', message: '调整编排必须携带当前配置版本号' } });
+  }
+  const maxMinutes = Math.floor(config.reviewInviteMaxTtlMs / 60000);
+  const minMinutes = Math.max(1, Math.ceil(config.reviewInviteMinTtlMs / 60000));
+  const parsed = parseBatchInput(body, { minMinutes, maxMinutes });
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = reconfigureBatch({
+    userId: user.id,
+    batchId,
+    expectedVersion,
+    config: parsed.value,
+    ttlMs: (parsed.value.ttlMinutes || 60) * 60000,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '调整编排失败' },
+      batch: result.batch || null,
+      currentVersion: result.currentVersion || null,
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    version: result.version,
+    batch: result.batch,
+    links: result.links,
+    timeline: state.timeline,
+    reviewBatches: state.reviewBatches,
+  });
+}
 
 function batchCookies(req) {
   return parseCookies(req.headers.cookie);
@@ -817,7 +868,8 @@ async function batchReviewValidate(req, res) {
   if (!result.ok) {
     recordFailure(limitKey, rate);
     return sendJson(res, result.status, {
-      error: { code: result.code, message: BATCH_ERRORS[result.code] || '邀请校验失败' },
+      error: { code: result.code, message: result.message || BATCH_ERRORS[result.code] || '邀请校验失败' },
+      stageOrdinal: result.stageOrdinal ?? null,
     });
   }
   setBatchSessionCookies(res, { sessionToken: result.sessionToken, csrf: result.csrf, expiresAt: result.expiresAt });
@@ -828,6 +880,7 @@ async function batchReviewValidate(req, res) {
     label: result.label,
     csrfToken: result.csrf,
     expiresAt: result.expiresAt,
+    stageOrdinal: result.stageOrdinal ?? null,
     autoStarted: result.autoStarted,
   });
 }
@@ -850,6 +903,19 @@ function requireBatchSession(req, res, { write = false } = {}) {
     return null;
   }
   return review;
+}
+
+// 阶段超时后台扫描间隔：到点即落定，重复扫描幂等
+const BATCH_TIMEOUT_SWEEP_MS = Number(process.env.BATCH_TIMEOUT_SWEEP_MS || 5000);
+let batchSweepTimer = null;
+function startBatchTimeoutSweep() {
+  if (batchSweepTimer || process.env.NO_BATCH_SWEEP === '1') return;
+  // 启动时先恢复一次：服务在阶段限时内重启后，到点的阶段仍会被落定
+  try { sweepBatchTimeouts(); } catch { /* 记录但不阻塞启动 */ }
+  batchSweepTimer = setInterval(() => {
+    try { sweepBatchTimeouts(); } catch (error) { console.error('batch timeout sweep failed', error); }
+  }, BATCH_TIMEOUT_SWEEP_MS);
+  batchSweepTimer.unref?.();
 }
 
 async function batchReviewContext(req, res) {
@@ -1232,7 +1298,8 @@ if (process.env.NO_AUTO_LISTEN !== '1') {
     const port = server.address()?.port || config.port;
     console.log(`Server-authoritative wizard listening on http://0.0.0.0:${port}`);
     console.log(`SQLite database: ${config.dbPath}`);
+    startBatchTimeoutSweep();
   });
 }
 
-export { server };
+export { server, startBatchTimeoutSweep };

@@ -42,6 +42,7 @@ docker compose up -d --build
 - **全部电子回执（固定快照、状态、撤销留档）**
 - **复核邀请、免登录复核会话、字段异议与处理结果、异议→更正→新回执来源关系**
 - **多方复核批次：批次状态、2-5 个限时一次性邀请、逐邀请字段授权、逐字段阈值、合并字段意见、逐字段决议与“接受意见→同一份更正→新回执”来源关系**
+- **分阶段复核编排：阶段顺序与状态、每阶段邀请/字段范围与阈值、开始时冻结的超时策略与倒计时、超时落定结果、编排配置版本与完整变更历史**
 - **回执核验码密钥 `receipt-secret.key`（核验能力依赖它，务必随数据卷备份）**
 
 默认监听 3000。若由反向代理终止 HTTPS，请设置：
@@ -203,6 +204,22 @@ COOKIE_SECURE: "1"
 - 办理人界面：回执卡片下方“回执复核协作”面板可创建邀请、复制/撤销链接、逐条接受/驳回；时间线条目内也可直接处理。复核人界面：`GET /review` 展示脱敏字段（每个字段可一键发起异议）、异议提交表单与本人异议的处理结果。
 
 
+## 分阶段复核编排（staged orchestration）
+
+在多方复核批次之上，办理人可以把一个批次拆成**按顺序执行的多个阶段**：
+
+- 每个阶段独立配置**邀请范围**（1-5 个一次性邀请，整批合计 2-5 个）、**字段范围**（字段在整个批次内不可跨阶段重复）、**接受/驳回阈值**、**阶段限时**与**超时策略**。
+- 阶段严格顺序开放：前一阶段未达到终局条件（全部字段决议完成，或按冻结策略落定）时，后续阶段不能校验邀请、查看字段或提交意见（`BATCH_STAGE_NOT_STARTED`）。
+- **超时策略三选一，且在阶段开始时冻结**（`frozen_policy`），阶段开始后修改编排不影响进行中的阶段：
+  - `advance`：自动转入下一阶段——本阶段未决字段由系统自动驳回（标记 `timeout_advance`，理由留档），随后激活下一阶段并起算其倒计时；最后一阶段则批次完成。
+  - `revoke_unused`：撤销本阶段尚未使用的邀请，阶段进入收尾，复核人不能再提交；办理人仍须依据已收集的意见（阈值分母只计已校验且未撤销的邀请）完成剩余字段决议后才开放下一阶段。
+  - `fail`：批次标记为**超时失败**（`timed_out` 终态），撤销全部未使用邀请、会话失效；已提交的意见与已决字段原样留档。
+- 超时落定同时由后台定时器（默认每 5 秒扫描，`BATCH_TIMEOUT_SWEEP_MS`）、服务启动恢复扫描与各接口的惰性检查触发；以 `timeout_fired_at IS NULL` 的条件更新为唯一判定，**重复触发不产生第二次结果**。
+- **编排版本号（乐观锁）**：批次配置带 `configVersion`。在任何阶段开始前，办理人可携带 `expectedVersion` 调整编排；两个页面同时基于同一版本保存时只有一个成功，另一个收到 `BATCH_CONFIG_VERSION_CONFLICT` 并返回最新版本与批次状态。任何阶段一旦开始，其配置即冻结，重配返回 `BATCH_CONFIG_LOCKED`。
+- 已提交的字段意见**不会因阶段切换而被改写**；放弃由接受意见进入的更正办理时，相关字段决议回收，对应阶段回到可决议状态。
+- 时间线的批次条目包含：阶段事件、配置版本、每阶段最终决议（`finalDecision`）、倒计时截止与超时结果、逐字段意见/阈值进度、更正回执来源，以及完整配置变更历史（`changeHistory` 与逐版本 `config_json`）。
+- 分阶段批次创建后处于 `collecting`，需办理人显式“启动第一阶段”才开始倒计时与冻结策略；启动前可凭版本号反复调整编排。
+
 ## 多方复核批次（可配置的多方复核与决议编排）
 
 办理人可在**已签发回执**上创建一个多方复核批次：同一份回执配 2～5 个**限时、一次性**邀请，每个邀请有独立的**可查看字段范围**，批次对每个纳入编排的字段配置**接受阈值 / 驳回阈值**。批次只有在全部邀请完成一次性校验后才能进入复核；复核人只能针对**本邀请被授权的字段**提交意见；同一字段的多份意见**合并展示但逐字保留每位复核人的原始说明**；办理人逐字段作出接受或驳回决议时**必须满足对应阈值**；被接受字段的全部意见进入**同一份**新的更正办理并关联全部意见。
@@ -218,6 +235,14 @@ COOKIE_SECURE: "1"
   - **门控**：最后一个邀请校验成功时自动进入复核；办理人也可显式 `POST …/{batchId}/start`，未全部校验时明确失败（`BATCH_GATE_NOT_SATISFIED`，响应给出未校验邀请）；有邀请被撤销/过期时门控不可恢复（`BATCH_GATE_INVITATION_INVALID`），只能取消批次重建；
   - 全部字段都有终局决议后批次自动 `completed`；批次在进入复核前、或复核中但**尚无任何决议**时可取消（`POST …/{batchId}/cancel`，可带理由）；已有字段决议后取消明确失败（`BATCH_HAS_DECISIONS`）。
 - 批次邀请链接形如 `/batch-review?t=…`，完整令牌同样只在创建当次返回（每个邀请一条一次性链接）。
+- **分阶段批次**：创建请求用 `stages: [{ name, ttlMinutes, timeoutPolicy, fields: [{ key, acceptThreshold, rejectThreshold }], invitations: [{ label, fields }] }]`（1-5 个阶段、整批 2-5 邀请）代替顶层 `fields/invitations/ttlMinutes`。创建后需 `POST …/{batchId}/start` 启动第一阶段；阶段全部未开始前可用 `POST …/{batchId}/orchestration`（带 `expectedVersion`）整体重配。
+
+### 1b. 分阶段编排的配置版本与阶段门控
+
+- `POST /api/review-batches/{id}/orchestration`（登录态）：仅当批次所有阶段都还 `pending`（未开始、无邀请校验）时允许整体替换编排；必须携带与当前 `configVersion` 一致的 `expectedVersion`，否则 `409 BATCH_CONFIG_VERSION_CONFLICT`（响应带最新 `batch`）。并发重配以 `UPDATE … WHERE config_version = ?` 保证只有一个成功，成功后版本 +1、旧邀请令牌全部失效、返回一组新一次性链接。
+- 任何阶段一旦开始即冻结：重配返回 `409 BATCH_CONFIG_LOCKED`；撤销已开始阶段的邀请也被拒绝。
+- 阶段门控：校验/查看/提交后续阶段邀请，在其阶段 `pending` 时返回 `409 BATCH_STAGE_NOT_STARTED`；阶段结束后返回 `410 BATCH_STAGE_NOT_CURRENT`；阶段限时已过返回 `410 BATCH_STAGE_DEADLINE_PASSED`；批次超时失败后所有写操作返回 `BATCH_STAGE_TIMED_OUT`。
+- `GET /api/review-batches/{id}/history`：返回当前 `configVersion`、逐版本配置快照（`versions[].config`）与变更历史（`history[]`：创建、重配、阶段开始/完成/超时、取消、批次完成）。
 
 ### 2. 限时一次性邀请与字段授权
 
@@ -318,6 +343,8 @@ COOKIE_SECURE: "1"
 | POST | `/api/review-batches/invitations/{id}/revoke` | 是 | 撤销未使用的批次邀请 |
 | POST | `/api/review-batches/{id}/fields/{fieldId}/accept` | 是 | 接受字段全部意见（必须达到接受阈值，进入同一份更正） |
 | POST | `/api/review-batches/{id}/fields/{fieldId}/reject` | 是 | 驳回字段意见（必须满足驳回阈值，理由必填） |
+| POST | `/api/review-batches/{id}/orchestration` | 是 | 阶段开始前调整分阶段编排（乐观锁 `expectedVersion`） |
+| GET | `/api/review-batches/{id}/history` | 是 | 编排配置版本快照与变更历史 |
 | POST | `/api/batch-review/validate` | 否 | 批次邀请一次性校验，成功后建立批次复核会话 |
 | GET | `/api/batch-review/context` | 否 | 仅本邀请授权字段的脱敏视图、合并意见与本人意见 |
 | POST | `/api/batch-review/opinions` | 否 | 复核人提交字段意见（需批次会话 + CSRF，幂等） |
@@ -339,11 +366,13 @@ COOKIE_SECURE: "1"
 - `review_sessions`：免登录复核会话（只存令牌哈希、绑定邀请与单份回执、独立 CSRF、有效期）
 - `review_objections`：字段级异议（字段、脱敏值快照、说明、`open/accepted/rejected`、提交/处理时间、处理人、驳回理由、关联更正办理与新回执编号、咨询锁、幂等键）
 - `correction_objections`：已接受异议与因此进入的更正办理的多对多来源关系
-- `review_batches`：多方复核批次（状态 `collecting/in_review/completed/cancelled`、有效期、取消原因，部分唯一索引保证同一回执至多一个未终结批次）
-- `review_batch_fields`：批次逐字段编排（接受/驳回阈值，冻结不变）与逐字段决议（接受/驳回、理由、处理人、时间、关联更正办理与新回执编号）
-- `review_batch_invitations` / `review_batch_invitation_fields`：批次的 2-5 个限时一次性邀请（令牌只存哈希）与逐邀请字段授权
-- `review_batch_sessions`：批次邀请校验后的免登录会话（只存令牌哈希、独立 CSRF、绑定单个邀请与字段授权）
-- `review_batch_opinions`：字段意见（每邀请每字段唯一，逐字保留原始说明、脱敏值快照、幂等键）；同一字段的多份意见在查询时合并
+- `review_batches`：多方复核批次（状态 `collecting/in_review/completed/cancelled/timed_out`、是否分阶段 `staged`、编排版本 `config_version`、超时结果、有效期、取消原因，部分唯一索引保证同一回执至多一个未终结批次）
+- `review_batch_stages`：分阶段编排（顺序、名称、状态 `pending/active/completed/timed_out/failed`、限时 `duration_ms`、阶段开始时冻结的超时策略 `frozen_policy`、开始/截止/完成时间、最终决议、超时落定时间与结果）；平面批次内部归一化为唯一阶段
+- `review_batch_orchestration_versions` / `review_batch_change_history`：逐版本编排配置快照（乐观锁 `review_batches.config_version`）与创建/重配/阶段开始/完成/超时/取消等变更历史
+- `review_batch_fields`：批次逐字段编排（所属阶段、接受/驳回阈值）与逐字段决议（接受/驳回、理由、处理人或系统超时策略 `decided_by_policy`、时间、关联更正办理与新回执编号）
+- `review_batch_invitations` / `review_batch_invitation_fields`：批次的 2-5 个限时一次性邀请（令牌只存哈希、所属阶段）与逐邀请字段授权；阶段未开始时邀请不能使用
+- `review_batch_sessions`：批次邀请校验后的免登录会话（只存令牌哈希、独立 CSRF、绑定单个邀请与字段授权、有效期不超过阶段截止）
+- `review_batch_opinions`：字段意见（每邀请每字段唯一，逐字保留原始说明、脱敏值快照、幂等键）；同一字段的多份意见在查询时合并。阶段超时失败/取消时会话只置为过期、不删除，避免外键级联删除需要留档的意见
 - `correction_opinions`：批次字段意见/普通异议与更正办理的统一来源关联（完成更正时据此回填新回执编号、放弃更正时据此回收决议）
 - `tokens`：令牌哈希、绑定维度、过期、使用、撤销状态
 - `submissions`：幂等键、请求指纹、提交和确认结果
@@ -367,5 +396,6 @@ SQLite 启用 WAL 和外键；所有推进与回执签发都在同步 `BEGIN IMM
 | `VERIFY_RATE_WINDOW_MS` | `900000` | 限流窗口长度（复核邀请校验共用） |
 | `REVIEW_INVITE_TTL_MS` | `259200000` | 复核邀请默认有效期（3 天） |
 | `REVIEW_INVITE_MIN_TTL_MS` | `300000` | 复核邀请允许的最短有效期（5 分钟） |
-| `REVIEW_INVITE_MAX_TTL_MS` | `604800000` | 复核邀请允许的最长有效期（7 天） |
+| `REVIEW_INVITE_MAX_TTL_MS` | `604800000` | 复核邀请允许的最长有效期（7 天）；分阶段每阶段限时同样受此上下限约束 |
+| `BATCH_TIMEOUT_SWEEP_MS` | `5000` | 分阶段批次超时落定后台扫描间隔；服务启动时也会先扫描一次（设 `NO_BATCH_SWEEP=1` 可关闭定时器） |
 | `DISPLAY_TIMEZONE` | `Asia/Shanghai` | 回执文档时间展示时区 |
