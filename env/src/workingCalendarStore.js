@@ -16,7 +16,7 @@
 //   时间，非工作时段自动顺延；逐段顺延原因写入计时台账。
 // ---------------------------------------------------------------------------
 import { createHash } from 'node:crypto';
-import { db, immediateTransaction, cryptoId } from './db.js';
+import { db, immediateTransaction, cryptoId, userQueries } from './db.js';
 import { config } from './config.js';
 import { appendObjectionEventTx } from './receiptObjectionStore.js';
 import {
@@ -347,35 +347,49 @@ export function listObjectionTiming(objectionId) {
 export function listObjectionPauses(objectionId) {
   return db.prepare(`
     SELECT * FROM receipt_objection_pauses WHERE objection_id = ? ORDER BY ordinal ASC
-  `).all(objectionId).map((row) => ({
-    id: row.id,
-    ordinal: row.ordinal,
-    status: row.status,
-    pausedAt: row.paused_at,
-    resumedAt: row.resumed_at || null,
-    remainingMinutesAtPause: row.remaining_minutes_at_pause,
-    pausedOffsetMs: row.paused_offset_ms || 0,
-    note: row.note || '',
-    requestedByUserId: row.requested_by_user_id || null,
-    resumedByUserId: row.resumed_by_user_id || null,
-  }));
+  `).all(objectionId).map((row) => {
+    const requestedBy = row.requested_by_user_id ? userQueries.findById(row.requested_by_user_id) : null;
+    const resumedBy = row.resumed_by_user_id ? userQueries.findById(row.resumed_by_user_id) : null;
+    return {
+      id: row.id,
+      ordinal: row.ordinal,
+      status: row.status,
+      pausedAt: row.paused_at,
+      resumedAt: row.resumed_at || null,
+      remainingMinutesAtPause: row.remaining_minutes_at_pause,
+      pausedOffsetMs: row.paused_offset_ms || 0,
+      note: row.note || '',
+      requestedByUserId: row.requested_by_user_id || null,
+      resumedByUserId: row.resumed_by_user_id || null,
+      requestedBy: requestedBy ? requestedBy.display_name : '',
+      resumedBy: resumedBy ? resumedBy.display_name : '',
+    };
+  });
 }
 
 export function listObjectionMigrations(objectionId) {
   return db.prepare(`
     SELECT * FROM objection_calendar_migrations WHERE objection_id = ? ORDER BY created_at ASC
-  `).all(objectionId).map((row) => ({
-    id: row.id,
-    previewId: row.preview_id,
-    fromVersionId: row.from_calendar_version_id,
-    toVersionId: row.to_calendar_version_id,
-    previousDeadlineAt: row.previous_deadline_at,
-    newDeadlineAt: row.new_deadline_at,
-    previousRemainingMinutes: row.previous_remaining_minutes,
-    newRemainingMinutes: row.new_remaining_minutes,
-    migratedByUserId: row.migrated_by_user_id || null,
-    createdAt: row.created_at,
-  }));
+  `).all(objectionId).map((row) => {
+    const fromVersion = db.prepare('SELECT version FROM working_calendars WHERE id = ?').get(row.from_calendar_version_id);
+    const toVersion = db.prepare('SELECT version FROM working_calendars WHERE id = ?').get(row.to_calendar_version_id);
+    const migratedBy = row.migrated_by_user_id ? userQueries.findById(row.migrated_by_user_id) : null;
+    return {
+      id: row.id,
+      previewId: row.preview_id,
+      fromVersionId: row.from_calendar_version_id,
+      toVersionId: row.to_calendar_version_id,
+      fromVersion: fromVersion?.version ?? 0,
+      toVersion: toVersion?.version ?? null,
+      previousDeadlineAt: row.previous_deadline_at,
+      newDeadlineAt: row.new_deadline_at,
+      previousRemainingMinutes: row.previous_remaining_minutes,
+      newRemainingMinutes: row.new_remaining_minutes,
+      migratedByUserId: row.migrated_by_user_id || null,
+      migratedBy: migratedBy ? migratedBy.display_name : '',
+      createdAt: row.created_at,
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------

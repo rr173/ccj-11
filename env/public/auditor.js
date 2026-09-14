@@ -166,6 +166,15 @@ const OBJECTION_EVENT_TEXT = {
   'receipt.objection.revocation-confirmed': '确认撤销',
   'receipt.objection.calendar.migrated': '日历版本迁移',
 };
+const OBJECTION_ROLE_TEXT = { handler: '办理人', processor: '处理人', supervisor: '主管', system: '系统' };
+const TIMING_TEXT = {
+  initial: '初始计时',
+  deferral: '顺延',
+  pause: '暂停（等待补充材料）',
+  resume: '恢复计时（补交材料）',
+  extension: '主管批准延期',
+  migration: '日历版本迁移',
+};
 
 async function loadObjections() {
   const result = await api('GET', '/api/auditor/receipt-objections');
@@ -199,6 +208,65 @@ async function loadObjections() {
   list.querySelectorAll('[data-objection]').forEach((btn) => {
     btn.addEventListener('click', () => loadObjectionDetail(btn.dataset.objection));
   });
+}
+
+// 工作日历与办理计时：固定日历版本、逐段计时台账、补充材料暂停/恢复与日历迁移记录（只读）
+function objectionCalendarTimingHtml(o) {
+  if (!o.calendar) return '';
+  const cal = o.calendar;
+  const schedule = (cal.schedule || []).map((d) => `${d.weekdayLabel} ${
+    d.closed ? '休息' : d.windows.map((w) => `${w.start}-${w.end}`).join('、')
+  }`).join('；');
+  const timingRows = (o.timing || []).map((t) => {
+    const segments = (t.detail.segments || []).map((s) => `
+      <li class="muted small">${s.working ? '计时' : '顺延'}：${formatTime(s.from)} → ${formatTime(s.to)} · ${escapeHtml(s.reason)}</li>`).join('');
+    return `<li class="small">
+      <b>#${t.ordinal} ${escapeHtml(TIMING_TEXT[t.type] || t.type)}</b>
+      · ${formatTime(t.createdAt)}
+      ${t.fromAt ? ` · 起 ${formatTime(t.fromAt)}` : ''}
+      ${t.toAt ? ` · 止 ${formatTime(t.toAt)}` : ''}
+      ${t.actorRole ? ` · 操作角色：${escapeHtml(OBJECTION_ROLE_TEXT[t.actorRole] || t.actorRole)}` : ''}
+      ${t.detail.note ? `<div>${escapeHtml(t.detail.note)}</div>` : ''}
+      ${t.detail.calendarVersion !== undefined ? `<div class="muted small">日历版本 v${t.detail.calendarVersion} · 办理时长 ${t.detail.slaMinutes || t.detail.remainingMinutes || ''} 工作分钟</div>` : ''}
+      ${t.detail.fromVersion !== undefined ? `<div class="muted small">日历版本 v${t.detail.fromVersion} → v${t.detail.toVersion}</div>` : ''}
+      ${t.detail.previousDeadlineAt ? `<div class="muted small">截止 ${formatTime(t.detail.previousDeadlineAt)} → ${formatTime(t.detail.newDeadlineAt)} · 剩余 ${t.detail.previousRemainingMinutes} → ${t.detail.newRemainingMinutes} 工作分钟</div>` : ''}
+      ${t.detail.remainingMinutesAtPause !== undefined ? `<div class="muted small">暂停时冻结剩余 ${t.detail.remainingMinutesAtPause} 工作分钟</div>` : ''}
+      ${segments ? `<ul class="batch-history-list">${segments}</ul>` : ''}
+    </li>`;
+  }).join('');
+  const pauses = (o.pauses || []).map((p) => `
+    <li class="small">#${p.ordinal} ${p.status === 'paused' ? '<b class="tag-warn">暂停中</b>' : '已恢复'}
+      · 暂停于 ${formatTime(p.pausedAt)}${p.resumedAt ? ` · 恢复于 ${formatTime(p.resumedAt)}` : ''}
+      · 冻结剩余 ${p.remainingMinutesAtPause} 工作分钟
+      ${p.requestedBy ? ` · 暂停操作人：${escapeHtml(p.requestedBy)}` : ''}${p.resumedBy ? ` · 恢复操作人：${escapeHtml(p.resumedBy)}` : ''}
+      ${p.note ? `<div>说明：${escapeHtml(p.note)}</div>` : ''}
+    </li>`).join('');
+  const migrations = (o.calendarMigrations || []).map((m) => `
+    <li class="small">${formatTime(m.createdAt)} · 日历版本 <b>v${m.fromVersion} → v${m.toVersion}</b>
+      · 截止 ${formatTime(m.previousDeadlineAt)} → ${formatTime(m.newDeadlineAt)}
+      · 剩余办理 ${m.previousRemainingMinutes} → ${m.newRemainingMinutes} 工作分钟
+      ${m.migratedBy ? ` · 操作人：${escapeHtml(m.migratedBy)}` : ''}
+    </li>`).join('');
+  return `
+    <h3>工作日历与办理计时（版本固定，只追加）</h3>
+    <div class="muted small">
+      本异议固定日历 <b>v${cal.calendarVersion}</b>${cal.legacy ? '（全天 24 小时兼容日历，按自然时间计）' : ''}
+      · 时区 ${escapeHtml(cal.calendarTimezone)}
+      · 办理时长 ${cal.slaMinutes} 工作分钟 · 剩余 ${cal.remainingMinutes} 工作分钟
+      · 本轮计时起点 ${formatTime(cal.anchorAt)}
+      ${cal.paused ? ' · <b class="tag-warn">当前暂停中，不计时</b>' : ''}
+      ${cal.calendarNote ? `<div>版本备注：${escapeHtml(cal.calendarNote)}</div>` : ''}
+    </div>
+    <details class="batch-history"><summary class="muted small">该日历版本每周工作时段</summary><div class="muted small">${escapeHtml(schedule)}</div></details>
+    <details class="batch-history" open><summary class="muted small">逐段计时台账（${(o.timing || []).length} 条，含每段工作/顺延说明）</summary>
+      <ol class="archive-events">${timingRows || '<li class="muted small">暂无计时记录</li>'}</ol>
+    </details>
+    <details class="batch-history" open><summary class="muted small">补充材料暂停与恢复（${(o.pauses || []).length} 段）</summary>
+      <ul class="batch-history-list">${pauses || '<li class="muted small">无暂停记录</li>'}</ul>
+    </details>
+    <details class="batch-history" open><summary class="muted small">日历迁移记录（${(o.calendarMigrations || []).length} 条）</summary>
+      <ul class="batch-history-list">${migrations || '<li class="muted small">无迁移记录</li>'}</ul>
+    </details>`;
 }
 
 async function loadObjectionDetail(objectionNo) {
@@ -245,7 +313,8 @@ async function loadObjectionDetail(objectionNo) {
       <h3>文本说明与补充材料（原文）</h3>
       ${materialsHtml || '<p class="muted small">无</p>'}
       <h3>处理历史（${(o.events || []).length} 条，只追加不可覆盖）</h3>
-      <ol class="archive-events">${eventsHtml}</ol>`;
+      <ol class="archive-events">${eventsHtml}</ol>
+      ${objectionCalendarTimingHtml(o)}`;
   } catch (error) {
     view.innerHTML = `<div class="alert error">${escapeHtml(error.message)}</div>`;
   }
