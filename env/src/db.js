@@ -51,6 +51,8 @@ import * as objectionNs from './receiptObjectionStore.js';
 import * as escalationNs from './objectionEscalationStore.js';
 // 可版本化工作日历（表结构在下方建好后惰性调用 seedWorkingCalendars）
 import { seedWorkingCalendars } from './workingCalendarStore.js';
+// 线下领取预约：撤销回执时在同一事务内把未交付预约置失效并释放名额（惰性调用，规避循环依赖）
+import * as pickupNs from './pickupStore.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -1471,6 +1473,134 @@ CREATE TABLE IF NOT EXISTS receipt_objection_timing (
 );
 CREATE INDEX IF NOT EXISTS idx_obj_timing_objection
   ON receipt_objection_timing(objection_id, ordinal);
+
+-- ---------------------------------------------------------------------------
+-- 回执线下领取预约与一次性交付：
+--   pickup_locations 领取网点（主管维护；停用后不能再新建时间段/预约）；
+--   pickup_slots 未来可预约时间段与每段容量（occupied 为当前占用名额，
+--                 容量调整产生 capacity_version，预约冻结当时版本）；
+--   pickup_appointments 预约（冻结创建时的网点名称/地址/时间范围/容量版本，
+--                 之后网点或时间段如何调整都不改写已有预约的冻结字段；
+--                 version 为乐观锁，改约必须携带；code_seq 为领取码版本）；
+--   pickup_codes 当前生效领取码的 HMAC 摘要（服务端不保存明文，改约/取消/
+--                 交付/失效后删除，旧领取码立即无法校验）；
+--   pickup_audit 只追加审计事件（成功与明确拒绝都留档；触发器禁止改写/删除）。
+-- 并发正确性：扣减/释放名额全部以“条件 UPDATE … WHERE occupied < capacity”
+-- 在 BEGIN IMMEDIATE 事务内完成，两个页面抢最后一个名额只有一个成功。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pickup_locations (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  address TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+  note TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL DEFAULT 1,
+  created_by_user_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pickup_locations_status ON pickup_locations(status, created_at);
+
+CREATE TABLE IF NOT EXISTS pickup_slots (
+  id TEXT PRIMARY KEY,
+  location_id TEXT NOT NULL REFERENCES pickup_locations(id),
+  start_at INTEGER NOT NULL,
+  end_at INTEGER NOT NULL,
+  capacity INTEGER NOT NULL CHECK (capacity >= 1),
+  occupied INTEGER NOT NULL DEFAULT 0 CHECK (occupied >= 0 AND occupied <= capacity),
+  capacity_version INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+  note TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL DEFAULT 1,
+  created_by_user_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pickup_slots_location ON pickup_slots(location_id, start_at);
+CREATE INDEX IF NOT EXISTS idx_pickup_slots_bookable ON pickup_slots(status, start_at);
+
+CREATE TABLE IF NOT EXISTS pickup_appointments (
+  id TEXT PRIMARY KEY,
+  appointment_no TEXT NOT NULL UNIQUE,
+  receipt_no TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  slot_id TEXT NOT NULL REFERENCES pickup_slots(id),
+  status TEXT NOT NULL DEFAULT 'booked'
+    CHECK (status IN ('booked', 'rescheduled', 'cancelled', 'delivered', 'revoked', 'expired')),
+  version INTEGER NOT NULL DEFAULT 1,
+  code_seq INTEGER NOT NULL DEFAULT 1,
+  grace_ms INTEGER NOT NULL DEFAULT 0,
+  -- 创建/改约成功瞬间冻结的领取信息（此后永不更新）
+  frozen_slot_id TEXT NOT NULL,
+  frozen_location_name TEXT NOT NULL,
+  frozen_location_address TEXT NOT NULL,
+  frozen_start_at INTEGER NOT NULL,
+  frozen_end_at INTEGER NOT NULL,
+  frozen_capacity_version INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  revoke_reason TEXT NOT NULL DEFAULT '',
+  created_by_session_id TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  cancelled_at INTEGER,
+  delivered_at INTEGER,
+  delivered_by_user_id TEXT,
+  delivered_by_label TEXT NOT NULL DEFAULT '',
+  expired_at INTEGER,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_pickup_appointments_user ON pickup_appointments(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_pickup_appointments_receipt ON pickup_appointments(receipt_no, created_at);
+CREATE INDEX IF NOT EXISTS idx_pickup_appointments_slot ON pickup_appointments(slot_id);
+CREATE INDEX IF NOT EXISTS idx_pickup_appointments_status ON pickup_appointments(status, frozen_end_at);
+-- 同一份回执至多一条进行中的预约（booked/rescheduled 语义相同，后者只表示改过约）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pickup_appointments_one_active
+  ON pickup_appointments(receipt_no) WHERE status IN ('booked', 'rescheduled');
+
+-- pickup_codes 领取码版本表：仅保存 HMAC 摘要，从不保存明文。
+--   current=当前生效；rotated=改约/取消/失效后被轮换的旧码（保留摘要仅为把
+--   “旧码”与“错码”明确区分，任何旧码都不能再交付）；consumed=交付一次性消费。
+CREATE TABLE IF NOT EXISTS pickup_codes (
+  appointment_id TEXT NOT NULL REFERENCES pickup_appointments(id) ON DELETE CASCADE,
+  code_seq INTEGER NOT NULL,
+  code_hash BLOB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'current'
+    CHECK (status IN ('current', 'rotated', 'consumed')),
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (appointment_id, code_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_pickup_codes_current ON pickup_codes(appointment_id, status);
+
+CREATE TABLE IF NOT EXISTS pickup_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL,
+  appointment_no TEXT NOT NULL DEFAULT '',
+  receipt_no TEXT NOT NULL DEFAULT '',
+  slot_id TEXT NOT NULL DEFAULT '',
+  location_id TEXT NOT NULL DEFAULT '',
+  actor_user_id TEXT,
+  actor_role TEXT NOT NULL DEFAULT '',
+  actor_label TEXT NOT NULL DEFAULT '',
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  result TEXT NOT NULL DEFAULT 'success' CHECK (result IN ('success', 'denied')),
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pickup_audit_appointment ON pickup_audit(appointment_no, id);
+CREATE INDEX IF NOT EXISTS idx_pickup_audit_receipt ON pickup_audit(receipt_no, id);
+CREATE INDEX IF NOT EXISTS idx_pickup_audit_result ON pickup_audit(result, created_at);
+-- 审计只追加：任何 UPDATE/DELETE 都在数据库层被拒绝
+CREATE TRIGGER IF NOT EXISTS trg_pickup_audit_no_update
+BEFORE UPDATE ON pickup_audit
+BEGIN
+  SELECT RAISE(ABORT, 'pickup_audit is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_pickup_audit_no_delete
+BEFORE DELETE ON pickup_audit
+BEGIN
+  SELECT RAISE(ABORT, 'pickup_audit is append-only');
+END;
 `);
 
 // 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
@@ -1490,7 +1620,7 @@ if (columnInfo('users').length > 0 && !columnInfo('users').some((c) => c.name ==
 // 会话表通过显式外键引用 users 表名（重建期间关外键）。
 {
   const usersCheckSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'").get()?.sql || '';
-  if (usersCheckSql && (!usersCheckSql.includes('processor') || !usersCheckSql.includes('supervisor'))) {
+  if (usersCheckSql && (!usersCheckSql.includes('processor') || !usersCheckSql.includes('supervisor') || !usersCheckSql.includes('pickup'))) {
     db.pragma('foreign_keys = OFF');
     db.pragma('legacy_alter_table = ON');
     db.exec('ALTER TABLE users RENAME TO users_old;');
@@ -1501,7 +1631,7 @@ if (columnInfo('users').length > 0 && !columnInfo('users').some((c) => c.name ==
         username TEXT NOT NULL UNIQUE,
         display_name TEXT NOT NULL,
         role TEXT NOT NULL DEFAULT 'handler'
-          CHECK (role IN ('handler', 'auditor', 'processor', 'supervisor')),
+          CHECK (role IN ('handler', 'auditor', 'processor', 'supervisor', 'pickup')),
         password_salt TEXT NOT NULL,
         password_hash TEXT NOT NULL,
         created_at INTEGER NOT NULL
@@ -1738,8 +1868,10 @@ seedUser('auditor2', '审计员二号（角色：auditor，未授权对照）', 
 // 异议处理人账号：受理/补充/驳回/确认撤销办理人发起的回执撤销异议
 seedUser('processor1', '异议处理人一号（角色：processor）', 'processor');
 seedUser('processor2', '异议处理人二号（角色：processor，分配对照）', 'processor');
-// 主管账号：审批处理人提交的一次延期申请（角色：supervisor）
-seedUser('supervisor1', '异议主管一号（角色：supervisor，审批延期）', 'supervisor');
+// 主管账号：维护领取网点/时间段容量、审批处理人提交的一次延期申请（角色：supervisor）
+seedUser('supervisor1', '异议主管一号（角色：supervisor，延期审批/领取网点维护）', 'supervisor');
+// 领取人员账号：在预约时间窗口（含宽限）内凭预约编号+一次性领取码确认线下交付
+seedUser('pickup1', '领取人员一号（角色：pickup，线下交付）', 'pickup');
 
 // 可版本化工作日历：幂等播种 v0（全天兼容日历）+ v1（默认工作日历）并指向 v1
 seedWorkingCalendars();
@@ -2338,6 +2470,8 @@ export function revokeReceipt({ userId, receiptNo, reason }) {
     db.prepare('UPDATE receipts SET status = ?, revoked_at = ?, revoke_reason = ? WHERE id = ?')
       .run('revoked', ts, String(reason || '').slice(0, 200), row.id);
     addEvent(row.workflow_id, 'receipt.revoked', null, { receiptNo: row.receipt_no, reason: String(reason || '').slice(0, 200) });
+    // 撤销联动：未交付预约在同一事务内失效并释放名额；已交付预约保持只读
+    pickupNs.invalidateAppointmentsForReceiptRevokedTx({ receiptNo: row.receipt_no, at: ts });
     return { ok: true, receipt: hydrateReceipt(db.prepare('SELECT * FROM receipts WHERE id = ?').get(row.id)) };
   });
 }
@@ -3024,6 +3158,9 @@ export function getStateForUser(userId) {
   // 归档版本比较报告与受控重放会话（同样惰性访问）
   envelope.archiveComparisons = comparisonNs.listComparisonsForOwner(userId);
   envelope.replaySessions = comparisonNs.listReplaysForOwner(userId);
+  // 线下领取预约：状态、冻结领取信息、可预约时间段（领取码明文不在任何接口返回）
+  envelope.pickupAppointments = pickupNs.listAppointmentsForOwner(userId);
+  envelope.bookableSlots = pickupNs.listBookableSlots({});
   return envelope;
 }
 
@@ -3196,3 +3333,35 @@ export {
   listObjectionMigrations,
   calendarContextForObjection,
 } from './workingCalendarStore.js';
+
+// 回执线下领取预约与一次性交付：统一从 db.js 重导出
+export {
+  PickupDenial,
+  writeAuditTx,
+  createPickupLocation,
+  updatePickupLocation,
+  disablePickupLocation,
+  createPickupSlot,
+  updatePickupSlot,
+  closePickupSlot,
+  bookPickup,
+  reschedulePickup,
+  cancelPickup,
+  confirmPickupDelivery,
+  getDeliveryContextByNo,
+  invalidateAppointmentsForReceiptRevokedTx,
+  sweepExpiredPickups,
+  getSlot,
+  getLocation,
+  listSlotsForLocation,
+  listAllLocations,
+  listBookableSlots,
+  effectiveAppointmentStatus,
+  getOwnerAppointment,
+  getOwnerAppointmentByNo,
+  listAppointmentsForOwner,
+  listAllAppointmentsForAdmin,
+  listAuditForAppointment,
+  listRecentDenials,
+  listPickupAudit,
+} from './pickupStore.js';

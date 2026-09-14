@@ -9,7 +9,8 @@
 - `carol` / `password123`
 - `dave` / `erin`（回执功能测试账号，密码相同）
 - `processor1` / `processor2`（异议处理人角色账号，密码相同；处理撤销异议，只能看到分配给自己的异议与脱敏回执）
-- `supervisor1`（异议主管角色账号，密码相同；查看逾期升级通知留痕、审批一次延期申请）
+- `supervisor1`（异议主管角色账号，密码相同；查看逾期升级通知留痕、审批一次延期申请、维护线下领取网点与时间段容量）
+- `pickup1`（领取人员角色账号，密码相同；仅能在预约时间窗口含宽限内凭预约编号+一次性领取码确认线下交付）
 - `auditor1` / `auditor2`（审计员角色账号，密码相同；`auditor2` 为未授权对照账号，只能看到显式授权的归档脱敏视图；审计员均可只读查看全部撤销异议、通知留痕与延期记录的完整审计记录）
 
 可通过环境变量 `DEMO_PASSWORD` 修改演示密码。生产环境应替换为正式的用户目录、密码轮换和 HTTPS。
@@ -50,6 +51,7 @@ docker compose up -d --build
 - **争议调解包（两层处理）：只能从【已完成】申诉回合的驳回字段生成只读调解包，冻结原批次决议、申诉意见、授权证据与当前更正来源（原批次/申诉历史永不改写）；第一层 2-5 名新调解人独立限时意见，第一层驳回字段达到升级条件后，第二层 3-5 名仲裁人才按冻结快照开放（只能看到第一层允许披露的结论摘要与选中证据）；仲裁接受同时关联调解包、上一层结论与原批次来源进入新的更正办理，同一调解包至多一份进行中更正；取消/超时写拒绝、超时策略只落定一次、服务重启后两层关系与时间线完整（`review.mediation.*` 事件）**
 - **回执撤销异议：异议编号/状态/处理期限、提交时独立冻结的回执快照、文本说明与逐份补充材料、只追加的完整处理历史（操作人/时间/原因/前后状态）、处理人分配与确认撤销后的回执状态全部持久化；刷新、重登、服务重启后异议状态、处理意见与时间线保持一致（`receipt_objections` / `receipt_objection_events` / `receipt_objection_materials`）**
 - **回执核验码密钥 `receipt-secret.key`（核验能力依赖它，务必随数据卷备份）**
+- **线下领取预约：领取网点与时间段/容量/容量版本、预约冻结快照（网点名/地址/时间范围/容量版本）、占用名额账、预约版本、领取码 HMAC 摘要（只存摘要、轮换/消费留痕）、成功与拒绝的只追加审计全部持久化；刷新、重登、重启后一致（`pickup_locations` / `pickup_slots` / `pickup_appointments` / `pickup_codes` / `pickup_audit`）**
 
 默认监听 3000。若由反向代理终止 HTTPS，请设置：
 
@@ -412,6 +414,40 @@ accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ reject
 - **一次性下载凭证**：`POST …/exports/{id}?action=credential` 对已完成任务签发一次性凭证（默认 15 分钟）；免登录兑换 `GET /api/archives/exports/{id}/download?credential=…`（凭证本身即授权），响应带 `X-File-Version` 与 `X-Content-Digest: sha-256=…`。重复使用 `410 EXPORT_CREDENTIAL_USED`；越权归档 `EXPORT_CREDENTIAL_ARCHIVE_MISMATCH`；任务取消 `EXPORT_TASK_CANCELLED`；任务/文件过期被清理 `EXPORT_TASK_EXPIRED`；凭证过期 `EXPORT_CREDENTIAL_EXPIRED`；未完成 `EXPORT_NOT_COMPLETED`。
 - **过期清理**：后台扫描把超过保留期的已完成任务文件内容清空并置 `expired`（任务行与审计事件留档），其活动凭证一并过期；过期凭证与外部核验码同样被置过期。办理页展示归档来源、冻结时间、事件数量、摘要链校验、三种视图权限、导出进度、凭证状态与失败原因。
 
+## 回执线下领取预约与一次性交付
+
+已签发且未撤销回执的办理人可预约到领取网点线下领取，领取人员只能在预约时间窗口（含可配置宽限）内凭“预约编号 + 一次性领取码”确认交付。
+
+### 网点与时间段容量（主管维护）
+
+- 网点有名称/地址/状态（可用/停用）与版本；停用后不能再新建时间段或预约，已有预约的冻结信息不变。
+- 时间段归属于网点，记录开始/结束时间、容量、`capacity_version`、占用名额与开放/关闭状态；同一网点时间段重叠拒绝；关闭后不再接受预约。
+- 容量可随时上调/下调（不得低于当前占用，调整使 `capacity_version` +1）；**已有人预约的时间段时间范围锁定**（返回 `SLOT_TIME_LOCKED`），需要改时间应新建时间段。
+- 主管调整网点名称/地址或容量，**不会改写任何已有预约冻结的信息**；主管页面同时展示每个时间段的占用与最近的预约/交付失败原因。
+
+### 预约、冻结信息与一次性领取码
+
+- 预约在单个 `BEGIN IMMEDIATE` 事务内以条件更新 `UPDATE … SET occupied=occupied+1 WHERE occupied < capacity` 原子扣减名额；两个页面同时抢最后一个名额恰好一个成功，另一个得到明确的 `SLOT_CAPACITY_FULL`（名额已满）。
+- 创建瞬间冻结预约编号 `YY-YYYYMMDD-XXXXXXXX`、网点名称/地址、时间范围、容量版本与宽限；之后主管的任何调整都不影响这些字段。
+- 同一回执至多一条进行中预约（部分唯一索引兜底并发）。
+- 领取码为 10 位（`XXXXX-XXXXX`）随机码，**明文只在预约/改约成功的当次响应出现一次**；服务端只保存按 `(预约编号, 码版本)` 计算的 HMAC 摘要（`pickup_codes`，状态 current/rotated/consumed），任何列表或详情接口都不再返回明文，数据库也不含明文。
+- 改约必须携带当前预约版本号（乐观锁，旧版本返回 `APPOINTMENT_VERSION_CONFLICT`），在同一事务内先原子占用新名额、再释放旧名额，并轮换领取码（旧码状态 `rotated`，立即失效）；交付前可取消并释放名额。
+- 预约状态：`booked`（已预约）/ `rescheduled`（已改约）/ `cancelled`（已取消）/ `delivered`（已交付，只读终态）/ `revoked`（回执撤销失效）/ `expired`（超过结束+宽限未领取）。
+
+### 一次性交付与明确拒绝
+
+- 可领取区间为 `[startAt, endAt + graceMs]`，两端点都包含；交付先判窗口再判码：
+  - 早于开始 → `PICKUP_TOO_EARLY`；晚于结束+宽限 → `PICKUP_TOO_LATE`（即使已被后台扫描落定为 expired 也给同一结果）。
+  - 码不匹配（错码 / 其他预约的码）→ `PICKUP_CODE_INVALID`；命中已轮换的旧码 → `PICKUP_CODE_OLD`；命中已消费码或预约已交付 → `PICKUP_ALREADY_DELIVERED`。
+- 成功交付把当前码标记为 `consumed`、预约置为 `delivered`，任何重放（同人/他人/跨会话）都无法再通过；交付后取消、改约、重复交付一律只读拒绝。
+- 领取人员页面只显示履约所需最小信息（预约编号、冻结的网点/地址/时间窗口、状态、交付时间），不含办理人身份、备注等。
+
+### 撤销联动、过期落定与只追加审计
+
+- 办理人自行撤销回执、或处理人经撤销异议确认撤销时，在**同一事务**内把该回执所有未交付预约置为 `revoked`、释放名额并轮换领取码；已交付预约保持只读，不受影响。
+- 后台每 `PICKUP_SWEEP_MS`（默认 1s，启动时先扫一次）把超过结束+宽限仍未交付的预约落定为 `expired`（过期不退还名额，名额在该时间段已被消耗）；读取路径对尚未落定的到期预约也呈现“已过期”，且不开写事务，避免与并发取消/改约/交付争锁。
+- 所有成功动作与每次明确拒绝都写入只追加表 `pickup_audit`（数据库触发器禁止 UPDATE/DELETE）；办理人可查看本人预约的完整操作历史，主管可查看全局成功/失败留痕。预约、容量占用、码摘要与审计在刷新、重新登录、服务重启后保持一致。
+
 ## 归档版本对比与受控重放审阅（只读报告 + 冻结副本重放）
 
 办理人可为**同一来源**的两个**已冻结归档版本**生成只读比较报告，并从报告获准的事件子集创建**受控重放审阅会话**。两者都严格只读：比较不触碰任一归档，重放不触碰归档、业务记录或导出文件。
@@ -671,6 +707,27 @@ accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ reject
 | POST | `/api/supervisor/calendar-migrations/{id}/apply` | 是（主管） | 按预览版本（回传 digest）确认迁移；冲突整体中止 |
 | GET | `/api/auditor/working-calendars` | 是（审计员） | 全部日历版本（只读） |
 | GET | `/api/auditor/calendar-migrations[?objectionNo=]` | 是（审计员） | 日历迁移留痕（只读） |
+| GET | `/api/pickup/bookable-slots` | 是（办理人） | 可预约的开放时间段与剩余名额（含网点） |
+| GET | `/api/pickup/appointments` | 是（办理人） | 本人全部预约（状态/冻结领取信息）与可预约时间段 |
+| POST | `/api/pickup/appointments` | 是（办理人） | 凭回执编号+时间段原子抢占名额并预约（响应一次性返回领取码明文） |
+| GET | `/api/pickup/appointments/{id}` | 是（办理人） | 预约详情（冻结信息）+ 只追加操作历史 |
+| GET | `/api/pickup/appointments/{id}/history` | 是（办理人） | 该预约的只追加审计事件（含成功与明确拒绝） |
+| POST | `/api/pickup/appointments/{id}/reschedule` | 是（办理人） | 改约（必带 expectedVersion；原子释放旧名额/占用新名额；旧领取码立即失效，返回新领取码一次） |
+| POST | `/api/pickup/appointments/{id}/cancel` | 是（办理人） | 交付前取消并释放名额（已交付只读拒绝） |
+| GET | `/api/pickup-delivery/context?appointmentNo=` | 是（领取人员） | 仅履约所需最小信息（网点/地址/时间窗口/状态，不含办理人身份） |
+| POST | `/api/pickup-delivery/confirm` | 是（领取人员） | 窗口（含宽限）内凭预约编号+一次性领取码确认交付；错码/旧码/跨预约/过早/过期/重复均明确拒绝 |
+| GET | `/api/supervisor/pickup/locations` | 是（主管） | 网点、全部预约占用、最近失败原因 |
+| POST | `/api/supervisor/pickup/locations` | 是（主管） | 新建领取网点 |
+| POST | `/api/supervisor/pickup/locations/{id}` | 是（主管） | 更新网点名称/地址（只影响今后预约） |
+| POST | `/api/supervisor/pickup/locations/{id}/disable` | 是（主管） | 停用网点（不再接受新时间段/预约，已有预约不变） |
+| GET/POST | `/api/supervisor/pickup/locations/{id}/slots` | 是（主管） | 查询/新建时间段（重叠拒绝；容量 ≥1） |
+| POST | `/api/supervisor/pickup/slots/{id}` | 是（主管） | 调整容量/时间（已占用时锁时间；容量不得低于占用；容量变更产生新版本） |
+| POST | `/api/supervisor/pickup/slots/{id}/close` | 是（主管） | 关闭时间段（不再接受预约） |
+| GET | `/api/supervisor/pickup/appointments` | 是（主管） | 全部预约占用与最近拒绝原因 |
+| GET | `/api/supervisor/pickup/audit` | 是（主管） | 领取模块最近审计事件（成功+拒绝） |
+| GET | `/pickups` | 否（办理人登录） | 线下领取预约页面 |
+| GET | `/delivery` | 否（领取人员登录） | 线下交付确认页面 |
+| GET | `/pickup-admin` | 否（主管登录） | 领取网点/时间段容量/预约占用管理页面 |
 | POST | `/api/archives/external-verify` | 否 | 外部一次性核验码核验，仅返回事件数量/时间范围/摘要链连续性/最终状态 |
 | POST | `/api/verify` | 否 | 编号+核验码核验，仅返回脱敏结果，按 IP 限流 |
 | GET | `/api/public/receipts/{no}/print?code=` | 否 | 脱敏可打印回执文档 |
@@ -692,6 +749,10 @@ accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ reject
 - `workflows`：多条记录（`sequence`、`status`、`source_receipt_no`），部分唯一索引保证每人至多一条 `open`、同一回执至多一条进行中的更正
 - `workflow_steps.draft_json / confirmed_json / confirmed_at`：草稿与服务端确认
 - `receipts`：回执编号（唯一）、固定快照、状态（`issued`/`revoked`）、撤销时间与原因
+- `pickup_locations` / `pickup_slots`：领取网点（名称/地址/版本/启停）与可预约时间段（时间范围、容量、`occupied` 占用账、`capacity_version`、开放/关闭、重叠由服务端拒绝）
+- `pickup_appointments`：线下领取预约（编号 `YY-…`、归属回执/办理人、状态机 `booked/rescheduled/cancelled/delivered/revoked/expired`、乐观锁 `version`、领取码版本 `code_seq`、宽限 `grace_ms`、**创建/改约瞬间冻结的网点名/地址/时间范围/容量版本**）；部分唯一索引保证同一回执至多一条进行中预约
+- `pickup_codes`：领取码版本表（复合主键 `(appointment_id, code_seq)`），**只存 HMAC 摘要不存明文**；`current` 当前生效 / `rotated` 改约取消失效的旧码（保留摘要仅为精确区分旧码与错码）/ `consumed` 交付一次性消费
+- `pickup_audit`：领取模块只追加审计（成功与明确拒绝、预约编号/回执/时间段、操作角色、原因、时间）；SQLite 触发器禁止任何 UPDATE/DELETE
 - `receipt_objections`：回执撤销异议（编号 `YY-…`、归属回执/办理/办理人、处理人分配、状态 `submitted/accepted/supplementing/rejected/revoked`、原因、**提交时独立复制的冻结快照**与 SHA-256 摘要、发起时间与处理期限、受理/补充/终局各列）；部分唯一索引保证同一回执至多一条进行中异议
 - `receipt_objection_events`：异议状态变化的只追加历史（顺序号、动作类型、前后状态、操作人/角色、原因/备注、时间），无任何更新/删除路径
 - `receipt_objection_materials`：文本说明与补充材料（每份异议顺序号、文件名、逐字正文、上传人/角色、备注、时间）；列表只下发摘要，正文仅详情接口返回
@@ -779,4 +840,7 @@ SQLite 启用 WAL 和外键；所有推进与回执签发都在同步 `BEGIN IMM
 | `RECEIPT_OBJECTION_SLA_MINUTES` | `3360` | 新异议办理时长（工作分钟，按创建时固定的工作日历版本计算；默认 7 工作日 × 8 小时） |
 | `OBJECTION_EXTENSION_MINUTES` | `1440` | 主管批准一次延期顺延的工作分钟（默认 3 工作日 × 8 小时；`OBJECTION_EXTENSION_MS` 仍用于 v0 全天兼容日历） |
 | `CALENDAR_LEGACY_DEFAULT` | `0` | 置 `1` 时新异议固定全天 24 小时 v0 日历（自然日 TTL，旧语义/测试用） |
+| `PICKUP_CODE_SECRET` | 空 | 线下领取码 HMAC 密钥；空则用数据目录下 0600 权限的 `pickup-code-secret.key`。密钥丢失后历史领取码无法再校验 |
+| `PICKUP_GRACE_MS` | `900000` | 线下领取允许的宽限时间（结束后仍可交付的毫秒数，默认 15 分钟）；区间端点包含 |
+| `PICKUP_SWEEP_MS` | `1000` | 超期未领取预约的后台落定扫描间隔；`NO_PICKUP_SWEEP=1` 只关周期定时器（启动恢复仍落定一次） |
 | `DISPLAY_TIMEZONE` | `Asia/Shanghai` | 回执文档时间展示时区 |

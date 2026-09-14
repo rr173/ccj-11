@@ -32,7 +32,7 @@ function loadSecret() {
   return cachedSecret;
 }
 
-const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+export const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 
 function crockford(buffer) {
   let bits = 0;

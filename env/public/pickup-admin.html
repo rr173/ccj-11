@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>线下领取网点与容量（主管）</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <h1>线下领取网点 · 时间段容量 · 预约占用</h1>
+        <p class="subtitle">主管维护领取网点、未来可预约时间段与每段容量；预约冻结创建时信息，后续调整不改写已有预约</p>
+      </div>
+      <div class="top-actions">
+        <a class="button secondary" href="/supervisor">返回异议主管工作台</a>
+        <span id="userName" class="user-box"></span>
+        <button id="logoutBtn" class="button secondary" type="button">退出</button>
+      </div>
+    </header>
+
+    <section id="loginView" class="card login-card">
+      <h2>主管登录</h2>
+      <p class="muted">演示主管账号：supervisor1，密码：password123</p>
+      <form id="loginForm">
+        <label>用户名<input name="username" autocomplete="username" required></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+        <div id="loginError" class="alert error hidden"></div>
+        <button class="button primary" type="submit">登录</button>
+      </form>
+    </section>
+
+    <section id="appView" class="app hidden" style="grid-template-columns: 1fr;">
+      <div id="globalAlert" class="alert hidden"></div>
+
+      <section class="card">
+        <div class="receipt-head">
+          <h2>领取网点</h2>
+          <div class="filter-bar">
+            <button id="refreshBtn" class="button secondary" type="button">刷新</button>
+            <button id="newLocationBtn" class="button primary" type="button">新建网点</button>
+          </div>
+        </div>
+        <div id="newLocationBox" class="archive-create hidden">
+          <label>名称<input id="locName" maxlength="60" placeholder="例如：市民中心领取处"></label>
+          <label>地址<input id="locAddress" maxlength="120" placeholder="例如：杭州市西湖区文三路 88 号 1 楼"></label>
+          <label>备注（可选）<input id="locNote" maxlength="200"></label>
+          <div class="form-actions">
+            <button id="saveLocationBtn" class="button primary" type="button">保存网点</button>
+            <button id="cancelLocationBtn" class="button secondary" type="button">取消</button>
+          </div>
+        </div>
+        <div id="locationList" class="archive-list"></div>
+      </section>
+
+      <section class="card">
+        <div class="receipt-head">
+          <h2>全部预约占用</h2>
+          <div class="filter-bar">
+            <select id="statusFilter">
+              <option value="">全部状态</option>
+              <option value="booked">已预约</option>
+              <option value="rescheduled">已改约</option>
+              <option value="delivered">已交付</option>
+              <option value="cancelled">已取消</option>
+              <option value="revoked">撤销失效</option>
+              <option value="expired">已过期</option>
+            </select>
+          </div>
+        </div>
+        <div id="appointmentList" class="archive-list"></div>
+      </section>
+
+      <section class="card">
+        <h2>最近失败/拒绝原因（只追加审计）</h2>
+        <div id="denialList" class="archive-list"></div>
+      </section>
+    </section>
+  </main>
+  <script type="module" src="/pickup-admin.js"></script>
+</body>
+</html>

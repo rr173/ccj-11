@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>线下交付确认（领取人员）</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell narrow-shell">
+    <header class="topbar">
+      <div>
+        <h1>回执线下交付确认</h1>
+        <p class="subtitle">只能在预约时间窗口（含宽限）内，凭预约编号与一次性领取码确认交付</p>
+      </div>
+      <div class="top-actions">
+        <span id="userName" class="user-box"></span>
+        <button id="logoutBtn" class="button secondary" type="button">退出</button>
+      </div>
+    </header>
+
+    <section id="loginView" class="card login-card">
+      <h2>领取人员登录</h2>
+      <p class="muted">演示账号：pickup1，密码：password123</p>
+      <form id="loginForm">
+        <label>用户名<input name="username" autocomplete="username" required></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+        <div id="loginError" class="alert error hidden"></div>
+        <button class="button primary" type="submit">登录</button>
+      </form>
+    </section>
+
+    <section id="appView" class="app hidden" style="grid-template-columns: 1fr;">
+      <div id="globalAlert" class="alert hidden"></div>
+
+      <section class="card">
+        <h2>查询预约（只显示履约最小信息）</h2>
+        <form id="lookupForm" class="archive-create">
+          <label>预约编号
+            <input name="appointmentNo" placeholder="YY-YYYYMMDD-XXXXXXXX" required>
+          </label>
+          <div class="form-actions">
+            <button class="button secondary" type="submit">查询预约窗口</button>
+          </div>
+        </form>
+        <div id="contextBox" class="confirmation hidden"></div>
+      </section>
+
+      <section class="card">
+        <h2>确认一次性交付</h2>
+        <form id="confirmForm" class="archive-create">
+          <label>预约编号
+            <input name="appointmentNo" placeholder="YY-YYYYMMDD-XXXXXXXX" required>
+          </label>
+          <label>领取码
+            <input name="code" placeholder="XXXXX-XXXXX" autocomplete="off" required>
+          </label>
+          <label>交付备注（可选）
+            <input name="note" maxlength="200">
+          </label>
+          <div class="form-actions">
+            <button class="button primary" type="submit">确认交付（领取码一次性消费）</button>
+          </div>
+        </form>
+        <p class="muted small">领取码错误、过早、过期、跨预约使用或重复使用都会被明确拒绝；页面不显示办理人身份等与交付无关的信息。</p>
+      </section>
+    </section>
+  </main>
+  <script type="module" src="/delivery.js"></script>
+</body>
+</html>

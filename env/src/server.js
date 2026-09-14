@@ -154,6 +154,31 @@ import {
   getMigrationPreview,
   listMigrationPreviews,
   listAllCalendarMigrationsForAuditor,
+  // 回执线下领取预约与一次性交付
+  createPickupLocation,
+  updatePickupLocation,
+  disablePickupLocation,
+  createPickupSlot,
+  updatePickupSlot,
+  closePickupSlot,
+  bookPickup,
+  reschedulePickup,
+  cancelPickup,
+  confirmPickupDelivery,
+  getDeliveryContextByNo,
+  sweepExpiredPickups,
+  getSlot,
+  getLocation,
+  listSlotsForLocation,
+  listAllLocations,
+  listBookableSlots,
+  getOwnerAppointment,
+  getOwnerAppointmentByNo,
+  listAppointmentsForOwner,
+  listAllAppointmentsForAdmin,
+  listAuditForAppointment,
+  listRecentDenials,
+  listPickupAudit,
 } from './db.js';
 import {
   parseComparisonCreateInput,
@@ -211,6 +236,19 @@ import {
   ARCHIVE_SOURCE_LABELS,
   isValidArchiveSourceType,
 } from './archives.js';
+import {
+  APPOINTMENT_NO_PATTERN,
+  PICKUP_ERRORS,
+  formatAppointmentNoInput,
+  parseBookingInput,
+  parseCancelInput,
+  parseConfirmDeliveryInput,
+  parseLocationInput,
+  parseRescheduleInput,
+  parseSlotInput,
+  parseSlotUpdateInput,
+} from './pickup.js';
+import { setClock, resetClock } from './clock.js';
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -258,6 +296,18 @@ const server = createServer(async (req, res) => {
     // 异议主管工作台（supervisor 角色：逾期升级记录与延期审批）
     if (url.pathname === '/supervisor' && req.method === 'GET') {
       return serveStaticFile(req, res, '/supervisor.html');
+    }
+    // 线下领取预约管理（supervisor 角色：领取网点、时间段容量、预约占用与失败原因）
+    if (url.pathname === '/pickup-admin' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/pickup-admin.html');
+    }
+    // 办理人：回执线下领取预约（预约/领取码只展示一次/改约/取消/操作历史）
+    if (url.pathname === '/pickups' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/pickups.html');
+    }
+    // 领取人员：凭预约编号 + 一次性领取码在窗口内确认交付
+    if (url.pathname === '/delivery' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/delivery.html');
     }
     if (url.pathname === '/api/archives/external-verify' && req.method === 'POST') {
       return archiveExternalVerify(req, res);
@@ -370,14 +420,28 @@ async function handleApi(req, res, url) {
   const user = userQueries.findById(session.user_id);
   if (!user) return sendJson(res, 401, { error: { code: 'UNAUTHENTICATED' } });
 
+  // 受控时钟：仅非生产环境（测试）可用，用于确定性验证领取时间窗口边界
+  if (!config.isProduction && url.pathname === '/api/test/clock' && req.method === 'POST') {
+    return testSetClock(req, res);
+  }
+  if (!config.isProduction && url.pathname === '/api/test/clock/reset' && req.method === 'POST') {
+    resetClock();
+    return sendJson(res, 200, { ok: true });
+  }
+
   // 异议处理人角色：只能访问被分配异议的处理工作台，不能触发任何办理/回执接口
   if (user.role === 'processor') {
     return handleProcessorApi(req, res, user, url);
   }
 
-  // 异议主管角色：只能查看逾期升级/提醒通知留痕并审批一次延期，无业务写权限
+  // 异议主管角色：逾期升级/提醒通知、延期审批，以及线下领取网点/时间段维护
   if (user.role === 'supervisor') {
     return handleSupervisorApi(req, res, user, url);
+  }
+
+  // 领取人员角色：只能在预约时间窗口（含宽限）内凭预约编号+领取码确认交付
+  if (user.role === 'pickup') {
+    return handlePickupStaffApi(req, res, user, url);
   }
 
   // 审计员角色：归档脱敏视图 + 撤销异议完整审计记录，不能触发办理/回执等业务接口
@@ -774,6 +838,44 @@ async function handleApi(req, res, url) {
     return replayControlRoute(req, res, user, replayControlMatch[1], replayControlMatch[2]);
   }
 
+  // 回执线下领取预约（办理人）
+  if (url.pathname === '/api/pickup/bookable-slots' && req.method === 'GET') {
+    return sendJson(res, 200, { slots: listBookableSlots({}) });
+  }
+  if (url.pathname === '/api/pickup/appointments' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      appointments: listAppointmentsForOwner(user.id),
+      slots: listBookableSlots({}),
+    });
+  }
+  if (url.pathname === '/api/pickup/appointments' && req.method === 'POST') {
+    return bookAppointmentRoute(req, res, user, session);
+  }
+  const pickupApptMatch = /^\/api\/pickup\/appointments\/([^/]+)$/.exec(url.pathname);
+  if (pickupApptMatch && req.method === 'GET') {
+    const appt = getOwnerAppointment(decodeURIComponent(pickupApptMatch[1]), user.id);
+    if (!appt) {
+      return sendJson(res, 404, { error: { code: 'APPOINTMENT_NOT_FOUND', message: PICKUP_ERRORS.APPOINTMENT_NOT_FOUND } });
+    }
+    return sendJson(res, 200, { appointment: appt, history: listAuditForAppointment(appt.appointmentNo) });
+  }
+  const pickupHistoryMatch = /^\/api\/pickup\/appointments\/([^/]+)\/history$/.exec(url.pathname);
+  if (pickupHistoryMatch && req.method === 'GET') {
+    const appt = getOwnerAppointment(decodeURIComponent(pickupHistoryMatch[1]), user.id);
+    if (!appt) {
+      return sendJson(res, 404, { error: { code: 'APPOINTMENT_NOT_FOUND', message: PICKUP_ERRORS.APPOINTMENT_NOT_FOUND } });
+    }
+    return sendJson(res, 200, { history: listAuditForAppointment(appt.appointmentNo) });
+  }
+  const pickupRescheduleMatch = /^\/api\/pickup\/appointments\/([^/]+)\/reschedule$/.exec(url.pathname);
+  if (pickupRescheduleMatch && req.method === 'POST') {
+    return rescheduleAppointmentRoute(req, res, user, session, pickupRescheduleMatch[1]);
+  }
+  const pickupCancelMatch = /^\/api\/pickup\/appointments\/([^/]+)\/cancel$/.exec(url.pathname);
+  if (pickupCancelMatch && req.method === 'POST') {
+    return cancelAppointmentRoute(req, res, user, pickupCancelMatch[1]);
+  }
+
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
 }
 
@@ -946,7 +1048,201 @@ function handleSupervisorApi(req, res, user, url) {
   if (extensionMatch && req.method === 'POST') {
     return supervisorDecideExtension(req, res, user, extensionMatch[1], extensionMatch[2]);
   }
+
+  // -------------------------------------------------------------------------
+  // 线下领取预约管理（同一 supervisor 角色）：网点 / 时间段容量 / 预约占用 / 失败原因
+  // -------------------------------------------------------------------------
+  if (url.pathname === '/api/supervisor/pickup/locations' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      locations: listAllLocations(),
+      appointments: listAllAppointmentsForAdmin(),
+      denials: listRecentDenials(),
+    });
+  }
+  if (url.pathname === '/api/supervisor/pickup/locations' && req.method === 'POST') {
+    return createPickupLocationRoute(req, res, user);
+  }
+  const adminLocationMatch = /^\/api\/supervisor\/pickup\/locations\/([^/]+)$/.exec(url.pathname);
+  if (adminLocationMatch && req.method === 'POST') {
+    return updatePickupLocationRoute(req, res, user, adminLocationMatch[1]);
+  }
+  const adminLocationDisableMatch = /^\/api\/supervisor\/pickup\/locations\/([^/]+)\/disable$/.exec(url.pathname);
+  if (adminLocationDisableMatch && req.method === 'POST') {
+    return disablePickupLocationRoute(req, res, user, adminLocationDisableMatch[1]);
+  }
+  const adminSlotsMatch = /^\/api\/supervisor\/pickup\/locations\/([^/]+)\/slots$/.exec(url.pathname);
+  if (adminSlotsMatch && req.method === 'GET') {
+    const location = getLocation(decodeURIComponent(adminSlotsMatch[1]));
+    if (!location) return sendJson(res, 404, { error: { code: 'LOCATION_NOT_FOUND', message: PICKUP_ERRORS.LOCATION_NOT_FOUND } });
+    return sendJson(res, 200, { location, slots: listSlotsForLocation(location.id) });
+  }
+  if (adminSlotsMatch && req.method === 'POST') {
+    return createPickupSlotRoute(req, res, user, adminSlotsMatch[1]);
+  }
+  const adminSlotMatch = /^\/api\/supervisor\/pickup\/slots\/([^/]+)$/.exec(url.pathname);
+  if (adminSlotMatch && req.method === 'POST') {
+    return updatePickupSlotRoute(req, res, user, adminSlotMatch[1]);
+  }
+  const adminSlotCloseMatch = /^\/api\/supervisor\/pickup\/slots\/([^/]+)\/close$/.exec(url.pathname);
+  if (adminSlotCloseMatch && req.method === 'POST') {
+    return closePickupSlotRoute(req, res, user, adminSlotCloseMatch[1]);
+  }
+  if (url.pathname === '/api/supervisor/pickup/appointments' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      appointments: listAllAppointmentsForAdmin(),
+      denials: listRecentDenials(),
+      locations: listAllLocations(),
+    });
+  }
+  if (url.pathname === '/api/supervisor/pickup/audit' && req.method === 'GET') {
+    return sendJson(res, 200, { audit: listPickupAudit() });
+  }
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
+}
+
+// ---------------------------------------------------------------------------
+// 主管：领取网点 / 时间段维护路由
+// ---------------------------------------------------------------------------
+function idFromRaw(raw) {
+  return decodeURIComponent(raw);
+}
+
+function validId(raw) {
+  const id = idFromRaw(raw);
+  return /^[A-Za-z0-9_-]{8,200}$/.test(id) ? id : null;
+}
+
+async function createPickupLocationRoute(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseLocationInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = createPickupLocation({
+    user,
+    name: parsed.value.name,
+    address: parsed.value.address,
+    note: parsed.value.note,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, { error: { code: result.code, message: result.message || '创建网点失败' } });
+  }
+  return sendJson(res, 200, { ok: true, location: result.location, locations: listAllLocations() });
+}
+
+async function updatePickupLocationRoute(req, res, user, rawId) {
+  const locationId = validId(rawId);
+  if (!locationId) return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '网点标识不正确' } });
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseLocationInput(body, { partial: true });
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = updatePickupLocation({
+    user, locationId,
+    name: parsed.value.name,
+    address: parsed.value.address,
+    note: parsed.value.note,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, { error: { code: result.code, message: result.message || '更新网点失败' } });
+  }
+  return sendJson(res, 200, { ok: true, location: result.location, locations: listAllLocations() });
+}
+
+async function disablePickupLocationRoute(req, res, user, rawId) {
+  const locationId = validId(rawId);
+  if (!locationId) return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '网点标识不正确' } });
+  const result = disablePickupLocation({ user, locationId });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, { error: { code: result.code, message: result.message || '停用网点失败' } });
+  }
+  return sendJson(res, 200, { ok: true, location: result.location, locations: listAllLocations() });
+}
+
+async function createPickupSlotRoute(req, res, user, rawLocationId) {
+  const locationId = validId(rawLocationId);
+  if (!locationId) return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '网点标识不正确' } });
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseSlotInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = createPickupSlot({ user, locationId, ...parsed.value });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, { error: { code: result.code, message: result.message || '创建时间段失败' } });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    slot: result.slot,
+    location: getLocation(locationId),
+    slots: listSlotsForLocation(locationId),
+    locations: listAllLocations(),
+  });
+}
+
+async function updatePickupSlotRoute(req, res, user, rawSlotId) {
+  const slotId = validId(rawSlotId);
+  if (!slotId) return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '时间段标识不正确' } });
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseSlotUpdateInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = updatePickupSlot({ user, slotId, ...parsed.value });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, { error: { code: result.code, message: result.message || '调整时间段失败' } });
+  }
+  return sendJson(res, 200, { ok: true, slot: result.slot, locations: listAllLocations() });
+}
+
+async function closePickupSlotRoute(req, res, user, rawSlotId) {
+  const slotId = validId(rawSlotId);
+  if (!slotId) return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '时间段标识不正确' } });
+  const result = closePickupSlot({ user, slotId });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, { error: { code: result.code, message: result.message || '关闭时间段失败' } });
+  }
+  return sendJson(res, 200, { ok: true, slot: result.slot, locations: listAllLocations() });
+}
+
+// ---------------------------------------------------------------------------
+// 领取人员侧：凭预约编号 + 一次性领取码确认交付
+// ---------------------------------------------------------------------------
+function handlePickupStaffApi(req, res, user, url) {
+  if (url.pathname === '/api/state' && req.method === 'GET') {
+    return sendJson(res, 200, { user: safeUser(user) });
+  }
+  if (url.pathname === '/api/pickup-delivery/context' && req.method === 'GET') {
+    const rawNo = String(url.searchParams.get('appointmentNo') || '');
+    const appointmentNo = formatAppointmentNoInput(rawNo);
+    if (!APPOINTMENT_NO_PATTERN.test(appointmentNo)) {
+      return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '预约编号格式不正确' } });
+    }
+    const result = getDeliveryContextByNo({ user, appointmentNo });
+    if (!result.ok) return sendJson(res, result.status, { error: { code: result.code, message: result.message } });
+    return sendJson(res, 200, { context: result.context });
+  }
+  if (url.pathname === '/api/pickup-delivery/confirm' && req.method === 'POST') {
+    return confirmDeliveryRoute(req, res, user);
+  }
+  return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
+}
+
+async function confirmDeliveryRoute(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseConfirmDeliveryInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = confirmPickupDelivery({
+    user,
+    appointmentNo: parsed.value.appointmentNo,
+    rawCode: parsed.value.code,
+    note: parsed.value.note,
+  });
+  if (!result.ok) {
+    // 错误码错误 / 过早 / 过期 / 跨预约 / 重复使用都给出明确中文结果
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || PICKUP_ERRORS[result.code] || '交付被拒绝' },
+    });
+  }
+  return sendJson(res, 200, { ok: true, delivery: result.delivery });
 }
 
 async function supervisorDecideExtension(req, res, user, rawExtensionId, decision) {
@@ -1195,8 +1491,10 @@ async function login(req, res) {
   }
   const session = createSession(user.id);
   setSessionCookies(res, session);
-  // 审计员/处理人不触发办理工作流创建，登录响应只携带身份与 CSRF
-  const extra = (user.role === 'auditor' || user.role === 'processor') ? {} : getStateForUser(user.id);
+  // 审计员/处理人/领取人员不触发办理工作流创建，登录响应只携带身份与 CSRF
+  const extra = ['auditor', 'processor', 'pickup', 'supervisor'].includes(user.role)
+    ? {}
+    : getStateForUser(user.id);
   return sendJson(res, 200, {
     user: safeUser(user),
     csrfToken: session.csrf,
@@ -2440,9 +2738,105 @@ async function replayControlRoute(req, res, user, rawReplayId, action) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// 回执线下领取预约：办理人侧（预约 / 改约 / 取消）
+// ---------------------------------------------------------------------------
+
+async function bookAppointmentRoute(req, res, user, session) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const receiptNo = formatReceiptNoInput(String(body.receiptNo || ''));
+  if (!RECEIPT_NO_PATTERN.test(receiptNo)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_RECEIPT_NO', message: '回执编号格式不正确' } });
+  }
+  const parsed = parseBookingInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = bookPickup({
+    user,
+    sessionId: session.id,
+    receiptNo,
+    slotId: parsed.value.slotId,
+    note: parsed.value.note,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '预约失败' },
+      slots: listBookableSlots({}),
+    });
+  }
+  // 领取码明文仅此一次返回；任何列表/详情接口都不再返回
+  return sendJson(res, 200, {
+    ok: true,
+    appointment: result.appointment,
+    pickupCode: result.pickupCode,
+    codeShownOnce: true,
+    appointments: listAppointmentsForOwner(user.id),
+    slots: listBookableSlots({}),
+  });
+}
+
+async function rescheduleAppointmentRoute(req, res, user, session, rawAppointmentId) {
+  const appointmentId = decodeURIComponent(rawAppointmentId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(appointmentId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '预约标识不正确' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseRescheduleInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = reschedulePickup({
+    user,
+    sessionId: session.id,
+    appointmentId,
+    expectedVersion: parsed.value.expectedVersion,
+    slotId: parsed.value.slotId,
+    note: parsed.value.note,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '改约失败' },
+      slots: listBookableSlots({}),
+    });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    appointment: result.appointment,
+    pickupCode: result.pickupCode,
+    codeShownOnce: true,
+    appointments: listAppointmentsForOwner(user.id),
+    slots: listBookableSlots({}),
+  });
+}
+
+async function cancelAppointmentRoute(req, res, user, rawAppointmentId) {
+  const appointmentId = decodeURIComponent(rawAppointmentId);
+  if (!/^[A-Za-z0-9_-]{8,200}$/.test(appointmentId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '预约标识不正确' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const parsed = parseCancelInput(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+  const result = cancelPickup({
+    user,
+    appointmentId,
+    reason: parsed.value.reason,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '取消失败' },
+    });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    appointment: result.appointment,
+    appointments: listAppointmentsForOwner(user.id),
+    slots: listBookableSlots({}),
+  });
+}
+
 // 免登录外部核验：一次性核验码，只返回事件数量/时间范围/摘要链连续性/最终状态
-async function archiveExternalVerify(req, res) {
-  const clientIp = req.socket.remoteAddress || 'unknown';
+async function archiveExternalVerify(req, res) {  const clientIp = req.socket.remoteAddress || 'unknown';
   const limitKey = `archive-external-verify:${clientIp}`;
   const rate = { windowMs: config.verifyRateWindowMs, max: config.verifyRateMax };
   const preview = peekRateLimit(limitKey, rate);
@@ -2746,6 +3140,8 @@ function stopArchiveSweep() {
   archiveSweepTimer = null;
 }
 function startBatchTimeoutSweep() {
+  // 线下领取预约过期落定独立注册：即使关闭批次扫描（测试环境），启动恢复仍执行一次
+  startPickupSweep();
   if (batchSweepTimer || process.env.NO_BATCH_SWEEP === '1') {
     // 即使关闭批次扫描（如测试环境），异议调度仍需独立注册与启动恢复
     startObjectionSweep();
@@ -2774,6 +3170,23 @@ function startBatchTimeoutSweep() {
   }, config.archiveSweepMs);
   archiveSweepTimer.unref?.();
   startObjectionSweep();
+}
+
+// 线下领取预约过期落定：独立于批次/归档扫描注册，重复调用幂等。
+// 启动先扫一次（重启期间超过 endAt+grace 的预约补落为 expired）；
+// NO_PICKUP_SWEEP=1 只关周期定时器，不影响启动恢复。
+let pickupSweepTimer = null;
+function startPickupSweep() {
+  try { sweepExpiredPickups(); } catch (error) {
+    console.error('pickup expiry startup sweep failed', error);
+  }
+  if (pickupSweepTimer || process.env.NO_PICKUP_SWEEP === '1') return;
+  pickupSweepTimer = setInterval(() => {
+    try { sweepExpiredPickups(); } catch (error) {
+      console.error('pickup expiry sweep failed', error);
+    }
+  }, config.pickupSweepMs);
+  pickupSweepTimer.unref?.();
 }
 
 // 异议提醒/逾期升级/待发送通知：独立于批次扫描注册，重复调用幂等。
@@ -3174,6 +3587,19 @@ async function servePublicReceiptDoc(req, res, url, rawReceiptNo) {
   const receipt = ownerReceipt(row, snapshotOfReceiptRow(row));
   const html = renderReceiptDocument(receipt, { publicView: true });
   return sendReceiptDocument(res, 200, html, receipt.receiptNo);
+}
+
+async function testSetClock(req, res) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const at = Number(body.at);
+  if (!Number.isFinite(at) || at <= 0) {
+    return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: 'at 必须是正数毫秒时间戳' } });
+  }
+  setClock(at);
+  // 立即把当前时钟下已到期的预约落定一次，保证断言可重复
+  sweepExpiredPickups({ at });
+  return sendJson(res, 200, { ok: true, at });
 }
 
 function integer(value) {

@@ -30,6 +30,8 @@ import {
   pauseObjectionClockTx,
   resumeObjectionClockTx,
 } from './workingCalendarStore.js';
+// 撤销确认联动：未交付的线下领取预约在同一事务内失效并释放名额
+import * as pickupNs from './pickupStore.js';
 
 function now() {
   return Date.now();
@@ -310,6 +312,8 @@ function transitionObjection({
           reason: revokeReason,
           viaObjectionNo: objection.objection_no,
         }), ts);
+        // 撤销联动：未交付预约失效并释放名额，已交付保持只读
+        pickupNs.invalidateAppointmentsForReceiptRevokedTx({ receiptNo: receipt.receipt_no, at: ts });
       }
     }
 

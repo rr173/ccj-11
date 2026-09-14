@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>回执线下领取预约（办理人）</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell narrow-shell">
+    <header class="topbar">
+      <div>
+        <h1>回执线下领取预约</h1>
+        <p class="subtitle">预约成功后的领取码只展示一次，请妥善记录；名额原子扣减，抢约结果以服务端为准</p>
+      </div>
+      <div class="top-actions">
+        <span id="userName" class="user-box"></span>
+        <button id="logoutBtn" class="button secondary" type="button">退出</button>
+      </div>
+    </header>
+
+    <section id="loginView" class="card login-card">
+      <h2>办理人登录</h2>
+      <p class="muted">演示账号：alice / bob / carol / dave / erin，密码：password123</p>
+      <form id="loginForm">
+        <label>用户名<input name="username" autocomplete="username" required></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+        <div id="loginError" class="alert error hidden"></div>
+        <button class="button primary" type="submit">登录</button>
+      </form>
+    </section>
+
+    <section id="appView" class="app hidden" style="grid-template-columns: 1fr;">
+      <div id="globalAlert" class="alert hidden"></div>
+
+      <section class="card">
+        <div class="receipt-head">
+          <h2>新建预约</h2>
+          <button id="refreshBtn" class="button secondary" type="button">刷新</button>
+        </div>
+        <form id="bookForm" class="archive-create">
+          <label>回执编号（已签发且未撤销）
+            <input name="receiptNo" placeholder="HZ-YYYYMMDD-XXXXXXXX" required>
+          </label>
+          <label>领取网点与时间段
+            <select name="slotId" required></select>
+          </label>
+          <label>备注（可选）
+            <input name="note" maxlength="200" placeholder="例如：本人到场，携带证件原件">
+          </label>
+          <div class="form-actions">
+            <button class="button primary" type="submit">原子抢占名额并预约</button>
+          </div>
+        </form>
+        <p class="muted small">每个时间段显示剩余名额；两个页面同时抢最后一个名额时只有一个成功，另一个会收到明确的“名额已满”结果。</p>
+      </section>
+
+      <section class="card">
+        <h2>我的预约</h2>
+        <div id="appointmentList" class="archive-list"></div>
+      </section>
+    </section>
+  </main>
+
+  <template id="codeOnceTemplate">
+    <div class="alert success">
+      <strong>领取码只显示这一次，请立即抄写或截图保存：</strong>
+      <div class="confirmation"><pre class="mono code-value selectable"></pre></div>
+      <span class="muted small">服务端只保存可校验摘要，列表与任何接口都不会再次返回明文。领取时在领取人员页面输入预约编号与该领取码。</span>
+    </div>
+  </template>
+
+  <script type="module" src="/pickups.js"></script>
+</body>
+</html>

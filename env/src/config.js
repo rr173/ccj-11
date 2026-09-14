@@ -60,6 +60,17 @@ export const config = {
   objectionExtensionMs: Number(process.env.OBJECTION_EXTENSION_MS || 3 * 24 * 60 * 60 * 1000),
   // 后台扫描间隔（生成提醒/逾期升级、发送待发送通知；NO_OBJECTION_SWEEP=1 可关闭定时器）
   objectionSweepMs: Number(process.env.OBJECTION_SWEEP_MS || 1000),
+  // ---------------------------------------------------------------------------
+  // 回执线下领取预约与一次性交付
+  // ---------------------------------------------------------------------------
+  // 领取码 HMAC 密钥：优先环境变量，否则在数据目录生成 0600 权限密钥文件
+  pickupCodeSecret: process.env.PICKUP_CODE_SECRET || '',
+  pickupCodeSecretPath: process.env.PICKUP_CODE_SECRET_PATH
+    || path.join(path.dirname(dbPath), 'pickup-code-secret.key'),
+  // 允许的交付宽限时间：预约结束后该毫秒数内仍可确认交付（默认 15 分钟）
+  pickupGraceMs: Number(process.env.PICKUP_GRACE_MS || 15 * 60 * 1000),
+  // 超期未领取预约的落定扫描间隔（NO_PICKUP_SWEEP=1 关闭）
+  pickupSweepMs: Number(process.env.PICKUP_SWEEP_MS || 1000),
 };
 
 config.isProduction = config.nodeEnv === 'production';
