@@ -145,6 +145,15 @@ import {
   listAllNotificationsForAuditor,
   listAllExtensionsForAuditor,
   escalationSummaryForObjection,
+  publishCalendarVersion,
+  getCurrentCalendarVersion,
+  listCalendarVersions,
+  getCalendarVersionById,
+  previewObjectionCalendarMigration,
+  confirmObjectionCalendarMigration,
+  getMigrationPreview,
+  listMigrationPreviews,
+  listAllCalendarMigrationsForAuditor,
 } from './db.js';
 import {
   parseComparisonCreateInput,
@@ -898,6 +907,41 @@ function handleSupervisorApi(req, res, user, url) {
     const status = url.searchParams.get('status') || '';
     return sendJson(res, 200, { extensions: listExtensionsForSupervisor({ status }) });
   }
+  // 可版本化工作日历（主管维护）：版本清单 / 当前生效版本
+  if (url.pathname === '/api/supervisor/working-calendars' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      versions: listCalendarVersions(),
+      current: getCurrentCalendarVersion(),
+    });
+  }
+  const calendarGetMatch = /^\/api\/supervisor\/working-calendars\/([^/]+)$/.exec(url.pathname);
+  if (calendarGetMatch && req.method === 'GET') {
+    const calendar = getCalendarVersionById(decodeURIComponent(calendarGetMatch[1]));
+    if (!calendar) return sendJson(res, 404, { error: { code: 'CALENDAR_VERSION_NOT_FOUND', message: '日历版本不存在' } });
+    return sendJson(res, 200, { calendar });
+  }
+  // 发布新版本（只追加；发布即成为当前生效版本，不影响任何在办异议）
+  if (url.pathname === '/api/supervisor/working-calendars' && req.method === 'POST') {
+    return publishCalendarRoute(req, res, user);
+  }
+  // 迁移预览（可选 targetVersionId；默认当前生效版本）
+  if (url.pathname === '/api/supervisor/calendar-migrations/preview' && req.method === 'POST') {
+    return createCalendarPreviewRoute(req, res, user);
+  }
+  if (url.pathname === '/api/supervisor/calendar-migrations' && req.method === 'GET') {
+    return sendJson(res, 200, { previews: listMigrationPreviews() });
+  }
+  const previewGetMatch = /^\/api\/supervisor\/calendar-migrations\/([^/]+)$/.exec(url.pathname);
+  if (previewGetMatch && req.method === 'GET') {
+    const preview = getMigrationPreview(decodeURIComponent(previewGetMatch[1]));
+    if (!preview) return sendJson(res, 404, { error: { code: 'MIGRATION_PREVIEW_NOT_FOUND', message: '迁移预览不存在' } });
+    return sendJson(res, 200, { preview });
+  }
+  // 按预览版本确认迁移（必须回传预览 digest；逾期/终结异议不会迁移）
+  const previewApplyMatch = /^\/api\/supervisor\/calendar-migrations\/([^/]+)\/apply$/.exec(url.pathname);
+  if (previewApplyMatch && req.method === 'POST') {
+    return applyCalendarPreviewRoute(req, res, user, previewApplyMatch[1]);
+  }
   const extensionMatch = /^\/api\/supervisor\/extensions\/([^/]+)\/(approve|reject)$/.exec(url.pathname);
   if (extensionMatch && req.method === 'POST') {
     return supervisorDecideExtension(req, res, user, extensionMatch[1], extensionMatch[2]);
@@ -931,6 +975,75 @@ async function supervisorDecideExtension(req, res, user, rawExtensionId, decisio
     extension: getExtensionForSupervisor(extensionId),
     newDeadlineAt: result.newDeadlineAt,
     pendingExtensions: listPendingExtensionsForSupervisor(),
+  });
+}
+
+// 发布工作日历新版本：校验由 store 内 parseCalendarConfig 完成，错误码透传
+async function publishCalendarRoute(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const result = publishCalendarVersion({
+    userId: user.id,
+    config: body.config || body,
+    note: String(body.note || '').trim(),
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 400, { error: { code: result.code, message: result.message } });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    calendar: result.calendar,
+    versions: listCalendarVersions(),
+    current: getCurrentCalendarVersion(),
+  });
+}
+
+// 生成迁移预览：只受影响的在办异议入清单，逾期/终态明确排除并说明
+async function createCalendarPreviewRoute(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const targetVersionId = String(body.targetVersionId || body.targetCalendarVersionId || '').trim();
+  const result = previewObjectionCalendarMigration({
+    userId: user.id,
+    targetVersionId: targetVersionId || null,
+    note: String(body.note || '').trim(),
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '预览失败' },
+    });
+  }
+  return sendJson(res, 200, { ok: true, preview: result.preview });
+}
+
+// 按预览版本确认迁移：digest 不匹配 / 预览后清单变化 → 409，要求重新预览
+async function applyCalendarPreviewRoute(req, res, user, rawPreviewId) {
+  const previewId = decodeURIComponent(rawPreviewId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(previewId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_PREVIEW_ID', message: '预览标识不正确' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const digest = String(body.digest || '').trim();
+  if (!digest) {
+    return sendJson(res, 400, { error: { code: 'DIGEST_REQUIRED', message: '确认迁移必须回传预览摘要' } });
+  }
+  const result = confirmObjectionCalendarMigration({ userId: user.id, previewId, digest });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: {
+        code: result.code,
+        message: result.message || '迁移失败',
+      },
+      conflicts: result.conflicts || null,
+    });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    migratedCount: result.migratedCount,
+    migrated: result.migrated,
+    preview: result.preview,
+    previews: listMigrationPreviews(),
   });
 }
 
@@ -1018,6 +1131,24 @@ function handleAuditorArchiveApi(req, res, user, url) {
     return sendJson(res, 200, {
       extensions: listAllExtensionsForAuditor({ status: url.searchParams.get('status') || '' }),
     });
+  }
+  // 可版本化工作日历：审计员可查看全部已发布版本（只读）
+  if (url.pathname === '/api/auditor/working-calendars' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      versions: listCalendarVersions(),
+      current: getCurrentCalendarVersion(),
+    });
+  }
+  // 日历迁移留痕（可按异议编号过滤；只读）
+  if (url.pathname === '/api/auditor/calendar-migrations' && req.method === 'GET') {
+    const objectionNo = url.searchParams.get('objectionNo') || '';
+    let objectionId = null;
+    if (objectionNo) {
+      const found = getAuditorObjectionByNo(objectionNo);
+      if (!found) return sendJson(res, 404, { error: { code: 'OBJECTION_NOT_FOUND', message: '异议不存在' } });
+      objectionId = found.id;
+    }
+    return sendJson(res, 200, { migrations: listAllCalendarMigrationsForAuditor({ objectionId }) });
   }
   if (url.pathname === '/api/auditor/archives' && req.method === 'GET') {
     return sendJson(res, 200, { archives: listArchivesForAuditor(user.id) });

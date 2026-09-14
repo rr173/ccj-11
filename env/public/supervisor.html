@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>异议超期升级与延期审批（主管）</title>
+  <title>工作日历与异议超期升级（主管）</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <main class="shell">
     <header class="topbar">
       <div>
-        <h1>异议超期升级与延期审批</h1>
-        <p class="subtitle">逾期升级记录只读留痕；每份异议至多一次延期，由主管批准或拒绝</p>
+        <h1>工作日历 · 异议超期升级与延期审批</h1>
+        <p class="subtitle">维护版本化工作日历（工作时段 / 节假日 / 临时停办日）；逾期升级只读留痕，延期由主管审批</p>
       </div>
       <div class="top-actions">
         <span id="userName" class="user-box"></span>
@@ -32,6 +32,69 @@
 
     <section id="appView" class="app hidden">
       <div id="globalAlert" class="alert hidden"></div>
+
+      <section class="card">
+        <div class="receipt-head">
+          <h2>可版本化工作日历</h2>
+          <div class="filter-bar">
+            <button id="refreshCalBtn" class="button secondary" type="button">刷新</button>
+            <button id="newVersionBtn" class="button primary" type="button">发布新版本</button>
+          </div>
+        </div>
+        <div id="currentCalendar" class="muted small">读取中…</div>
+        <div id="calendarVersionList" class="archive-list"></div>
+      </section>
+
+      <section id="calendarEditorCard" class="card hidden">
+        <h2>发布新日历版本</h2>
+        <p class="muted small">新版本发布后立即生效，但<b>不影响任何进行中的异议</b>——它们固定使用创建时的版本，需要通过下方“日历迁移”显式换版。</p>
+        <label class="form-row">版本说明
+          <input id="calNote" maxlength="300" placeholder="例如：国庆假期安排 / 系统升级停办日">
+        </label>
+        <label class="form-row">时区（IANA，默认 Asia/Shanghai）
+          <input id="calTimezone" value="Asia/Shanghai">
+        </label>
+        <div class="form-row">
+          <b>每日工作时段</b><span class="muted small">（分钟可填 0-1440；留空表示该日不工作）</span>
+          <div id="weeklyEditor"></div>
+        </div>
+        <div class="form-row">
+          <b>节假日（整天不工作）</b>
+          <table class="cal-date-table" id="holidayTable">
+            <thead><tr><th>日期</th><th>名称</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <button type="button" class="button secondary" data-add="holiday">+ 添加节假日</button>
+        </div>
+        <div class="form-row">
+          <b>临时停办日（整天不工作）</b>
+          <table class="cal-date-table" id="closureTable">
+            <thead><tr><th>日期</th><th>停办说明</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <button type="button" class="button secondary" data-add="closure">+ 添加临时停办日</button>
+        </div>
+        <div class="record-actions">
+          <button id="cancelCalEditBtn" class="button secondary" type="button">取消</button>
+          <button id="publishCalBtn" class="button primary" type="button">校验并发布</button>
+        </div>
+        <div id="calEditError" class="alert error hidden"></div>
+      </section>
+
+      <section class="card">
+        <div class="receipt-head">
+          <h2>在办异议迁移到新日历</h2>
+          <div class="filter-bar">
+            <select id="migrationTarget"></select>
+            <button id="previewMigrationBtn" class="button secondary" type="button">生成迁移预览</button>
+            <button id="refreshMigrationBtn" class="button secondary" type="button">刷新历史</button>
+          </div>
+        </div>
+        <p class="muted small">先预览受影响清单（含每条异议换版后的预计截止时间），确认无误后按预览版本迁移；已经逾期或终结的异议不会迁移。预览后清单变化时确认会被拒绝，需要重新预览。</p>
+        <div id="migrationPreview" class="muted small">尚未生成预览。</div>
+        <div id="migrationHistory" class="archive-list"></div>
+      </section>
+
       <section class="card">
         <div class="receipt-head">
           <h2>逾期升级与通知留痕</h2>

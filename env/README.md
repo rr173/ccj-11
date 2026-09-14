@@ -293,6 +293,35 @@ accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ reject
 - **主管**（supervisor）：只能访问 `/api/supervisor/*`——通知留痕（逾期升级广播、延期申请通知）、确认已读、延期审批；不能办理、不能访问业务或审计接口。
 - **审计员**（auditor）：`GET /api/auditor/receipt-objection-notifications[?kind=&audience=&status=&objectionNo=]` 查看**全部通知**完整留痕（含接收人、发送/已读时刻、去重键、定型负载），`GET /api/auditor/receipt-objection-extensions[?status=]` 查看全部延期申请与决议；只读，无任何写接口。完整证件号/地址/手机号仍只在异议冻结快照审计视图中按需返回。
 
+## 可版本化工作日历（versionable working calendar）
+
+异议处理期限不再按自然时间硬算，而是按**版本化工作日历**以工作分钟计算。管理员（supervisor）维护每天的工作时段、节假日与临时停办日；已发布日历只追加、永不修改，进行中的异议固定使用创建时的版本，换版必须经主管“预览 → 确认迁移”。
+
+### 1. 日历版本与计时模型
+
+- `working_calendars` 为只追加版本表：`v0` 是全天 24 小时**兼容日历**（旧异议/测试沿用自然日 TTL），`v1` 为默认工作日历（周一至周五 09:00-12:00、13:30-17:30，时区 `Asia/Shanghai`）；`working_calendar_pointer` 单行指向当前生效版本。
+- 新异议创建时固定（pin）当前版本（`calendar_version_id/version`），办理时长为 `RECEIPT_OBJECTION_SLA_MINUTES`（默认 7 个工作日 × 8 小时 = 3360 分钟）。截止时间由纯函数 `advanceWorkingMinutes(calendar, createdAt, slaMinutes)` 计算：遇到工作时段外、周末、节假日、临时停办日自动顺延，返回值带**逐段顺延说明**（类型/起讫/原因），写入 `receipt_objection_timing`（只追加台账）并在异议详情中展示。
+- 时钟模型：`anchor_at`（本轮计时起点）+ `remaining_minutes`（剩余工作分钟）→ `deadline_at`。纯算术 `workingMinutesBetween` 只统计工作时间，天然跳过非工作时段。
+
+### 2. 补充材料暂停 / 恢复
+
+- 处理人“要求补充材料”（accepted → supplementing）即**暂停**：按固定日历计算 anchor→now 已消耗工作分钟，扣减后冻结 `remaining_minutes`，写入 `receipt_objection_pauses`（部分唯一索引保证同一异议至多一条打开暂停段）。暂停期间既不提醒也不标记逾期。
+- 办理人“补交材料”（supplementing → accepted）即**恢复**：以恢复时刻为新 anchor，从冻结的剩余工作分钟继续推进，非工作时段自动顺延；恢复台账带逐段顺延原因。
+- 重复暂停、重复恢复均以状态条件更新 + 暂停行唯一索引拒绝；**并发补交**（两个请求同时恢复）只有一个事务成功（测试覆盖，返回 `[200,409]`），不会多扣或多加时间。暂停中被驳回会关闭打开的暂停段。
+
+### 3. 日历更新与受控迁移（不悄悄改变在办异议）
+
+- 发布新版本（`POST /api/supervisor/working-calendars`）立即成为当前生效版本，但**不影响任何在办异议**——它们仍按固定版本计时。
+- 主管先 `POST /api/supervisor/calendar-migrations/preview` 生成**受影响清单**：逐条给出当前截止时间、换版后的预计截止时间（运行中按当前时刻重算；暂停中只换版本、恢复时才重算），并明确列出**排除项**（已逾期、已终结）。预览冻结为一份带 `digest` 的快照。
+- 确认迁移 `POST /api/supervisor/calendar-migrations/{id}/apply` 必须回传同一 `digest`：预览后任一候选终结/逾期/已换版，整体 `MIGRATION_CONFLICT` 中止、不落任何变更，要求重新预览；已经逾期或终结的异议**绝不迁移**。成功迁移逐条写 `objection_calendar_migrations`、追加迁移事件与计时台账（前后截止/剩余分钟、目标版本）。已应用预览不可重复确认。
+
+### 4. 调度跟随当前截止时间；审计可见
+
+- 提醒/逾期调度始终以异议**当前有效截止时间**为准；提醒去重键含截止时间（`reminder-{ordinal}@{deadlineAt}`），恢复或迁移产生新截止后可按新时间点再次提醒，旧提醒永久留档。
+- 服务重启后：版本指针、固定版本、暂停状态、剩余分钟、截止时间、计时台账与迁移记录全部从持久层恢复，启动补扫不产生重复。
+- 审计员可 `GET /api/auditor/working-calendars`（全部版本）、`GET /api/auditor/calendar-migrations[?objectionNo=]`（迁移留痕），并在异议详情查看使用过的版本与每段计时/暂停/迁移记录。
+- 兼容开关 `CALENDAR_LEGACY_DEFAULT=1` 时新异议固定 v0 全天日历（自然日 TTL），供只验证旧语义的环境使用。
+
 ## 分阶段复核编排（staged orchestration）
 
 在多方复核批次之上，办理人可以把一个批次拆成**按顺序执行的多个阶段**：
@@ -633,6 +662,15 @@ accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ reject
 | GET | `/api/auditor/receipt-objection-extensions[?status=]` | 是（审计员） | 全部延期申请与主管决议（只读） |
 | GET | `/api/auditor/receipt-objections[?receiptNo=&status=]` | 是（审计员） | 全部撤销异议列表（只读、脱敏摘要） |
 | GET | `/api/auditor/receipt-objections/{YY编号}` | 是（审计员） | 完整审计记录（未脱敏冻结快照、文本原文、逐次状态变化） |
+| GET | `/api/supervisor/working-calendars` | 是（主管） | 日历版本清单与当前生效版本（只读） |
+| GET | `/api/supervisor/working-calendars/{id}` | 是（主管） | 单个日历版本详情（工作时段/节假日/停办日） |
+| POST | `/api/supervisor/working-calendars` | 是（主管） | 发布新版本（只追加，立即生效，不影响在办异议） |
+| POST | `/api/supervisor/calendar-migrations/preview` | 是（主管） | 生成受影响在办异议预览（含预计截止与逾期/终结排除项） |
+| GET | `/api/supervisor/calendar-migrations` | 是（主管） | 迁移预览历史 |
+| GET | `/api/supervisor/calendar-migrations/{id}` | 是（主管） | 单个迁移预览 |
+| POST | `/api/supervisor/calendar-migrations/{id}/apply` | 是（主管） | 按预览版本（回传 digest）确认迁移；冲突整体中止 |
+| GET | `/api/auditor/working-calendars` | 是（审计员） | 全部日历版本（只读） |
+| GET | `/api/auditor/calendar-migrations[?objectionNo=]` | 是（审计员） | 日历迁移留痕（只读） |
 | POST | `/api/archives/external-verify` | 否 | 外部一次性核验码核验，仅返回事件数量/时间范围/摘要链连续性/最终状态 |
 | POST | `/api/verify` | 否 | 编号+核验码核验，仅返回脱敏结果，按 IP 限流 |
 | GET | `/api/public/receipts/{no}/print?code=` | 否 | 脱敏可打印回执文档 |
@@ -738,4 +776,7 @@ SQLite 启用 WAL 和外键；所有推进与回执签发都在同步 `BEGIN IMM
 | `OBJECTION_REMINDER_LEAD_MS` | `86400000,7200000` | 到期前提醒时间点（毫秒，逗号分隔多个；提前量越大越早生成；停机错过会在恢复时补留痕） |
 | `OBJECTION_EXTENSION_MS` | `259200000` | 主管批准一次延期后顺延的时长（默认 3 天；每份异议至多一次） |
 | `OBJECTION_SWEEP_MS` | `1000` | 异议提醒/逾期升级/待发送通知后台扫描间隔；`NO_OBJECTION_SWEEP=1` 关闭定时器（启动恢复扫描仍执行） |
+| `RECEIPT_OBJECTION_SLA_MINUTES` | `3360` | 新异议办理时长（工作分钟，按创建时固定的工作日历版本计算；默认 7 工作日 × 8 小时） |
+| `OBJECTION_EXTENSION_MINUTES` | `1440` | 主管批准一次延期顺延的工作分钟（默认 3 工作日 × 8 小时；`OBJECTION_EXTENSION_MS` 仍用于 v0 全天兼容日历） |
+| `CALENDAR_LEGACY_DEFAULT` | `0` | 置 `1` 时新异议固定全天 24 小时 v0 日历（自然日 TTL，旧语义/测试用） |
 | `DISPLAY_TIMEZONE` | `Asia/Shanghai` | 回执文档时间展示时区 |

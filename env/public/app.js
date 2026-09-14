@@ -1287,6 +1287,7 @@ const RECEIPT_OBJECTION_EVENT_TEXT = {
   'receipt.objection.supplemented': '办理人补充材料',
   'receipt.objection.rejected': '驳回',
   'receipt.objection.revocation-confirmed': '确认撤销',
+  'receipt.objection.calendar.migrated': '日历版本迁移',
 };
 
 function renderReceiptObjectionTimelineCard(entry) {
@@ -1371,6 +1372,32 @@ const NOTIF_KIND_TEXT = {
   'extension-rejected': '延期申请已拒绝',
 };
 
+function ownerCalendarTimingHtml(o) {
+  if (!o.calendar) return '';
+  const cal = o.calendar;
+  const timing = (o.timing || []).map((t) => {
+    const deferrals = (t.detail.segments || []).filter((s) => !s.working).map((s) =>
+      `<li class="muted tiny">顺延 ${formatTime(s.from)} → ${formatTime(s.to)} · ${escapeHtml(s.reason)}</li>`).join('');
+    return `<li class="small">#${t.ordinal} ${escapeHtml({
+      initial: '初始计时', pause: '暂停（等待补充材料）', resume: '恢复计时（已补交）',
+      extension: '主管批准延期', migration: '日历版本迁移', deferral: '顺延',
+    }[t.type] || t.type)} · ${formatTime(t.createdAt)}
+      ${t.toAt ? ` → ${formatTime(t.toAt)}` : ''}
+      ${t.detail.note ? `<div>${escapeHtml(t.detail.note)}</div>` : ''}
+      ${deferrals ? `<ul class="batch-history-list">${deferrals}</ul>` : ''}
+    </li>`;
+  }).join('');
+  return `
+    <details class="batch-history"><summary class="muted small">工作日历 v${cal.calendarVersion} 与计时说明${cal.paused ? '（暂停中）' : ''}</summary>
+      <div class="muted tiny">
+        本异议固定使用创建时的日历版本（${escapeHtml(cal.calendarTimezone)}），办理时长 ${cal.slaMinutes} 工作分钟；
+        非工作时间（周末/节假日/临时停办日/工作时段外）自动顺延。
+        ${cal.paused ? '当前因等待补充材料暂停计时，补交后从剩余时长继续。' : ''}
+      </div>
+      <ul class="batch-history-list">${timing || '<li class="muted small">暂无计时记录</li>'}</ul>
+    </details>`;
+}
+
 function renderObjectionPanel() {
   const panel = els.objectionPanel;
   if (!panel) return;
@@ -1412,6 +1439,7 @@ function renderObjectionPanel() {
         <ul class="batch-invite-list">${materials || '<li class="muted small">文本说明加载中…</li>'}</ul>
         <details class="batch-history"><summary class="muted small">完整处理历史（${(o.events || []).length}）</summary>
           <ul class="batch-history-list">${events}</ul></details>
+        ${ownerCalendarTimingHtml(o)}
         <div class="record-actions" data-ro-actions="${escapeHtml(o.objectionNo)}"></div>
       </li>`;
   }).join('');
@@ -1419,7 +1447,7 @@ function renderObjectionPanel() {
   panel.innerHTML = `
     <div class="receipt-head">
       <h2>回执撤销与异议</h2>
-      <span class="muted small">对本回执内容有异议可申请撤销；提交时冻结回执快照，处理期限 7 天</span>
+      <span class="muted small">对本回执内容有异议可申请撤销；提交时冻结回执快照，处理期限按创建时的工作日历（工作时段/节假日/停办日）计算</span>
     </div>
     ${revoked
       ? '<p class="muted small">本回执已撤销，不能再发起撤销异议；原始快照仍留档可查。</p>'

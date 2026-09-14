@@ -21,6 +21,7 @@ import {
   overdueDedupeKey,
   reminderDedupeKey,
 } from './objectionEscalations.js';
+import { appendTimingTx, extendObjectionClockTx } from './workingCalendarStore.js';
 
 function now() {
   return Date.now();
@@ -93,6 +94,9 @@ function generateDueNotificationsTx(at) {
   const insertStmt = db.prepare(NOTIFICATION_INSERT);
 
   for (const objection of open) {
+    // 暂停（等待办理人补充材料）期间不计时：既不提醒也不标记逾期，
+    // 调度始终跟随恢复后的当前有效截止时间。
+    if (objection.status === 'supplementing') continue;
     // 1) 到期前提醒：每个序位独立判断“是否已进入提醒窗口”。
     //
     // 编号 ordinal 按到期先后固定（提前量越大越早到期、序位越小）；
@@ -105,7 +109,9 @@ function generateDueNotificationsTx(at) {
       .map((leadMs, index, arr) => ({ ordinal: arr.length - 1 - index, leadMs }));
     for (const { ordinal, leadMs } of leads) {
       if (at < objection.deadline_at - leadMs) continue;
-      const dedupeKey = reminderDedupeKey(ordinal);
+      // 去重键跟随“当前有效截止时间”：恢复/迁移使截止时间变化后，
+      // 按新截止时间的提醒点可以再次提醒；旧提醒永久留档。
+      const dedupeKey = reminderDedupeKey(ordinal, objection.deadline_at);
       const exists = db.prepare(`
         SELECT 1 FROM receipt_objection_notifications
         WHERE objection_id = ? AND kind = 'reminder' AND dedupe_key = ?
@@ -331,7 +337,12 @@ export function requestObjectionExtension({ userId, objectionId, reason }) {
     }
 
     const ts = now();
-    const durationMs = config.objectionExtensionMs;
+    // 日历化异议按工作分钟延期（暂停期间只增加冻结的剩余时长）；
+    // 旧版全天日历沿用自然毫秒，行为与历史一致。
+    const extensionMinutes = objection.calendar_version === 0
+      ? Math.round(config.objectionExtensionMs / 60000)
+      : config.objectionExtensionMinutes;
+    const durationMs = extensionMinutes * 60000;
     const id = cryptoId();
     try {
       db.prepare(`
@@ -438,12 +449,33 @@ export function decideObjectionExtension({ userId, extensionId, decision, note =
       }
       // 顺延截止时间；若此前已逾期，清除逾期标记——新截止时间之后的扫描
       // 会以新层级（level=2）再升级，旧升级记录永久保留。
-      const newDeadline = Math.max(objection.deadline_at, ts) + extension.requested_duration_ms;
-      db.prepare(`
-        UPDATE receipt_objections
-        SET deadline_at = ?, overdue_at = NULL
-        WHERE id = ?
-      `).run(newDeadline, objection.id);
+      // 日历化异议：按工作分钟顺延（暂停中则只增加冻结剩余时长，恢复时才重算）。
+      const extensionMinutes = objection.calendar_version === 0
+        ? Math.round(config.objectionExtensionMs / 60000)
+        : config.objectionExtensionMinutes;
+      const clock = extendObjectionClockTx(objection, extensionMinutes, ts);
+      const newDeadline = clock.deadlineAt;
+      if (clock.paused) {
+        db.prepare(`
+          UPDATE receipt_objections
+          SET remaining_minutes = remaining_minutes + ?, overdue_at = NULL
+          WHERE id = ?
+        `).run(clock.addedMinutes, objection.id);
+      } else {
+        // 旧版全天日历（remaining_minutes=0）：只移动截止时间与 anchor，不写剩余分钟
+        if (clock.legacy) {
+          db.prepare(`
+            UPDATE receipt_objections SET deadline_at = ?, overdue_at = NULL WHERE id = ?
+          `).run(newDeadline, objection.id);
+        } else {
+          db.prepare(`
+            UPDATE receipt_objections
+            SET deadline_at = ?, anchor_at = ?,
+                remaining_minutes = remaining_minutes + ?, overdue_at = NULL
+            WHERE id = ?
+          `).run(newDeadline, ts, clock.addedMinutes || 0, objection.id);
+        }
+      }
       const updated = db.prepare('SELECT * FROM receipt_objections WHERE id = ?').get(objection.id);
       appendObjectionEventTx({
         objection: updated,
@@ -458,6 +490,25 @@ export function decideObjectionExtension({ userId, extensionId, decision, note =
         },
       });
       const approved = db.prepare('SELECT * FROM receipt_objection_extensions WHERE id = ?').get(extensionId);
+      // 计时台账：延期批准段（暂停中只记录增加的工作分钟）
+      appendTimingTx({
+        objection: updated,
+        type: 'extension',
+        fromAt: extension.previous_deadline_at,
+        toAt: newDeadline,
+        actorUserId: userId,
+        actorRole: 'supervisor',
+        detail: {
+          extensionId,
+          extensionMinutes,
+          previousDeadlineAt: extension.previous_deadline_at,
+          newDeadlineAt: newDeadline,
+          paused: Boolean(clock.paused),
+          legacy: Boolean(clock.legacy),
+          segments: clock.segments || [],
+        },
+        createdAt: ts,
+      });
       notifyExtensionDecisionTx({
         objection: updated, extension: approved, decision: 'approved', actorUserId: userId, at: ts,
       });

@@ -273,3 +273,23 @@ table.kv th { width: 150px; background: #f5f7fb; font-weight: 600; white-space: 
 .material-box { margin: 6px 0; border: 1px solid #e4e7ec; border-radius: 8px; padding: 6px 10px; }
 .material-box summary { cursor: pointer; font-size: 13px; }
 .material-box .archive-pre { margin: 8px 0; }
+
+/* 可版本化工作日历：主管编辑器 / 迁移预览表 */
+.form-row { display: block; margin: 12px 0; }
+.form-row input[type="text"], .form-row input:not([type]), .form-row input[type="date"], .form-row input {
+  width: 100%; max-width: 420px; margin-top: 4px;
+}
+.cal-day-row { display: flex; gap: 10px; align-items: flex-start; padding: 4px 0; border-bottom: 1px dashed #eef0f4; }
+.cal-day-label { width: 42px; padding-top: 6px; }
+.cal-windows { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.cal-window { display: inline-flex; gap: 6px; align-items: center; }
+.cal-time { min-width: 96px; }
+.button.tiny { padding: 2px 8px; font-size: 12px; }
+.cal-date-table, .cal-migration-table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+.cal-date-table th, .cal-date-table td, .cal-migration-table th, .cal-migration-table td {
+  border: 1px solid #d8dee9; padding: 5px 8px; text-align: left; vertical-align: top; font-size: 13px;
+}
+.cal-date-table .cal-date { width: 160px; }
+.cal-date-table .cal-label { min-width: 220px; }
+.cal-row-excluded { background: #fdf2f2; color: #8a94a6; }
+.cal-migration-table code { font-size: 11px; }

@@ -10,6 +10,8 @@ process.env.TOKEN_TTL_MS = '600000';
 process.env.RECEIPT_SECRET = 'unit-test-objection-secret-fixed-value';
 process.env.VERIFY_RATE_MAX = '100';
 process.env.RECEIPT_OBJECTION_TTL_MS = String(7 * 24 * 60 * 60 * 1000);
+// 本用例验证既有“自然日期限”语义：新异议固定全天 v0 日历
+process.env.CALENDAR_LEGACY_DEFAULT = '1';
 process.env.NO_AUTO_LISTEN = '1';
 for (const suffix of ['', '-wal', '-shm']) rmSync(`${process.env.DB_PATH}${suffix}`, { force: true });
 

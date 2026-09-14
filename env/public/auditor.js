@@ -71,6 +71,8 @@ async function boot(knownUser = null) {
     await loadObjections();
     await loadObjectionNotifications();
     await loadObjectionExtensions();
+    await loadCalendarVersions();
+    await loadCalendarMigrations();
   } catch (error) {
     $('#loginView').classList.remove('hidden');
     $('#appView').classList.add('hidden');
@@ -162,6 +164,7 @@ const OBJECTION_EVENT_TEXT = {
   'receipt.objection.supplemented': '办理人补充材料',
   'receipt.objection.rejected': '驳回',
   'receipt.objection.revocation-confirmed': '确认撤销',
+  'receipt.objection.calendar.migrated': '日历版本迁移',
 };
 
 async function loadObjections() {
@@ -398,3 +401,54 @@ async function loadComparisonDetail(comparisonId) {
     view.innerHTML = `<div class="alert error">${escapeHtml(error.message)}</div>`;
   }
 }
+
+// ---------------------------------------------------------------------------
+// 工作日历版本与迁移留痕（只读审计）
+// ---------------------------------------------------------------------------
+async function loadCalendarVersions() {
+  try {
+    const data = await api('GET', '/api/auditor/working-calendars');
+    $('#calendarVersionList').innerHTML = data.versions.map((v) => `
+      <details class="archive-item card-inner">
+        <summary class="record-main">
+          <span class="tag ${v.legacy ? 'tag-warn' : 'tag-ok'}">v${v.version}${data.current?.id === v.id ? '（当前生效）' : ''}</span>
+          <b>${v.legacy ? '全天 24 小时兼容日历' : '工作日历'}</b>
+          <span class="muted small">${formatTime(v.createdAt)} · ${escapeHtml(v.timezone)}</span>
+        </summary>
+        <div class="small">
+          ${v.note ? `<div>${escapeHtml(v.note)}</div>` : ''}
+          <ul>${v.config.weeklyWindows.map((d) => `<li>${d.weekdayLabel}：${
+            d.closed ? '休息' : d.windows.map((w) => `${w.start}-${w.end}`).join('、')
+          }</li>`).join('')}</ul>
+          ${v.config.holidays.length ? `<div><b>节假日：</b>${v.config.holidays.map((h) => `${h.date} ${escapeHtml(h.name)}`).join('；')}</div>` : ''}
+          ${v.config.closures.length ? `<div><b>临时停办：</b>${v.config.closures.map((c) => `${c.date} ${escapeHtml(c.note)}`).join('；')}</div>` : ''}
+        </div>
+      </details>`).join('');
+  } catch (error) {
+    $('#calendarVersionList').innerHTML = `<p class="muted small">加载失败：${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function loadCalendarMigrations() {
+  try {
+    const data = await api('GET', '/api/auditor/calendar-migrations');
+    $('#calendarMigrationList').innerHTML = data.migrations.length
+      ? data.migrations.map((m) => `
+        <div class="archive-item card-inner">
+          <div class="record-main">
+            <b class="mono">${escapeHtml(m.objectionNo)}</b>
+            <span class="tag tag-warn">v${m.fromVersion} → v${m.toVersion}</span>
+            <span class="muted small">${formatTime(m.createdAt)}</span>
+          </div>
+          <div class="muted small">
+            截止 ${formatTime(m.previousDeadlineAt)} → ${formatTime(m.newDeadlineAt)}
+            · 剩余办理 ${m.previousRemainingMinutes} → ${m.newRemainingMinutes} 工作分钟
+          </div>
+        </div>`).join('')
+      : '<p class="muted small">暂无迁移记录。</p>';
+  } catch (error) {
+    $('#calendarMigrationList').innerHTML = `<p class="muted small">加载失败：${escapeHtml(error.message)}</p>`;
+  }
+}
+$('#refreshCalBtn')?.addEventListener('click', loadCalendarVersions);
+$('#refreshMigrationBtn')?.addEventListener('click', loadCalendarMigrations);

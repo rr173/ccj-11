@@ -14,6 +14,8 @@ process.env.RECEIPT_OBJECTION_TTL_MS = String(60 * 60 * 1000);
 process.env.OBJECTION_REMINDER_LEAD_MS = `${60 * 60 * 1000},${30 * 60 * 1000}`;
 process.env.OBJECTION_EXTENSION_MS = String(10 * 60 * 1000);
 process.env.OBJECTION_SWEEP_MS = String(60 * 60 * 1000);
+// 本用例验证既有自然日期限语义：新异议固定全天 v0 日历
+process.env.CALENDAR_LEGACY_DEFAULT = '1';
 // 父测试进程不靠定时器驱动（全部用注入时间显式扫描）；重启恢复由子进程启动扫描覆盖
 process.env.NO_OBJECTION_SWEEP = '1';
 process.env.NO_AUTO_LISTEN = '1';
@@ -681,6 +683,7 @@ async function startRestartServer(dbFile, extraEnv = {}) {
       DB_PATH: dbFile,
       RECEIPT_SECRET: process.env.RECEIPT_SECRET,
       RECEIPT_OBJECTION_TTL_MS: process.env.RECEIPT_OBJECTION_TTL_MS,
+      CALENDAR_LEGACY_DEFAULT: process.env.CALENDAR_LEGACY_DEFAULT || '1',
       VERIFY_RATE_MAX: '100',
       PORT: '0',
       NO_AUTO_LISTEN: '0',

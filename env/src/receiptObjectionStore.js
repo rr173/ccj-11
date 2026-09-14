@@ -17,10 +17,19 @@ import {
   maskedObjectionReceipt,
   newObjectionNo,
   nextStatusFor,
-  objectionDeadline,
   snapshotDigest,
   fullApplicant,
 } from './receiptObjections.js';
+import {
+  appendTimingTx,
+  calendarContextForObjection,
+  initialScheduleForObjection,
+  listObjectionMigrations,
+  listObjectionPauses,
+  listObjectionTiming,
+  pauseObjectionClockTx,
+  resumeObjectionClockTx,
+} from './workingCalendarStore.js';
 
 function now() {
   return Date.now();
@@ -111,6 +120,9 @@ export function createReceiptObjection({ userId, receiptNo, reason, attachment }
       }
 
       const ts = now();
+      // 新异议固定创建时的【当前生效日历版本】：办理时长按该版本的工作时段计算，
+      // 非工作时间自动顺延；日历之后如何更新都不影响本异议，除非主管显式迁移。
+      const schedule = initialScheduleForObjection(ts);
       // 提交时冻结回执快照：独立复制一份 snapshot_json，与原回执之后的任何变化无关
       const snapshotJson = receipt.snapshot_json;
       const id = cryptoId();
@@ -121,12 +133,16 @@ export function createReceiptObjection({ userId, receiptNo, reason, attachment }
            status, reason, snapshot_json, receipt_status_snapshot, snapshot_digest, note,
            created_at, deadline_at, accepted_at, accepted_by_user_id,
            supplement_requested_at, supplement_requested_by_user_id, supplement_request_note,
-           supplemented_at, resolved_at, resolved_by_user_id, resolve_note, revoked_receipt_at)
+           supplemented_at, resolved_at, resolved_by_user_id, resolve_note, revoked_receipt_at,
+           calendar_version_id, calendar_version, sla_minutes, remaining_minutes, anchor_at)
         VALUES (?, ?, ?, ?, ?, ?, 'submitted', ?, ?, 'issued', ?, '', ?, ?, NULL, NULL,
-                NULL, NULL, '', NULL, NULL, NULL, '', NULL)
+                NULL, NULL, '', NULL, NULL, NULL, '', NULL,
+                ?, ?, ?, ?, ?)
       `).run(
         id, objectionNo, receipt.receipt_no, receipt.workflow_id, userId, assignee.id,
-        reason, snapshotJson, snapshotDigest(snapshotJson), ts, objectionDeadline(ts),
+        reason, snapshotJson, snapshotDigest(snapshotJson), ts, schedule.deadlineAt,
+        schedule.calendarVersionId, schedule.calendarVersion,
+        schedule.slaMinutes, schedule.remainingMinutes, schedule.anchorAt,
       );
       const objection = db.prepare('SELECT * FROM receipt_objections WHERE id = ?').get(id);
       db.prepare(`
@@ -143,7 +159,28 @@ export function createReceiptObjection({ userId, receiptNo, reason, attachment }
         actorUserId: userId,
         actorRole: 'handler',
         reason,
-        extra: { assigneeUserId: assignee.id, attachment: attachment.filename },
+        extra: {
+          assigneeUserId: assignee.id,
+          attachment: attachment.filename,
+          calendarVersion: schedule.calendarVersion,
+          deadlineAt: schedule.deadlineAt,
+        },
+      });
+      // 计时台账初始段：anchor→deadline 的逐段工作/顺延说明（固定日历版本）
+      appendTimingTx({
+        objection,
+        type: 'initial',
+        fromAt: schedule.anchorAt,
+        toAt: schedule.deadlineAt,
+        actorUserId: userId,
+        actorRole: 'handler',
+        detail: {
+          calendarVersion: schedule.calendarVersion,
+          calendarVersionId: schedule.calendarVersionId,
+          slaMinutes: schedule.slaMinutes,
+          segments: schedule.segments,
+        },
+        createdAt: ts,
       });
       return { ok: true, objection: getOwnerObjection(id) };
     });
@@ -202,7 +239,7 @@ function userListProcessorsTx() {
 // 状态变化（处理人 / 办理人补充）：统一的条件更新，非法跳转明确拒绝
 // ---------------------------------------------------------------------------
 function transitionObjection({
-  userId, role, objectionId, action, reason = '', note = '', supplement = null,
+  userId, role, objectionId, action, reason = '', note = '', supplement = null, at = null,
 }) {
   return immediateTransaction(() => {
     const objection = db.prepare('SELECT * FROM receipt_objections WHERE id = ?').get(objectionId);
@@ -239,7 +276,7 @@ function transitionObjection({
     }
 
     const toStatus = nextStatusFor(action);
-    const ts = now();
+    const ts = at || now();
     const type = {
       accept: 'receipt.objection.accepted',
       requestSupplements: 'receipt.objection.supplement-requested',
@@ -276,6 +313,18 @@ function transitionObjection({
       }
     }
 
+    // 要求补充材料：暂停剩余办理时长（按固定日历冻结已消耗的工作分钟）。
+    // 先算好冻结值；暂停行必须在状态条件更新成功之后再写入，避免失败流转留下孤儿暂停行。
+    let pauseInsert = null;
+    if (action === 'requestSupplements') {
+      const frozen = pauseObjectionClockTx(objection, ts);
+      pauseInsert = {
+        remaining: frozen.legacy ? 0 : frozen.remainingMinutes,
+        offsetMs: frozen.legacy ? frozen.pausedOffsetMs : 0,
+        note: String(note || reason || '').slice(0, 500),
+      };
+    }
+
     const result = applyStatusUpdate({ objection, action, toStatus, userId, ts, note, reason, receiptRevokedAt });
     if (result.changes === 0) {
       // 并发：另一事务已先行流转，返回最新状态明确拒绝覆盖
@@ -286,6 +335,37 @@ function transitionObjection({
         code: 'OBJECTION_STATE_CHANGED',
         message: '该异议状态刚被其他操作改变，请刷新后重试',
         objection: role === 'handler' ? getOwnerObjection(objection.id) : getProcessorObjection(objection.id),
+      };
+    }
+
+    // 暂停中被驳回（终态）：关闭打开的暂停段，避免残留“进行中暂停”影响审计与后续判定
+    if (action === 'reject' && fromStatus === 'supplementing') {
+      db.prepare(`
+        UPDATE receipt_objection_pauses
+        SET status = 'resumed', resumed_at = ?, resumed_by_user_id = ?
+        WHERE objection_id = ? AND status = 'paused'
+      `).run(ts, userId, objection.id);
+    }
+
+    // 状态流转成功后再落暂停行；打开的唯一部分索引兜底重复暂停/并发
+    let pauseRow = null;
+    if (action === 'requestSupplements' && pauseInsert) {
+      const ordinal = db.prepare(`
+        SELECT COALESCE(MAX(ordinal), -1) + 1 AS next_ordinal
+        FROM receipt_objection_pauses WHERE objection_id = ?
+      `).get(objection.id).next_ordinal;
+      db.prepare(`
+        INSERT INTO receipt_objection_pauses
+          (id, objection_id, ordinal, status, requested_by_user_id,
+           paused_at, remaining_minutes_at_pause, paused_offset_ms, resumed_at, note)
+        VALUES (?, ?, ?, 'paused', ?, ?, ?, ?, NULL, ?)
+      `).run(
+        cryptoId(), objection.id, ordinal, userId, ts,
+        pauseInsert.remaining, pauseInsert.offsetMs, pauseInsert.note,
+      );
+      pauseRow = {
+        ordinal, remaining_minutes_at_pause: pauseInsert.remaining,
+        paused_offset_ms: pauseInsert.offsetMs,
       };
     }
 
@@ -305,6 +385,39 @@ function transitionObjection({
       );
     }
 
+    // 办理人补交材料 = 恢复计时：以恢复时刻为新 anchor，按固定日历从剩余工作
+    // 分钟继续计算截止时间，非工作时段自动顺延并逐段写入计时台账。
+    // 条件更新（WHERE status='paused'）保证重复恢复 / 并发补交只生效一次。
+    let resumeInfo = null;
+    if (action === 'supplement') {
+      const openPause = db.prepare(`
+        SELECT * FROM receipt_objection_pauses
+        WHERE objection_id = ? AND status = 'paused'
+      `).get(objection.id);
+      if (!openPause) {
+        throw new Error('补充恢复失败：找不到进行中的暂停段');
+      }
+      resumeInfo = resumeObjectionClockTx(objection, openPause, ts);
+      const closeResult = db.prepare(`
+        UPDATE receipt_objection_pauses
+        SET status = 'resumed', resumed_at = ?, resumed_by_user_id = ?
+        WHERE id = ? AND status = 'paused'
+      `).run(ts, userId, openPause.id);
+      if (closeResult.changes === 0) {
+        throw new Error('补充恢复失败：暂停段刚被并发操作恢复');
+      }
+      db.prepare(`
+        UPDATE receipt_objections
+        SET deadline_at = ?, anchor_at = ?, remaining_minutes = ?, overdue_at = NULL
+        WHERE id = ?
+      `).run(
+        resumeInfo.deadlineAt,
+        resumeInfo.legacy ? ts : resumeInfo.anchorAt,
+        resumeInfo.legacy ? objection.remaining_minutes : resumeInfo.remainingMinutes,
+        objection.id,
+      );
+    }
+
     const updated = db.prepare('SELECT * FROM receipt_objections WHERE id = ?').get(objection.id);
     addObjectionEventTx({
       objection: updated,
@@ -315,8 +428,50 @@ function transitionObjection({
       actorRole: role,
       reason,
       note,
-      extra: action === 'supplement' && supplement ? { attachment: supplement.filename } : {},
+      extra: {
+        ...(action === 'supplement' && supplement ? { attachment: supplement.filename } : {}),
+        ...(action === 'supplement' ? { newDeadlineAt: resumeInfo.deadlineAt } : {}),
+        ...(action === 'requestSupplements'
+          ? { remainingMinutes: pauseRow.remaining_minutes_at_pause } : {}),
+      },
     });
+
+    // 暂停 / 恢复分别写入计时台账（恢复台账带逐段顺延原因）
+    if (action === 'requestSupplements') {
+      appendTimingTx({
+        objection: updated,
+        type: 'pause',
+        fromAt: ts,
+        toAt: null,
+        actorUserId: userId,
+        actorRole: role,
+        detail: {
+          ordinal: pauseRow.ordinal,
+          remainingMinutesAtPause: pauseRow.remaining_minutes_at_pause,
+          pausedOffsetMs: pauseRow.paused_offset_ms,
+          reason: note || reason || '',
+          note: '办理时长暂停：等待办理人补充材料',
+        },
+        createdAt: ts,
+      });
+    }
+    if (action === 'supplement') {
+      appendTimingTx({
+        objection: updated,
+        type: 'resume',
+        fromAt: ts,
+        toAt: resumeInfo.deadlineAt,
+        actorUserId: userId,
+        actorRole: role,
+        detail: {
+          remainingMinutes: updated.remaining_minutes,
+          newDeadlineAt: resumeInfo.deadlineAt,
+          note: '办理人补交材料，从剩余办理时长继续计算',
+          segments: resumeInfo.segments,
+        },
+        createdAt: ts,
+      });
+    }
 
     return {
       ok: true,
@@ -383,7 +538,7 @@ export function rejectReceiptObjection(params) {
 export function confirmObjectionRevocation(params) {
   return transitionObjection({ ...params, action: 'confirmRevocation', role: 'processor' });
 }
-// 办理人补充材料
+// 办理人补充材料（at 仅用于测试注入当前时间）
 export function supplementReceiptObjection(params) {
   return transitionObjection({ ...params, action: 'supplement', role: 'handler' });
 }
@@ -432,7 +587,10 @@ function materialsForObjection(objectionId, { includeContent = false } = {}) {
 
 function objectionBase(row, viewer) {
   const snapshot = JSON.parse(row.snapshot_json);
-  const overdue = !isObjectionTerminal(row.status) && row.deadline_at <= now();
+  const isTerminal = isObjectionTerminal(row.status);
+  // 暂停（待补充材料）期间不计时也不逾期：逾期判定以恢复后的当前截止时间为准
+  const paused = row.status === 'supplementing';
+  const overdue = !isTerminal && !paused && row.deadline_at <= now();
   const assignee = row.assignee_user_id ? userQueries.findById(row.assignee_user_id) : null;
   const owner = userQueries.findById(row.user_id);
   return {
@@ -445,6 +603,7 @@ function objectionBase(row, viewer) {
     createdAt: row.created_at,
     deadlineAt: row.deadline_at,
     overdue,
+    paused,
     overdueAt: row.overdue_at || null,
     acceptedAt: row.accepted_at || null,
     supplementRequestedAt: row.supplement_requested_at || null,
@@ -455,6 +614,7 @@ function objectionBase(row, viewer) {
     receiptRevokedAt: row.revoked_receipt_at || null,
     receiptStatusSnapshot: row.receipt_status_snapshot,
     snapshotDigest: row.snapshot_digest,
+    calendar: calendarContextForObjection(row),
     assignee: assignee ? { id: assignee.id, displayName: assignee.display_name } : null,
     owner: viewer === 'processor' && owner
       ? { displayName: owner.display_name, username: owner.username }
@@ -463,26 +623,36 @@ function objectionBase(row, viewer) {
   };
 }
 
+// 详情视图附加：计时台账、暂停段、迁移记录
+function withTimingDetail(view, row) {
+  return {
+    ...view,
+    timing: listObjectionTiming(row.id),
+    pauses: listObjectionPauses(row.id),
+    calendarMigrations: listObjectionMigrations(row.id),
+  };
+}
+
 // 办理人视图：自己的异议，含脱敏申请人（本人其实知情，但响应只给脱敏结果）与完整时间线
 export function getOwnerObjection(objectionId, { userId = null } = {}) {
   const row = db.prepare('SELECT * FROM receipt_objections WHERE id = ?').get(objectionId);
   if (!row || (userId && row.user_id !== userId)) return null;
-  return {
+  return withTimingDetail({
     ...objectionBase(row, 'owner'),
     materials: materialsForObjection(row.id),
     events: eventsForObjection(row.id),
-  };
+  }, row);
 }
 
 // 办理人视图：按异议编号（YY-...）查询，带归属校验
 export function getOwnerObjectionByNo(objectionNo, userId) {
   const row = db.prepare('SELECT * FROM receipt_objections WHERE objection_no = ?').get(objectionNo);
   if (!row || (userId && row.user_id !== userId)) return null;
-  return {
+  return withTimingDetail({
     ...objectionBase(row, 'owner'),
     materials: materialsForObjection(row.id),
     events: eventsForObjection(row.id),
-  };
+  }, row);
 }
 
 // 处理人视图：按异议编号查询，带分配校验
@@ -505,14 +675,14 @@ export function getProcessorObjection(objectionId, { userId = null } = {}) {
   const snapshot = JSON.parse(row.snapshot_json);
   const currentReceipt = db.prepare('SELECT status, revoked_at, revoke_reason FROM receipts WHERE receipt_no = ?')
     .get(row.receipt_no);
-  return {
+  return withTimingDetail({
     ...objectionBase(row, 'processor'),
     maskedReceipt: maskedObjectionReceipt(snapshot),
     currentReceiptStatus: currentReceipt?.status || 'unknown',
     currentReceiptRevokedAt: currentReceipt?.revoked_at || null,
     materials: materialsForObjection(row.id, { includeContent: true }),
     events: eventsForObjection(row.id),
-  };
+  }, row);
 }
 
 // 审计视图：完整（未脱敏）冻结快照、完整材料正文与完整处理历史
@@ -521,7 +691,7 @@ export function getAuditorObjection(objectionId) {
   if (!row) return null;
   const snapshot = JSON.parse(row.snapshot_json);
   const currentReceipt = db.prepare('SELECT * FROM receipts WHERE receipt_no = ?').get(row.receipt_no);
-  return {
+  return withTimingDetail({
     ...objectionBase(row, 'auditor'),
     fullSnapshot: snapshot,
     fullApplicant: fullApplicant(snapshot),
@@ -531,7 +701,7 @@ export function getAuditorObjection(objectionId) {
     currentReceiptRevokeReason: currentReceipt?.revoke_reason || '',
     materials: materialsForObjection(row.id, { includeContent: true }),
     events: eventsForObjection(row.id),
-  };
+  }, row);
 }
 
 // ---------------------------------------------------------------------------

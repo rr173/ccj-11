@@ -97,10 +97,10 @@ export function buildNotificationPayload({
   return Object.assign(payload, extra);
 }
 
-// 提醒去重键：同一截止时间的同一提醒序位只生成一次（延期产生新截止时间，
-// 其提醒是新的 dedupeKey，旧提醒通知永久留档）。
-export function reminderDedupeKey(reminderOrdinal) {
-  return `reminder-${reminderOrdinal}`;
+// 提醒去重键：同一截止时间的同一提醒序位只生成一次（恢复/迁移产生新的有效
+// 截止时间后，其提醒是新的 dedupeKey，旧提醒通知永久留档）。
+export function reminderDedupeKey(reminderOrdinal, deadlineAt) {
+  return `reminder-${reminderOrdinal}@${deadlineAt}`;
 }
 
 // 升级层级：批准过几次延期，层级就往后排（首次逾期 level=1；延期后再逾期 level=2）

@@ -77,6 +77,18 @@
         <p class="muted small">每份异议至多一次延期申请；主管批准 / 拒绝均只追加记录，不可覆盖。</p>
         <div id="objectionExtensionList" class="archive-list"></div>
       </section>
+      <section class="card">
+        <h2>工作日历版本与迁移留痕</h2>
+        <p class="muted small">已发布的工作日历版本只追加、不可修改；每份异议固定创建时的版本，换版必须经主管“预览 → 确认迁移”。此区块只读。</p>
+        <div class="filter-bar">
+          <button id="refreshCalBtn" class="button secondary" type="button">刷新版本</button>
+          <button id="refreshMigrationBtn" class="button secondary" type="button">刷新迁移记录</button>
+        </div>
+        <h3 class="small">日历版本</h3>
+        <div id="calendarVersionList" class="archive-list"></div>
+        <h3 class="small">迁移记录</h3>
+        <div id="calendarMigrationList" class="archive-list"></div>
+      </section>
       <section id="objectionView" class="card hidden"></section>
       <section id="detailView" class="card hidden"></section>
       <section id="comparisonView" class="card hidden"></section>

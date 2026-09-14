@@ -49,6 +49,8 @@ import * as comparisonNs from './comparisonStore.js';
 import * as objectionNs from './receiptObjectionStore.js';
 // 异议超期升级与通知留痕模块（同样依赖 db.js / 异议 store）
 import * as escalationNs from './objectionEscalationStore.js';
+// 可版本化工作日历（表结构在下方建好后惰性调用 seedWorkingCalendars）
+import { seedWorkingCalendars } from './workingCalendarStore.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -1361,6 +1363,114 @@ CREATE INDEX IF NOT EXISTS idx_obj_extensions_objection
   ON receipt_objection_extensions(objection_id);
 CREATE INDEX IF NOT EXISTS idx_obj_extensions_status
   ON receipt_objection_extensions(status, created_at);
+
+-- ---------------------------------------------------------------------------
+-- 可版本化工作日历：
+--   working_calendars 为只追加的版本表（发布即冻结，永不 UPDATE/DELETE）；
+--   working_calendar_pointer 单行保存“当前生效版本”，新异议固定使用该版本；
+--   v0 为兼容旧库的全天 24 小时日历，旧异议沿用自然日 TTL（deadline_at 直接相加）。
+-- 每份异议在创建时固定 calendar_version_id；之后日历更新不影响在办异议，
+-- 必须经主管“迁移预览 → 按预览版本确认迁移”才会换版本。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS working_calendars (
+  id TEXT PRIMARY KEY,
+  version INTEGER NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'published' CHECK (status IN ('published', 'legacy')),
+  timezone TEXT NOT NULL,
+  content_json TEXT NOT NULL,
+  content_digest TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  created_by_user_id TEXT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS working_calendar_pointer (
+  id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+  calendar_version_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- 迁移预览：按某版本日历计算“受影响的在办异议”清单（生成瞬间冻结）。
+-- digest 是 items_json 的摘要；确认时必须回传同一 digest（预览被重新生成或
+-- 清单变化时确认被拒绝，返回最新预览供主管重新核对）。
+CREATE TABLE IF NOT EXISTS objection_calendar_previews (
+  id TEXT PRIMARY KEY,
+  from_calendar_version_id TEXT NOT NULL,
+  target_calendar_version_id TEXT NOT NULL,
+  target_version INTEGER NOT NULL,
+  digest TEXT NOT NULL,
+  items_json TEXT NOT NULL DEFAULT '[]',
+  eligible_count INTEGER NOT NULL DEFAULT 0,
+  excluded_count INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  created_by_user_id TEXT,
+  created_at INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open', 'applied', 'superseded'))
+);
+CREATE INDEX IF NOT EXISTS idx_obj_cal_previews_target
+  ON objection_calendar_previews(target_version, created_at);
+
+-- 迁移留痕（只追加）：确认迁移时为每条实际换版的异议写一行，
+-- 记录换版前后截止时间与剩余办理分钟，审计员据此核对每次迁移。
+CREATE TABLE IF NOT EXISTS objection_calendar_migrations (
+  id TEXT PRIMARY KEY,
+  preview_id TEXT NOT NULL REFERENCES objection_calendar_previews(id),
+  objection_id TEXT NOT NULL REFERENCES receipt_objections(id) ON DELETE CASCADE,
+  from_calendar_version_id TEXT NOT NULL,
+  to_calendar_version_id TEXT NOT NULL,
+  previous_deadline_at INTEGER NOT NULL,
+  new_deadline_at INTEGER NOT NULL,
+  previous_remaining_minutes INTEGER NOT NULL DEFAULT 0,
+  new_remaining_minutes INTEGER NOT NULL DEFAULT 0,
+  migrated_by_user_id TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_obj_cal_migrations_objection
+  ON objection_calendar_migrations(objection_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_obj_cal_migrations_preview
+  ON objection_calendar_migrations(preview_id);
+
+-- 补充材料暂停段（一条请求补充 ↔ 一次恢复；UNIQUE 兜底并发补交只能恢复一次）。
+-- 暂停期间不消耗办理时长，恢复时以剩余工作分钟按固定日历重新计算截止时间。
+CREATE TABLE IF NOT EXISTS receipt_objection_pauses (
+  id TEXT PRIMARY KEY,
+  objection_id TEXT NOT NULL REFERENCES receipt_objections(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'paused' CHECK (status IN ('paused', 'resumed')),
+  requested_by_user_id TEXT,
+  resumed_by_user_id TEXT,
+  paused_at INTEGER NOT NULL,
+  remaining_minutes_at_pause INTEGER NOT NULL,
+  paused_offset_ms INTEGER NOT NULL DEFAULT 0,
+  resumed_at INTEGER,
+  note TEXT NOT NULL DEFAULT '',
+  UNIQUE(objection_id, ordinal)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_obj_pauses_one_open
+  ON receipt_objection_pauses(objection_id) WHERE status = 'paused';
+CREATE INDEX IF NOT EXISTS idx_obj_pauses_objection
+  ON receipt_objection_pauses(objection_id, ordinal);
+
+-- 计时台账（只追加）：初始计时、每段顺延、每次暂停/恢复、每次延期、每次迁移
+-- 逐行留档；detail_json 含该段的起讫、类型与原因，供详情页与审计视图逐段说明。
+CREATE TABLE IF NOT EXISTS receipt_objection_timing (
+  id TEXT PRIMARY KEY,
+  objection_id TEXT NOT NULL REFERENCES receipt_objections(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  type TEXT NOT NULL
+    CHECK (type IN ('initial', 'deferral', 'pause', 'resume', 'extension', 'migration')),
+  from_at INTEGER,
+  to_at INTEGER,
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  actor_user_id TEXT,
+  actor_role TEXT NOT NULL DEFAULT 'system',
+  created_at INTEGER NOT NULL,
+  UNIQUE(objection_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_obj_timing_objection
+  ON receipt_objection_timing(objection_id, ordinal);
 `);
 
 // 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
@@ -1407,6 +1517,24 @@ if (columnInfo('users').length > 0 && !columnInfo('users').some((c) => c.name ==
 if (columnInfo('receipt_objections').length > 0
   && !columnInfo('receipt_objections').some((c) => c.name === 'overdue_at')) {
   db.exec('ALTER TABLE receipt_objections ADD COLUMN overdue_at INTEGER;');
+}
+// 可版本化工作日历模块：异议固定（pin）创建时的日历版本。
+// calendar_version=0 表示旧的全天 24 小时兼容日历（沿用自然日 TTL）。
+for (const [column, ddl] of [
+  ['calendar_version_id', "TEXT NOT NULL DEFAULT 'legacy-v0'"],
+  ['calendar_version', 'INTEGER NOT NULL DEFAULT 0'],
+  ['sla_minutes', 'INTEGER NOT NULL DEFAULT 0'],
+  ['remaining_minutes', 'INTEGER NOT NULL DEFAULT 0'],
+  ['anchor_at', 'INTEGER'],
+]) {
+  if (columnInfo('receipt_objections').length > 0
+    && !columnInfo('receipt_objections').some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE receipt_objections ADD COLUMN ${column} ${ddl};`);
+  }
+}
+// 旧异议的 anchor 回填为创建时刻（仅一次）
+if (columnInfo('receipt_objections').some((c) => c.name === 'anchor_at')) {
+  db.prepare('UPDATE receipt_objections SET anchor_at = created_at WHERE anchor_at IS NULL').run();
 }
 for (const [table, column, ddl] of [
   ['review_batch_opinions', 'correction_receipt_no', "TEXT NOT NULL DEFAULT ''"],
@@ -1612,6 +1740,9 @@ seedUser('processor1', '异议处理人一号（角色：processor）', 'process
 seedUser('processor2', '异议处理人二号（角色：processor，分配对照）', 'processor');
 // 主管账号：审批处理人提交的一次延期申请（角色：supervisor）
 seedUser('supervisor1', '异议主管一号（角色：supervisor，审批延期）', 'supervisor');
+
+// 可版本化工作日历：幂等播种 v0（全天兼容日历）+ v1（默认工作日历）并指向 v1
+seedWorkingCalendars();
 
 // 旧库已完成但当时尚未签发回执的记录，在升级时补签（内容按已持久化的确认冻结）
 if (legacyWorkflows || !hasReceipts) {
@@ -3047,3 +3178,21 @@ export {
   listAllExtensionsForAuditor,
   escalationSummaryForObjection,
 } from './objectionEscalationStore.js';
+
+// 可版本化工作日历：统一从 db.js 重导出
+export {
+  publishCalendarVersion,
+  getCurrentCalendarVersion,
+  listCalendarVersions,
+  getCalendarVersionById,
+  getCalendarVersionByVersion,
+  previewObjectionCalendarMigration,
+  confirmObjectionCalendarMigration,
+  getMigrationPreview,
+  listMigrationPreviews,
+  listAllCalendarMigrationsForAuditor,
+  listObjectionTiming,
+  listObjectionPauses,
+  listObjectionMigrations,
+  calendarContextForObjection,
+} from './workingCalendarStore.js';

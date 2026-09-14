@@ -40,8 +40,17 @@ export const config = {
   replayMaxTtlMs: Number(process.env.REPLAY_MAX_TTL_MS || 7 * 24 * 60 * 60 * 1000),
   replayDefaultTtlMs: Number(process.env.REPLAY_DEFAULT_TTL_MS || 60 * 60 * 1000),
   replaySubmitTokenTtlMs: Number(process.env.REPLAY_SUBMIT_TOKEN_TTL_MS || 10 * 60 * 1000),
-  // 回执撤销异议：默认处理期限 7 个自然日（仅影响截止时间与逾期标记，不自动流转）
+  // 回执撤销异议：默认处理期限（日历化后按【工作分钟】计算；旧异议沿用自然日 TTL）
   receiptObjectionTtlMs: Number(process.env.RECEIPT_OBJECTION_TTL_MS || 7 * 24 * 60 * 60 * 1000),
+  // 新异议的办理时长（工作分钟，按异议创建时固定的工作日历版本计算）。
+  // 默认 7 个工作日 × 8 小时（上午 3h + 下午 4h）= 3360 分钟。
+  receiptObjectionSlaMinutes: Number(process.env.RECEIPT_OBJECTION_SLA_MINUTES
+    || 7 * 8 * 60),
+  // 主管批准一次延期后顺延的工作分钟（默认 3 个工作日 × 8 小时）
+  objectionExtensionMinutes: Number(process.env.OBJECTION_EXTENSION_MINUTES || 3 * 8 * 60),
+  // 测试 / 纯自然日语义部署：新异议固定使用全天 24 小时的 v0 兼容日历
+  // （生产默认关闭，新异议使用当前发布的工作日历版本）
+  calendarLegacyDefault: process.env.CALENDAR_LEGACY_DEFAULT === '1',
   // 异议超期升级与通知留痕：
   // 到期前提前提醒时间点（毫秒，逗号分隔；可多个，如 24 小时、2 小时）
   objectionReminderLeadMs: String(process.env.OBJECTION_REMINDER_LEAD_MS
