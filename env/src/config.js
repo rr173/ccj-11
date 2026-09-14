@@ -40,6 +40,8 @@ export const config = {
   replayMaxTtlMs: Number(process.env.REPLAY_MAX_TTL_MS || 7 * 24 * 60 * 60 * 1000),
   replayDefaultTtlMs: Number(process.env.REPLAY_DEFAULT_TTL_MS || 60 * 60 * 1000),
   replaySubmitTokenTtlMs: Number(process.env.REPLAY_SUBMIT_TOKEN_TTL_MS || 10 * 60 * 1000),
+  // 回执撤销异议：默认处理期限 7 个自然日（仅影响截止时间与逾期标记，不自动流转）
+  receiptObjectionTtlMs: Number(process.env.RECEIPT_OBJECTION_TTL_MS || 7 * 24 * 60 * 60 * 1000),
 };
 
 config.isProduction = config.nodeEnv === 'production';

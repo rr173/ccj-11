@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>撤销异议处理工作台（异议处理人）</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <h1>回执撤销异议处理工作台</h1>
+        <p class="subtitle">仅展示分配给当前处理人的异议；回执内容一律脱敏，完整记录仅审计员可查</p>
+      </div>
+      <div class="top-actions">
+        <span id="userName" class="user-box"></span>
+        <button id="logoutBtn" class="button secondary" type="button">退出</button>
+      </div>
+    </header>
+
+    <section id="loginView" class="card login-card">
+      <h2>处理人登录</h2>
+      <p class="muted">演示处理人账号：processor1 / processor2，密码：password123</p>
+      <form id="loginForm">
+        <label>用户名<input name="username" autocomplete="username" required></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+        <div id="loginError" class="alert error hidden"></div>
+        <button class="button primary" type="submit">登录</button>
+      </form>
+    </section>
+
+    <section id="appView" class="app hidden">
+      <div id="globalAlert" class="alert hidden"></div>
+      <section class="card">
+        <div class="receipt-head">
+          <h2>分配给我的异议</h2>
+          <div class="filter-bar">
+            <label>状态筛选
+              <select id="statusFilter">
+                <option value="open">进行中（待受理/已受理/待补充）</option>
+                <option value="">全部</option>
+                <option value="submitted">待受理</option>
+                <option value="accepted">已受理</option>
+                <option value="supplementing">待补充材料</option>
+                <option value="rejected">已驳回</option>
+                <option value="revoked">已确认撤销</option>
+              </select>
+            </label>
+            <button id="refreshBtn" class="button secondary" type="button">刷新</button>
+          </div>
+        </div>
+        <div id="objectionList" class="archive-list"></div>
+      </section>
+      <section id="detailView" class="card hidden"></section>
+    </section>
+  </main>
+  <script type="module" src="/processor.js"></script>
+</body>
+</html>

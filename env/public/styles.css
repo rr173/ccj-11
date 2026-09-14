@@ -259,3 +259,17 @@ a.button { display: inline-block; text-decoration: none; }
 .replay-actions input { flex: 1; min-width: 160px; }
 .replay-opinions { margin: 4px 0; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; }
 .replay-event { padding: 6px; border-radius: 6px; }
+
+/* 回执撤销与异议处理 */
+.badge.warn { background: #fef0c7; color: #b54708; }
+.receipt-objection-item { border-left: 3px solid #f79009; }
+.receipt-objection-card.supplementing { background: #fffaeb; }
+.receipt-objection-card.revoked, .receipt-objection-card.rejected { opacity: .92; }
+.filter-bar { display: flex; gap: 12px; align-items: center; }
+.filter-bar select { padding: 6px 8px; }
+table.kv { width: 100%; border-collapse: collapse; font-size: 13px; margin: 6px 0 12px; }
+table.kv th, table.kv td { border: 1px solid #d8dee9; padding: 6px 10px; text-align: left; vertical-align: top; }
+table.kv th { width: 150px; background: #f5f7fb; font-weight: 600; white-space: nowrap; }
+.material-box { margin: 6px 0; border: 1px solid #e4e7ec; border-radius: 8px; padding: 6px 10px; }
+.material-box summary { cursor: pointer; font-size: 13px; }
+.material-box .archive-pre { margin: 8px 0; }

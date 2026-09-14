@@ -45,6 +45,8 @@ import {
 import * as archiveNs from './archiveStore.js';
 // 版本对比 / 受控重放模块同样惰性访问（其依赖 db.js）
 import * as comparisonNs from './comparisonStore.js';
+// 回执撤销与异议处理模块（其依赖 db.js）：顶层导入，函数在表结构就绪后调用
+import * as objectionNs from './receiptObjectionStore.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -100,7 +102,7 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
   display_name TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'handler' CHECK (role IN ('handler', 'auditor')),
+  role TEXT NOT NULL DEFAULT 'handler' CHECK (role IN ('handler', 'auditor', 'processor')),
   password_salt TEXT NOT NULL,
   password_hash TEXT NOT NULL,
   created_at INTEGER NOT NULL
@@ -1209,6 +1211,88 @@ CREATE TABLE IF NOT EXISTS audit_replay_audit (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_replay_audit_replay ON audit_replay_audit(replay_id, created_at);
+
+-- ---------------------------------------------------------------------------
+-- 回执撤销与异议处理：办理人针对自己持有的有效回执发起一次撤销异议，
+-- 提交时冻结回执快照（snapshot_json 独立复制，原回执之后如何变化都不影响它）。
+-- 处理人（users.role='processor'，记录在 assignee_user_id）受理、要求补充、
+-- 驳回或确认撤销；确认撤销同时把原回执置为 revoked。
+-- 状态机：submitted → accepted ⇄ supplementing → revoked；
+--         accepted/supplementing → rejected。终态 rejected/revoked 不可逆。
+-- 部分唯一索引保证同一回执至多一条进行中（submitted/accepted/supplementing）异议。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS receipt_objections (
+  id TEXT PRIMARY KEY,
+  objection_no TEXT NOT NULL UNIQUE,
+  receipt_no TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  assignee_user_id TEXT,
+  status TEXT NOT NULL DEFAULT 'submitted'
+    CHECK (status IN ('submitted', 'accepted', 'supplementing', 'rejected', 'revoked')),
+  reason TEXT NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  receipt_status_snapshot TEXT NOT NULL DEFAULT 'issued',
+  snapshot_digest TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  deadline_at INTEGER NOT NULL,
+  accepted_at INTEGER,
+  accepted_by_user_id TEXT,
+  supplement_requested_at INTEGER,
+  supplement_requested_by_user_id TEXT,
+  supplement_request_note TEXT NOT NULL DEFAULT '',
+  supplemented_at INTEGER,
+  resolved_at INTEGER,
+  resolved_by_user_id TEXT,
+  resolve_note TEXT NOT NULL DEFAULT '',
+  revoked_receipt_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_receipt_objections_receipt ON receipt_objections(receipt_no, created_at);
+CREATE INDEX IF NOT EXISTS idx_receipt_objections_user ON receipt_objections(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_receipt_objections_assignee ON receipt_objections(assignee_user_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_receipt_objections_workflow ON receipt_objections(workflow_id);
+
+-- 同一回执至多存在一条进行中的异议（两个页面/两次请求并发只放行一个）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_objections_one_open
+  ON receipt_objections(receipt_no) WHERE status IN ('submitted', 'accepted', 'supplementing');
+
+-- 异议处理事件：只追加（INSERT-only）。每一次状态变化记录操作人、时间、原因与
+-- 前后状态；历史事件没有任何 UPDATE/DELETE 路径，处理意见不可覆盖。
+CREATE TABLE IF NOT EXISTS receipt_objection_events (
+  id TEXT PRIMARY KEY,
+  objection_id TEXT NOT NULL REFERENCES receipt_objections(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  from_status TEXT NOT NULL DEFAULT '',
+  to_status TEXT NOT NULL DEFAULT '',
+  actor_user_id TEXT,
+  actor_role TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE(objection_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_receipt_objection_events_objection
+  ON receipt_objection_events(objection_id, ordinal);
+
+-- 文本说明/补充材料：发起时一份（ordinal=0），办理人可在 supplementing 状态追加。
+-- 内容服务端逐字冻结；处理意见与材料永远不被覆盖。
+CREATE TABLE IF NOT EXISTS receipt_objection_materials (
+  id TEXT PRIMARY KEY,
+  objection_id TEXT NOT NULL REFERENCES receipt_objections(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  filename TEXT NOT NULL,
+  content_type TEXT NOT NULL DEFAULT 'text/plain; charset=utf-8',
+  content TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  uploaded_by_user_id TEXT,
+  uploaded_by_role TEXT NOT NULL DEFAULT 'handler',
+  created_at INTEGER NOT NULL,
+  UNIQUE(objection_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_receipt_objection_materials_objection
+  ON receipt_objection_materials(objection_id, ordinal);
 `);
 
 // 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
@@ -1222,6 +1306,32 @@ db.exec(`
 // 审计归档：旧库 users 表补角色列（全新库建表语句已含 role）
 if (columnInfo('users').length > 0 && !columnInfo('users').some((c) => c.name === 'role')) {
   db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'handler';");
+}
+// 撤销异议模块新增 processor 角色：旧库 users 的 CHECK 只允许 handler/auditor，
+// 用“改名重建”方式拓宽约束，会话表通过显式外键引用 users 表名（重建期间关外键）。
+{
+  const usersCheckSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'").get()?.sql || '';
+  if (usersCheckSql && !usersCheckSql.includes('processor')) {
+    db.pragma('foreign_keys = OFF');
+    db.pragma('legacy_alter_table = ON');
+    db.exec('ALTER TABLE users RENAME TO users_old;');
+    db.pragma('legacy_alter_table = OFF');
+    db.exec(`
+      CREATE TABLE users (
+        id TEXT PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'handler' CHECK (role IN ('handler', 'auditor', 'processor')),
+        password_salt TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO users (id, username, display_name, role, password_salt, password_hash, created_at)
+      SELECT id, username, display_name, role, password_salt, password_hash, created_at FROM users_old;
+      DROP TABLE users_old;
+    `);
+    db.pragma('foreign_keys = ON');
+  }
 }
 for (const [table, column, ddl] of [
   ['review_batch_opinions', 'correction_receipt_no', "TEXT NOT NULL DEFAULT ''"],
@@ -1422,6 +1532,9 @@ seedUser('erin', 'Erin 回执测试用户');
 // 审计员账号：只能按归档创建时冻结的角色授权查看脱敏字段、来源关系与摘要链校验结果
 seedUser('auditor1', '审计员一号（角色：auditor）', 'auditor');
 seedUser('auditor2', '审计员二号（角色：auditor，未授权对照）', 'auditor');
+// 异议处理人账号：受理/补充/驳回/确认撤销办理人发起的回执撤销异议
+seedUser('processor1', '异议处理人一号（角色：processor）', 'processor');
+seedUser('processor2', '异议处理人二号（角色：processor，分配对照）', 'processor');
 
 // 旧库已完成但当时尚未签发回执的记录，在升级时补签（内容按已持久化的确认冻结）
 if (legacyWorkflows || !hasReceipts) {
@@ -2579,6 +2692,14 @@ export function getTimelineForUser(userId) {
       caseGroupIdsByPackage.get(anchor).push(groupEntry);
     }
   }
+  // 回执撤销异议按其原回执归组：时间线中紧跟该回执的其他协作条目
+  const objectionEntriesByReceipt = new Map();
+  for (const objectionEntry of objectionNs.buildObjectionTimelineEntries(userId)) {
+    if (!objectionEntriesByReceipt.has(objectionEntry.receiptNo)) {
+      objectionEntriesByReceipt.set(objectionEntry.receiptNo, []);
+    }
+    objectionEntriesByReceipt.get(objectionEntry.receiptNo).push(objectionEntry);
+  }
   for (const entry of entries) {
     withReviews.push(entry);
     if (entry.kind !== 'receipt') continue;
@@ -2635,6 +2756,10 @@ export function getTimelineForUser(userId) {
         })),
       });
     }
+    // 撤销异议条目紧跟回执（在邀请/批次等协作条目之后），带来源关系与完整处理历史
+    for (const objectionEntry of objectionEntriesByReceipt.get(entry.receiptNo) || []) {
+      withReviews.push({ sequence: entry.sequence, ...objectionEntry });
+    }
   }
   return withReviews;
 }
@@ -2679,6 +2804,7 @@ export function getStateForUser(userId) {
   envelope.reviewAppeals = listAppealRoundsForOwner(userId);
   envelope.mediationPackages = listMediationPackagesForOwner(userId);
   envelope.caseGroups = listCaseGroupsForOwner(userId);
+  envelope.receiptObjections = objectionNs.listReceiptObjectionsForOwner(userId);
   // 归档模块通过重导出供路由使用；经命名空间惰性访问，规避模块求值期循环依赖
   envelope.archives = archiveNs.listArchivesForOwner(userId);
   envelope.archiveRejections = archiveNs.listArchiveRejectionsForOwner(userId);
@@ -2802,3 +2928,23 @@ export {
   cancelReplaySession,
   sweepReplaySessions,
 } from './comparisonStore.js';
+
+// 回执撤销与异议处理：统一从 db.js 重导出
+export {
+  createReceiptObjection,
+  acceptReceiptObjection,
+  requestObjectionSupplements,
+  rejectReceiptObjection,
+  confirmObjectionRevocation,
+  supplementReceiptObjection,
+  getOwnerObjection,
+  getProcessorObjection,
+  getAuditorObjection,
+  getOwnerObjectionByNo,
+  getProcessorObjectionByNo,
+  getAuditorObjectionByNo,
+  listReceiptObjectionsForOwner,
+  listAssignedObjections,
+  listAllObjectionsForAuditor,
+  buildObjectionTimelineEntries,
+} from './receiptObjectionStore.js';

@@ -41,6 +41,12 @@
         <p class="muted small">比较报告为只读冻结文档；审计员只能看到按归档脱敏规则处理的版本差异，看不到重放意见原文，也不能进行任何重放写操作。</p>
         <div id="comparisonList" class="archive-list"></div>
       </section>
+      <section class="card">
+        <h2>回执撤销异议完整审计记录</h2>
+        <p class="muted small">审计员按角色权限可查看全部撤销异议：提交时冻结的<b>完整（未脱敏）</b>回执快照、文本说明原文、逐次状态变化（操作人/时间/原因/前后状态）。此区块只读，不提供任何处理操作。</p>
+        <div id="objectionList" class="archive-list"></div>
+      </section>
+      <section id="objectionView" class="card hidden"></section>
       <section id="detailView" class="card hidden"></section>
       <section id="comparisonView" class="card hidden"></section>
     </section>

@@ -68,6 +68,7 @@ async function boot(knownUser = null) {
     $('#appView').classList.remove('hidden');
     await loadArchives();
     await loadComparisons();
+    await loadObjections();
   } catch (error) {
     $('#loginView').classList.remove('hidden');
     $('#appView').classList.add('hidden');
@@ -144,6 +145,106 @@ async function loadDetail(archiveId) {
 }
 
 boot();
+
+// ---------------------------------------------------------------------------
+// 回执撤销异议：审计员可查看全部异议的完整（未脱敏）审计记录（只读）
+// ---------------------------------------------------------------------------
+const OBJECTION_STATUS_LABELS = {
+  submitted: '待受理', accepted: '已受理', supplementing: '待补充材料',
+  rejected: '已驳回', revoked: '已确认撤销',
+};
+const OBJECTION_EVENT_TEXT = {
+  'receipt.objection.submitted': '发起异议',
+  'receipt.objection.accepted': '受理',
+  'receipt.objection.supplement-requested': '要求补充材料',
+  'receipt.objection.supplemented': '办理人补充材料',
+  'receipt.objection.rejected': '驳回',
+  'receipt.objection.revocation-confirmed': '确认撤销',
+};
+
+async function loadObjections() {
+  const result = await api('GET', '/api/auditor/receipt-objections');
+  const list = $('#objectionList');
+  if (!result.objections.length) {
+    list.innerHTML = '<p class="muted">当前没有撤销异议记录。</p>';
+    return;
+  }
+  list.innerHTML = result.objections.map((o) => `
+    <div class="archive-item card-inner">
+      <div class="record-main">
+        <b class="mono">${escapeHtml(o.objectionNo)}</b>
+        <span class="tag ${o.status === 'revoked' ? 'tag-reject' : o.status === 'rejected' ? 'tag-warn' : 'tag-ok'}">
+          ${escapeHtml(OBJECTION_STATUS_LABELS[o.status] || o.status)}
+        </span>
+      </div>
+      <div class="muted small">
+        来源回执 <span class="mono">${escapeHtml(o.receiptNo)}</span>
+        · 发起人：${escapeHtml(o.owner?.displayName || '—')}
+        · 处理人：${escapeHtml(o.assignee?.displayName || '—')}
+      </div>
+      <div class="muted small">
+        发起于 ${formatTime(o.createdAt)} · 处理期限至 ${formatTime(o.deadlineAt)}
+        ${o.resolvedAt ? ` · 完结于 ${formatTime(o.resolvedAt)}` : ''}
+        · 历史事件 ${o.eventCount} 条 · 文本材料 ${o.materialCount} 份
+      </div>
+      <div class="record-actions">
+        <button class="button secondary" type="button" data-objection="${escapeHtml(o.objectionNo)}">查阅完整审计记录</button>
+      </div>
+    </div>`).join('');
+  list.querySelectorAll('[data-objection]').forEach((btn) => {
+    btn.addEventListener('click', () => loadObjectionDetail(btn.dataset.objection));
+  });
+}
+
+async function loadObjectionDetail(objectionNo) {
+  const view = $('#objectionView');
+  view.classList.remove('hidden');
+  view.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  view.innerHTML = '<p class="muted">加载中…</p>';
+  try {
+    const { objection: o } = await api('GET', `/api/auditor/receipt-objections/${encodeURIComponent(objectionNo)}`);
+    const stepsHtml = (o.fullSnapshot.steps || []).map((s, i) => `
+      <div class="confirmation">
+        <strong>${i + 1}. ${escapeHtml(s.title)}</strong>
+        <div class="muted small">确认时间：${formatTime(s.confirmedAt)}</div>
+        <pre class="archive-pre">${escapeHtml(JSON.stringify(s.data, null, 2))}</pre>
+      </div>`).join('');
+    const materialsHtml = (o.materials || []).map((m) => `
+      <details class="material-box">
+        <summary>${escapeHtml(m.filename)} · ${m.sizeBytes} 字节 ·
+          ${m.uploadedByRole === 'handler' ? '办理人' : '处理人'}${m.uploadedBy ? `：${escapeHtml(m.uploadedBy)}` : ''} ·
+          上传于 ${formatTime(m.uploadedAt)}${m.note ? ` · ${escapeHtml(m.note)}` : ''}</summary>
+        <pre class="archive-pre">${escapeHtml(m.content || '')}</pre>
+      </details>`).join('');
+    const eventsHtml = (o.events || []).map((e) => `
+      <li>
+        <span class="mono small">${escapeHtml(OBJECTION_EVENT_TEXT[e.type] || e.type)}</span>
+        <span class="muted small">${formatTime(e.at)} · ${e.actorRole === 'handler' ? '办理人' : e.actorRole === 'processor' ? '处理人' : escapeHtml(e.actorRole)}${e.actorName ? `：${escapeHtml(e.actorName)}` : ''}
+          ${e.fromStatus ? ` · ${escapeHtml(OBJECTION_STATUS_LABELS[e.fromStatus] || e.fromStatus)} → ${escapeHtml(OBJECTION_STATUS_LABELS[e.toStatus] || e.toStatus)}` : ''}</span>
+        ${e.reason ? `<div class="small">原因：${escapeHtml(e.reason)}</div>` : ''}
+        ${e.note ? `<div class="small">备注：${escapeHtml(e.note)}</div>` : ''}
+      </li>`).join('');
+    view.innerHTML = `
+      <h2>撤销异议完整审计记录 <span class="mono">${escapeHtml(o.objectionNo)}</span>
+        <span class="tag ${o.status === 'revoked' ? 'tag-reject' : 'tag-ok'}">${escapeHtml(OBJECTION_STATUS_LABELS[o.status] || o.status)}</span></h2>
+      <p class="muted small">
+        来源回执 <span class="mono">${escapeHtml(o.receiptNo)}</span> · 原回执当前状态：${o.currentReceiptStatus === 'revoked' ? '已撤销' : '有效'}
+        ${o.currentReceiptRevokedAt ? `（撤销于 ${formatTime(o.currentReceiptRevokedAt)}）` : ''}
+        · 冻结快照 SHA-256：<span class="mono small">${escapeHtml(o.snapshotDigest)}</span>
+      </p>
+      <div class="small"><b>异议原因：</b>${escapeHtml(o.reason)}</div>
+      <div class="small">发起人：${escapeHtml(o.owner?.displayName || '—')} · 处理人：${escapeHtml(o.assignee?.displayName || '—')}
+        · 发起于 ${formatTime(o.createdAt)} · 处理期限至 ${formatTime(o.deadlineAt)}</div>
+      <h3>冻结回执快照（完整未脱敏，提交异议瞬间冻结）</h3>
+      ${stepsHtml}
+      <h3>文本说明与补充材料（原文）</h3>
+      ${materialsHtml || '<p class="muted small">无</p>'}
+      <h3>处理历史（${(o.events || []).length} 条，只追加不可覆盖）</h3>
+      <ol class="archive-events">${eventsHtml}</ol>`;
+  } catch (error) {
+    view.innerHTML = `<div class="alert error">${escapeHtml(error.message)}</div>`;
+  }
+}
 
 // 比较报告：只有同时被两个版本授权时才出现在列表中；条目按归档脱敏规则处理
 const COMPARE_STATUS_TEXT = {

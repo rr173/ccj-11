@@ -8,7 +8,8 @@
 - `bob` / `password123`
 - `carol` / `password123`
 - `dave` / `erin`（回执功能测试账号，密码相同）
-- `auditor1` / `auditor2`（审计员角色账号，密码相同；`auditor2` 为未授权对照账号，只能看到显式授权的归档脱敏视图）
+- `processor1` / `processor2`（异议处理人角色账号，密码相同；处理撤销异议，只能看到分配给自己的异议与脱敏回执）
+- `auditor1` / `auditor2`（审计员角色账号，密码相同；`auditor2` 为未授权对照账号，只能看到显式授权的归档脱敏视图；审计员均可只读查看全部撤销异议的完整审计记录）
 
 可通过环境变量 `DEMO_PASSWORD` 修改演示密码。生产环境应替换为正式的用户目录、密码轮换和 HTTPS。
 
@@ -46,6 +47,7 @@ docker compose up -d --build
 - **分阶段复核编排：阶段顺序与状态、每阶段邀请/字段范围与阈值、开始时冻结的超时策略与倒计时、超时落定结果、编排配置版本与完整变更历史**
 - **复核申诉回合：只能针对原批次已驳回字段发起；独立限时与一次性新邀请、逐邀请字段授权、独立接受/驳回阈值；只引用原批次冻结快照（脱敏字段+原驳回决议+显式授权并匿名化的证据摘要）；申诉意见合并/幂等、逐字段决议、“接受申诉→同一份更正→关联申诉意见与原批次来源→新回执”、取消/过期写拒绝与完整审计时间线**
 - **争议调解包（两层处理）：只能从【已完成】申诉回合的驳回字段生成只读调解包，冻结原批次决议、申诉意见、授权证据与当前更正来源（原批次/申诉历史永不改写）；第一层 2-5 名新调解人独立限时意见，第一层驳回字段达到升级条件后，第二层 3-5 名仲裁人才按冻结快照开放（只能看到第一层允许披露的结论摘要与选中证据）；仲裁接受同时关联调解包、上一层结论与原批次来源进入新的更正办理，同一调解包至多一份进行中更正；取消/超时写拒绝、超时策略只落定一次、服务重启后两层关系与时间线完整（`review.mediation.*` 事件）**
+- **回执撤销异议：异议编号/状态/处理期限、提交时独立冻结的回执快照、文本说明与逐份补充材料、只追加的完整处理历史（操作人/时间/原因/前后状态）、处理人分配与确认撤销后的回执状态全部持久化；刷新、重登、服务重启后异议状态、处理意见与时间线保持一致（`receipt_objections` / `receipt_objection_events` / `receipt_objection_materials`）**
 - **回执核验码密钥 `receipt-secret.key`（核验能力依赖它，务必随数据卷备份）**
 
 默认监听 3000。若由反向代理终止 HTTPS，请设置：
@@ -205,6 +207,59 @@ COOKIE_SECURE: "1"
 - 邀请、复核会话、异议、处理结果与关联全部存入 SQLite（`review_invitations` / `review_sessions` / `review_objections` / `correction_objections`），刷新、重新登录或服务重启后保留；审计事件（`review.invitation.created/consumed/revoked`、`review.objection.submitted/accepted/rejected/reopened`、`review.correction.completed`）写入回执对应办理记录。
 - `/api/state` 时间线在对应回执之后插入 `kind: 'review'` 条目：邀请状态（待使用/已使用/已撤销/已过期）、异议数量、每条异议的字段、说明、提交时间、处理结果，以及“接受异议 → 更正办理 → 新回执”的来源关系；更正完成后条目直接展示新回执编号。
 - 办理人界面：回执卡片下方“回执复核协作”面板可创建邀请、复制/撤销链接、逐条接受/驳回；时间线条目内也可直接处理。复核人界面：`GET /review` 展示脱敏字段（每个字段可一键发起异议）、异议提交表单与本人异议的处理结果。
+
+
+## 回执撤销与异议处理
+
+办理人可以针对**自己持有的有效回执**发起一次“撤销异议”：填写异议原因（5-500 字）并上传**一份 `.txt` 纯文本说明**（≤64KB）。系统在提交瞬间**冻结回执快照**（独立复制一份，原回执之后如何变化都不影响它），生成异议编号（`YY-YYYYMMDD-XXXXXXXX`，Crockford Base32）、当前状态（`submitted`）与处理期限（默认 7 个自然日，`RECEIPT_OBJECTION_TTL_MS`，逾期仅标记不改状态）。异议自动分配给当前在办量最少的处理人账号（`processor` 角色）。
+
+### 1. 发起限制（明确拒绝）
+
+| 情况 | HTTP | 错误码 |
+| --- | --- | --- |
+| 未登录 | 401 | `UNAUTHENTICATED` |
+| 回执不存在 / 不属于当前账号 | 404 | `RECEIPT_NOT_FOUND` |
+| 回执已撤销 | 409 | `RECEIPT_REVOKED` |
+| 该回执已有进行中异议 | 409 | `OBJECTION_IN_PROGRESS` |
+| 原因长度不合法 / 缺少文本附件 / 附件非 `.txt` 或超过 64KB | 400 | `INVALID_REASON` / `ATTACHMENT_*` |
+| 当前没有处理人账号 | 503 | `NO_PROCESSOR_AVAILABLE` |
+
+同一回执的**进行中异议至多一条**（`submitted/accepted/supplementing`，部分唯一索引兜底并发）；异议进入终态（`rejected/revoked`）后可再次发起。
+
+### 2. 处理人与状态机
+
+异议处理人在 `/processor` 工作台（演示账号 `processor1` / `processor2`）只能看到**分配给自己**的异议（未分配的访问返回 404），且看到的是**脱敏回执内容**（复用复核脱敏规则：姓名/手机号/证件号/详细地址全部遮罩），可读取文本说明原文。处理动作：
+
+```
+submitted ──受理(accept)──▶ accepted
+accepted  ──要求补充材料(request-supplements，必须填写说明)──▶ supplementing
+supplementing ──办理人补充(supplement，必须再上传一份 .txt 与说明)──▶ accepted
+accepted  ──确认撤销(confirm-revocation)──▶ revoked（终态，原回执同事务置为 revoked）
+accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ rejected（终态）
+```
+
+任何非法跳转（如未受理先驳回、`supplementing` 直接确认撤销、已终态重复操作）都返回 `409 OBJECTION_INVALID_TRANSITION` 或 `409 OBJECTION_ALREADY_HANDLED`，历史不被覆盖。所有状态变化在 `BEGIN IMMEDIATE` 事务中以“当前状态 + 行级条件更新”为唯一判定，并发处理只有一个成功。
+
+**确认撤销后**：原回执状态置为 `revoked`（记录撤销时间与“经异议确认撤销”原因），免登录核验接口 `POST /api/verify` 返回 `410 RECEIPT_REVOKED`；但原始快照永久留档，办理人仍可查本人回执，授权审计员可查看完整记录。
+
+### 3. 处理意见与历史只追加、不可覆盖
+
+- `receipt_objection_events` 为只追加表：每次状态变化记录操作人、操作角色、时间、原因/备注与前后状态（`from_status → to_status`），没有任何 UPDATE/DELETE 路径；重复处理返回同一历史。
+- 文本说明（初始 1 份 + 每次补充 1 份）逐字冻结在 `receipt_objection_materials`，列表只回传摘要（文件名/字节数/行数/上传时间），正文仅在详情接口返回。
+- 办理人刷新、重新登录或**服务重启**后仍能看到异议状态、处理意见（驳回理由、补充要求、确认撤销意见）、文本材料与完整时间线。
+
+### 4. 权限分级
+
+- **办理人**（handler）：只能发起/查看/补充自己的异议；回执申请人信息同样只返回脱敏结果。
+- **处理人**（processor）：只能访问 `/api/processor/*`，看到被分配异议的脱敏回执；不能访问办理、审计等任何其他接口。
+- **审计员**（auditor）：`/api/auditor/receipt-objections` 只读，可按权限查看**全部**异议的完整审计记录——未脱敏冻结快照、文本原文、逐次状态变化、快照 SHA-256 摘要与原回执当前状态；没有任何写操作。
+
+### 5. 接口与时间线
+
+- 办理人：`POST/GET /api/receipt-objections`、`GET /api/receipt-objections/{YY编号}`、`POST /api/receipt-objections/{YY编号}/supplement`。
+- 处理人：`GET /api/processor/objections[?status=]`、`GET /api/processor/objections/{YY编号}`、`POST /api/processor/objections/{YY编号}/{accept|request-supplements|reject|confirm-revocation}`。
+- 审计员：`GET /api/auditor/receipt-objections[?receiptNo=&status=]`、`GET /api/auditor/receipt-objections/{YY编号}`。
+- `/api/state` 的回执版本时间线在对应回执之后插入 `kind: 'receiptObjection'` 条目，携带异议编号、来源回执、状态、处理期限与完整处理历史（`receipt.objection.*` 事件同时写入回执所属办理记录的审计时间线）。
 
 
 ## 分阶段复核编排（staged orchestration）
@@ -523,6 +578,18 @@ COOKIE_SECURE: "1"
 | POST | `/api/replay-sessions/{id}/resume` | 是（办理人） | 恢复重放（重新校验报告 digest 与双归档摘要链、版本未变化） |
 | POST | `/api/replay-sessions/{id}/cancel` | 是（办理人） | 取消重放（会话只读，历史意见与审计事件保留） |
 | GET | `/api/auditor/comparisons[/{id}]` | 是（审计员） | 仅当同时被两个版本授权时可见的脱敏比较内容（不含任何重放意见） |
+| POST | `/api/receipt-objections` | 是（办理人） | 对本人有效回执发起撤销异议（原因 + 一份 .txt 文本说明；冻结快照/编号/处理期限） |
+| GET | `/api/receipt-objections[?receiptNo=]` | 是（办理人） | 本人撤销异议列表（脱敏申请人、材料摘要） |
+| GET | `/api/receipt-objections/{YY编号}` | 是（办理人） | 本人异议详情（完整处理历史、材料摘要、处理意见） |
+| POST | `/api/receipt-objections/{YY编号}/supplement` | 是（办理人） | 在“待补充材料”状态追加一份 .txt 与说明，异议回到已受理 |
+| GET | `/api/processor/objections[?status=]` | 是（处理人） | 分配给当前处理人的异议列表 |
+| GET | `/api/processor/objections/{YY编号}` | 是（处理人） | 被分配异议详情（脱敏回执、材料原文、完整历史） |
+| POST | `/api/processor/objections/{YY编号}/accept` | 是（处理人） | 受理（submitted → accepted） |
+| POST | `/api/processor/objections/{YY编号}/request-supplements` | 是（处理人） | 要求补充材料（accepted → supplementing，必带说明） |
+| POST | `/api/processor/objections/{YY编号}/reject` | 是（处理人） | 驳回（accepted/supplementing → rejected，理由 5-300 字） |
+| POST | `/api/processor/objections/{YY编号}/confirm-revocation` | 是（处理人） | 确认撤销（accepted → revoked，同事务撤销原回执） |
+| GET | `/api/auditor/receipt-objections[?receiptNo=&status=]` | 是（审计员） | 全部撤销异议列表（只读、脱敏摘要） |
+| GET | `/api/auditor/receipt-objections/{YY编号}` | 是（审计员） | 完整审计记录（未脱敏冻结快照、文本原文、逐次状态变化） |
 | POST | `/api/archives/external-verify` | 否 | 外部一次性核验码核验，仅返回事件数量/时间范围/摘要链连续性/最终状态 |
 | POST | `/api/verify` | 否 | 编号+核验码核验，仅返回脱敏结果，按 IP 限流 |
 | GET | `/api/public/receipts/{no}/print?code=` | 否 | 脱敏可打印回执文档 |
@@ -533,6 +600,7 @@ COOKIE_SECURE: "1"
 | GET | `/mediation-review` | 否 | 免登录第一层调解评议页面（先完成调解邀请校验，只展示本层授权内容） |
 | GET | `/arbitration-review` | 否 | 免登录第二层仲裁评议页面（第一层升级后才开放） |
 | GET | `/auditor` | 否（审计员登录） | 审计员归档查阅页面 |
+| GET | `/processor` | 否（处理人登录） | 异议处理人工作台（受理/补充/驳回/确认撤销） |
 | GET | `/archive-verify` | 否 | 免登录归档外部核验页面（一次性核验码） |
 
 所有非 GET 的登录态接口要求 `X-CSRF-Token`。会话 Cookie 为 `HttpOnly; SameSite=Lax`，HTTPS 环境可启用 `Secure`。
@@ -542,6 +610,9 @@ COOKIE_SECURE: "1"
 - `workflows`：多条记录（`sequence`、`status`、`source_receipt_no`），部分唯一索引保证每人至多一条 `open`、同一回执至多一条进行中的更正
 - `workflow_steps.draft_json / confirmed_json / confirmed_at`：草稿与服务端确认
 - `receipts`：回执编号（唯一）、固定快照、状态（`issued`/`revoked`）、撤销时间与原因
+- `receipt_objections`：回执撤销异议（编号 `YY-…`、归属回执/办理/办理人、处理人分配、状态 `submitted/accepted/supplementing/rejected/revoked`、原因、**提交时独立复制的冻结快照**与 SHA-256 摘要、发起时间与处理期限、受理/补充/终局各列）；部分唯一索引保证同一回执至多一条进行中异议
+- `receipt_objection_events`：异议状态变化的只追加历史（顺序号、动作类型、前后状态、操作人/角色、原因/备注、时间），无任何更新/删除路径
+- `receipt_objection_materials`：文本说明与补充材料（每份异议顺序号、文件名、逐字正文、上传人/角色、备注、时间）；列表只下发摘要，正文仅详情接口返回
 - `review_invitations`：复核邀请（令牌只存哈希、有效期、`active/used/revoked/expired` 状态、使用时间/来源）
 - `review_sessions`：免登录复核会话（只存令牌哈希、绑定邀请与单份回执、独立 CSRF、有效期）
 - `review_objections`：字段级异议（字段、脱敏值快照、说明、`open/accepted/rejected`、提交/处理时间、处理人、驳回理由、关联更正办理与新回执编号、咨询锁、幂等键）
@@ -617,4 +688,5 @@ SQLite 启用 WAL 和外键；所有推进与回执签发都在同步 `BEGIN IMM
 | `REPLAY_MAX_TTL_MS` | `604800000` | 受控重放会话最长有效期（7 天） |
 | `REPLAY_DEFAULT_TTL_MS` | `3600000` | 重放会话默认有效期（1 小时） |
 | `REPLAY_SUBMIT_TOKEN_TTL_MS` | `600000` | 重放一次性提交令牌有效期（10 分钟） |
+| `RECEIPT_OBJECTION_TTL_MS` | `604800000` | 撤销异议处理期限（默认 7 个自然日；仅决定截止时间与逾期标记，不自动流转） |
 | `DISPLAY_TIMEZONE` | `Asia/Shanghai` | 回执文档时间展示时区 |

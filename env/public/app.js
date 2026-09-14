@@ -41,7 +41,7 @@ const els = {
   userBox: $('#userBox'), userName: $('#userName'), logoutBtn: $('#logoutBtn'), stepList: $('#stepList'),
   stateVersion: $('#stateVersion'), currentStepLabel: $('#currentStepLabel'), globalAlert: $('#globalAlert'),
   stepForm: $('#stepForm'), receiptPanel: $('#receiptPanel'), correctionPanel: $('#correctionPanel'),
-  reviewPanel: $('#reviewPanel'), batchPanel: $('#batchPanel'),
+  reviewPanel: $('#reviewPanel'), objectionPanel: $('#objectionPanel'), batchPanel: $('#batchPanel'),
   archivePanel: $('#archivePanel'),
   comparisonPanel: $('#comparisonPanel'),
   recordsPanel: $('#recordsPanel'), recordsList: $('#recordsList'),
@@ -56,6 +56,7 @@ const state = {
   timeline: [],
   correction: null,
   reviews: { invitations: [], objections: [] },
+  receiptObjections: [],
   reviewBatches: [],
   reviewAppeals: [],
   mediationPackages: [],
@@ -116,6 +117,7 @@ function applyState(result) {
   state.timeline = Array.isArray(result.timeline) ? result.timeline : [];
   state.correction = result.correction || null;
   state.reviews = result.reviews || { invitations: [], objections: [] };
+  state.receiptObjections = Array.isArray(result.receiptObjections) ? result.receiptObjections : [];
   state.reviewBatches = Array.isArray(result.reviewBatches) ? result.reviewBatches : [];
   state.reviewAppeals = Array.isArray(result.reviewAppeals) ? result.reviewAppeals : [];
   state.mediationPackages = Array.isArray(result.mediationPackages) ? result.mediationPackages : [];
@@ -152,6 +154,7 @@ async function logout() {
     state.timeline = [];
     state.correction = null;
     state.reviews = { invitations: [], objections: [] };
+    state.receiptObjections = [];
     state.reviewBatches = [];
     state.reviewAppeals = [];
     state.mediationPackages = [];
@@ -184,6 +187,7 @@ function render() {
   renderCorrectionPanel();
   if (state.workflow.completed) {
     renderReceipt(state.receipt || state.viewingReceipt || null);
+    renderObjectionPanel();
     renderReviewPanel();
     renderBatchPanel();
     renderArchivePanel();
@@ -192,6 +196,7 @@ function render() {
   }
   if (state.viewingReceipt) {
     renderReceipt(state.viewingReceipt);
+    renderObjectionPanel();
     renderReviewPanel();
     renderBatchPanel();
     renderArchivePanel();
@@ -201,6 +206,7 @@ function render() {
   state.viewingReceipt = null;
   els.receiptPanel.classList.add('hidden');
   els.receiptPanel.innerHTML = '';
+  if (els.objectionPanel) { els.objectionPanel.classList.add('hidden'); els.objectionPanel.innerHTML = ''; }
   els.reviewPanel.classList.add('hidden');
   els.reviewPanel.innerHTML = '';
   els.batchPanel.classList.add('hidden');
@@ -590,6 +596,9 @@ function renderTimeline() {
     } else if (entry.kind === 'mediationPackage') {
       li.className = 'record-item mediation-item';
       li.append(renderMediationTimelineCard(entry));
+    } else if (entry.kind === 'receiptObjection') {
+      li.className = 'record-item receipt-objection-item';
+      li.append(renderReceiptObjectionTimelineCard(entry));
     } else {
       li.className = 'record-item in-progress';
       li.innerHTML = `
@@ -1248,6 +1257,255 @@ function renderReviewPanel() {
 function cssEscape(value) {
   if (window.CSS && CSS.escape) return CSS.escape(value);
   return value.replace(/["\\]/g, '\\$&');
+}
+
+// ---------------------------------------------------------------------------
+// 回执撤销与异议处理（办理人侧）
+// ---------------------------------------------------------------------------
+
+const RECEIPT_OBJECTION_STATUS = {
+  submitted: ['待受理', 'current'],
+  accepted: ['已受理', 'confirmed'],
+  supplementing: ['待补充材料', 'warn'],
+  rejected: ['已驳回', 'invalidated'],
+  revoked: ['已确认撤销', 'invalidated'],
+};
+const RECEIPT_OBJECTION_EVENT_TEXT = {
+  'receipt.objection.submitted': '发起异议',
+  'receipt.objection.accepted': '受理',
+  'receipt.objection.supplement-requested': '要求补充材料',
+  'receipt.objection.supplemented': '办理人补充材料',
+  'receipt.objection.rejected': '驳回',
+  'receipt.objection.revocation-confirmed': '确认撤销',
+};
+
+function renderReceiptObjectionTimelineCard(entry) {
+  const card = document.createElement('div');
+  const [statusText, statusCls] = RECEIPT_OBJECTION_STATUS[entry.status] || [entry.status, 'current'];
+  const eventsHtml = (entry.events || []).map((event) => `
+    <li class="muted small">
+      ${formatTime(event.at)} · ${escapeHtml(RECEIPT_OBJECTION_EVENT_TEXT[event.type] || event.type)}
+      （${event.actorRole === 'handler' ? '办理人' : event.actorRole === 'processor' ? '处理人' : escapeHtml(event.actorRole)}${event.actorName ? `：${escapeHtml(event.actorName)}` : ''}）
+      ${event.reason ? ` · ${escapeHtml(event.reason)}` : ''}${event.note ? ` · ${escapeHtml(event.note)}` : ''}
+    </li>`).join('');
+  card.innerHTML = `
+    <div class="record-main">
+      <span>↳ 撤销异议 <span class="mono small">${escapeHtml(entry.objectionNo)}</span>
+        （来源回执 <span class="mono small">${escapeHtml(entry.receiptNo)}</span>）</span>
+      <span class="badge ${statusCls}">${statusText}${entry.overdue ? ' · 已逾处理期限' : ''}</span>
+    </div>
+    <div class="muted small">发起于 ${formatTime(entry.createdAt)} · 处理期限至 ${formatTime(entry.deadlineAt)}
+      ${entry.resolvedAt ? ` · 处理完结于 ${formatTime(entry.resolvedAt)}` : ''}</div>
+    <details class="batch-history" open>
+      <summary class="muted small">处理历史（${(entry.events || []).length} 条，只追加不可覆盖）</summary>
+      <ul class="batch-history-list">${eventsHtml}</ul>
+    </details>
+    <div class="record-actions"></div>`;
+  const actions = card.querySelector('.record-actions');
+  const detailBtn = document.createElement('button');
+  detailBtn.type = 'button';
+  detailBtn.className = 'link-button muted-link';
+  detailBtn.textContent = '查看异议详情';
+  detailBtn.addEventListener('click', () => loadReceiptObjection(entry.objectionNo));
+  actions.append(detailBtn);
+  if (entry.status === 'supplementing') {
+    const supplementBtn = document.createElement('button');
+    supplementBtn.type = 'button';
+    supplementBtn.className = 'link-button';
+    supplementBtn.textContent = '补充材料';
+    supplementBtn.addEventListener('click', () => supplementReceiptObjection(entry.objectionNo));
+    actions.append(supplementBtn);
+  }
+  return card;
+}
+
+function renderObjectionPanel() {
+  const panel = els.objectionPanel;
+  if (!panel) return;
+  const receiptNo = state.receipt?.receiptNo || state.viewingReceipt?.receiptNo;
+  if (!receiptNo) {
+    panel.classList.add('hidden');
+    panel.innerHTML = '';
+    return;
+  }
+  panel.classList.remove('hidden');
+  const receipt = state.receipt?.receiptNo === receiptNo ? state.receipt : state.viewingReceipt;
+  const revoked = receipt?.status === 'revoked';
+  const objections = (state.receiptObjections || []).filter((o) => o.receiptNo === receiptNo);
+  const openObjection = objections.find((o) => ['submitted', 'accepted', 'supplementing'].includes(o.status));
+
+  const cardsHtml = objections.map((o) => {
+    const [statusText, statusCls] = RECEIPT_OBJECTION_STATUS[o.status] || [o.status, 'current'];
+    const materials = (o.materials || []).map((m) => `
+      <li class="muted small">${escapeHtml(m.filename)} · ${m.sizeBytes} 字节 · ${m.lineCount} 行
+        · ${m.uploadedByRole === 'handler' ? '办理人' : '处理人'} 上传于 ${formatTime(m.uploadedAt)}</li>`).join('');
+    const events = (o.events || []).map((event) => `
+      <li class="muted small">
+        ${formatTime(event.at)} · ${escapeHtml(RECEIPT_OBJECTION_EVENT_TEXT[event.type] || event.type)}
+        （${event.actorRole === 'handler' ? '办理人' : event.actorRole === 'processor' ? '处理人' : escapeHtml(event.actorRole)}）
+        ${event.reason ? ` · ${escapeHtml(event.reason)}` : ''}${event.note ? ` · ${escapeHtml(event.note)}` : ''}
+      </li>`).join('');
+    return `
+      <li class="objection-item receipt-objection-card ${o.status}" data-no="${escapeHtml(o.objectionNo)}">
+        <div class="record-main">
+          <b class="mono">${escapeHtml(o.objectionNo)}</b>
+          <span class="badge ${statusCls}">${statusText}${o.overdue ? ' · 已逾期限' : ''}</span>
+        </div>
+        <div class="muted small">发起于 ${formatTime(o.createdAt)} · 处理期限至 ${formatTime(o.deadlineAt)}
+          ${o.assignee ? ` · 处理人：${escapeHtml(o.assignee.displayName)}` : ''}</div>
+        <div class="small">异议原因：${escapeHtml(o.reason)}</div>
+        ${o.supplementNote ? `<div class="small review-obj-result">处理人要求补充：${escapeHtml(o.supplementNote)}</div>` : ''}
+        ${o.resolveNote ? `<div class="small review-obj-result">处理意见：${escapeHtml(o.resolveNote)}（${formatTime(o.resolvedAt)}）</div>` : ''}
+        ${o.receiptRevokedAt ? `<div class="small review-obj-result">原回执已于 ${formatTime(o.receiptRevokedAt)} 被撤销，核验接口将返回“已撤销”；冻结快照仍可供审计查看。</div>` : ''}
+        <ul class="batch-invite-list">${materials || '<li class="muted small">文本说明加载中…</li>'}</ul>
+        <details class="batch-history"><summary class="muted small">完整处理历史（${(o.events || []).length}）</summary>
+          <ul class="batch-history-list">${events}</ul></details>
+        <div class="record-actions" data-ro-actions="${escapeHtml(o.objectionNo)}"></div>
+      </li>`;
+  }).join('');
+
+  panel.innerHTML = `
+    <div class="receipt-head">
+      <h2>回执撤销与异议</h2>
+      <span class="muted small">对本回执内容有异议可申请撤销；提交时冻结回执快照，处理期限 7 天</span>
+    </div>
+    ${revoked
+      ? '<p class="muted small">本回执已撤销，不能再发起撤销异议；原始快照仍留档可查。</p>'
+      : openObjection
+        ? `<p class="muted small">该回执存在一份进行中的异议（<b class="mono">${escapeHtml(openObjection.objectionNo)}</b>：${escapeHtml((RECEIPT_OBJECTION_STATUS[openObjection.status] || [openObjection.status])[0])}），处理完成前不能重复发起。</p>`
+        : '<div class="receipt-actions"><button class="button danger" type="button" data-action="new-objection">发起撤销异议（填写原因并上传文本说明）</button></div>'}
+    <h3>我的撤销异议</h3>
+    <ul class="objection-list">${cardsHtml || '<li class="muted small">尚未发起撤销异议。</li>'}</ul>`;
+
+  panel.querySelector('[data-action="new-objection"]')?.addEventListener('click', () => openObjectionBuilder(receiptNo));
+  objections.forEach((o) => {
+    const box = panel.querySelector(`[data-ro-actions="${cssEscape(o.objectionNo)}"]`);
+    if (!box) return;
+    const detailBtn = document.createElement('button');
+    detailBtn.type = 'button';
+    detailBtn.className = 'link-button muted-link';
+    detailBtn.textContent = '刷新详情（处理意见/历史）';
+    detailBtn.addEventListener('click', () => loadReceiptObjection(o.objectionNo));
+    box.append(detailBtn);
+    if (o.status === 'supplementing') {
+      const supplementBtn = document.createElement('button');
+      supplementBtn.type = 'button';
+      supplementBtn.className = 'link-button';
+      supplementBtn.textContent = '补充材料（上传文本）';
+      supplementBtn.addEventListener('click', () => supplementReceiptObjection(o.objectionNo));
+      box.append(supplementBtn);
+    }
+  });
+}
+
+function readTextFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      const comma = result.indexOf(',');
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error || new Error('文件读取失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function pickTextAttachment() {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.txt,text/plain';
+    input.addEventListener('change', async () => {
+      const file = input.files && input.files[0];
+      if (!file) return resolve(null);
+      if (!/\.txt$/i.test(file.name)) {
+        showAlert('只允许上传 .txt 纯文本说明。', 'error');
+        return resolve(null);
+      }
+      if (file.size > 64 * 1024) {
+        showAlert('文本说明不能超过 64KB。', 'error');
+        return resolve(null);
+      }
+      try {
+        const contentBase64 = await readTextFileAsBase64(file);
+        resolve({ filename: file.name, contentType: 'text/plain; charset=utf-8', contentBase64 });
+      } catch (error) {
+        showAlert(error.message || '文件读取失败', 'error');
+        resolve(null);
+      }
+    }, { once: true });
+    // 取消选择时 resolve(null)（cancel 事件在文件选择框取消时触发）
+    input.addEventListener('cancel', () => resolve(null), { once: true });
+    input.click();
+  });
+}
+
+async function openObjectionBuilder(receiptNo) {
+  const reason = window.prompt('请填写异议原因（5-500 字）：', '');
+  if (reason === null) return;
+  if (reason.trim().length < 5 || reason.trim().length > 500) {
+    showAlert('异议原因需为 5-500 个字符。', 'error');
+    return;
+  }
+  const attachment = await pickTextAttachment();
+  if (!attachment) {
+    showAlert('必须上传一份 .txt 文本说明。', 'error');
+    return;
+  }
+  if (state.busy) return;
+  state.busy = true;
+  try {
+    const result = await api('POST', '/api/receipt-objections', { receiptNo, reason: reason.trim(), attachment });
+    state.receiptObjections = result.receiptObjections || state.receiptObjections;
+    state.timeline = result.timeline || state.timeline;
+    showAlert(`异议已提交，编号 ${result.objection.objectionNo}，请在“我的撤销异议”中查看处理进度。`, 'success');
+    await refreshState();
+  } catch (error) {
+    showAlert(error.message || '发起异议失败', 'error');
+    await refreshStateSilent();
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function supplementReceiptObjection(objectionNo) {
+  const note = window.prompt('请填写补充说明（将与文本材料一并提交给处理人）：', '');
+  if (note === null) return;
+  if (note.trim().length < 2) {
+    showAlert('补充说明至少 2 个字符。', 'error');
+    return;
+  }
+  const attachment = await pickTextAttachment();
+  if (!attachment) {
+    showAlert('必须上传一份 .txt 文本说明。', 'error');
+    return;
+  }
+  try {
+    const result = await api('POST', `/api/receipt-objections/${encodeURIComponent(objectionNo)}/supplement`, {
+      note: note.trim(), attachment,
+    });
+    state.receiptObjections = result.receiptObjections || state.receiptObjections;
+    state.timeline = result.timeline || state.timeline;
+    showAlert('补充材料已提交，异议回到“已受理”。', 'success');
+    await refreshState();
+  } catch (error) {
+    showAlert(error.message || '补充材料失败', 'error');
+    await refreshStateSilent();
+  }
+}
+
+async function loadReceiptObjection(objectionNo) {
+  try {
+    const result = await api('GET', `/api/receipt-objections/${encodeURIComponent(objectionNo)}`);
+    const index = (state.receiptObjections || []).findIndex((o) => o.objectionNo === objectionNo);
+    if (index >= 0) state.receiptObjections[index] = result.objection;
+    else state.receiptObjections = [...(state.receiptObjections || []), result.objection];
+    render();
+    els.objectionPanel?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (error) {
+    showAlert(error.message || '异议详情加载失败', 'error');
+  }
 }
 
 async function createReviewInvitation(receiptNo) {

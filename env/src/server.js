@@ -119,6 +119,19 @@ import {
   pauseReplaySession,
   resumeReplaySession,
   cancelReplaySession,
+  sweepReplaySessions,
+  createReceiptObjection,
+  acceptReceiptObjection,
+  requestObjectionSupplements,
+  rejectReceiptObjection,
+  confirmObjectionRevocation,
+  supplementReceiptObjection,
+  getOwnerObjectionByNo,
+  getProcessorObjectionByNo,
+  getAuditorObjectionByNo,
+  listReceiptObjectionsForOwner,
+  listAssignedObjections,
+  listAllObjectionsForAuditor,
 } from './db.js';
 import {
   parseComparisonCreateInput,
@@ -142,6 +155,14 @@ import {
   CODE_PATTERN,
 } from './receipts.js';
 import { INVITATION_ERRORS, isValidTtlMinutes } from './reviews.js';
+import {
+  OBJECTION_NO_PATTERN,
+  formatObjectionNoInput,
+  parseTextAttachment,
+  validateObjectionReason,
+  validateRejectReason,
+  validateSupplementNote,
+} from './receiptObjections.js';
 import { parseBatchInput, BATCH_ERRORS, BATCH_SESSION_COOKIE, BATCH_CSRF_COOKIE, ALL_BATCH_FIELDS, BATCH_MAX_INVITATIONS } from './batchReviews.js';
 import { parseAppealCreateInput, APPEAL_ERRORS, APPEAL_SESSION_COOKIE, APPEAL_CSRF_COOKIE, APPEAL_REASONS } from './appealReviews.js';
 import {
@@ -203,6 +224,10 @@ const server = createServer(async (req, res) => {
     // 审计员查阅页面（登录后按角色分流到脱敏归档视图）
     if (url.pathname === '/auditor' && req.method === 'GET') {
       return serveStaticFile(req, res, '/auditor.html');
+    }
+    // 异议处理人工作台（processor 角色登录后处理撤销异议）
+    if (url.pathname === '/processor' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/processor.html');
     }
     if (url.pathname === '/api/archives/external-verify' && req.method === 'POST') {
       return archiveExternalVerify(req, res);
@@ -277,7 +302,9 @@ const server = createServer(async (req, res) => {
       return servePublicReceiptDoc(req, res, url, publicDocMatch[1]);
     }
 
-    if (url.pathname.startsWith('/api/')) return handleApi(req, res, url);
+    // 必须 await：直接 return handleApi() 的 rejection 不会被外层 try/catch 捕获，
+    // 会变成 unhandledRejection（请求挂起直至超时）
+    if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
     return serveStaticFile(req, res, url.pathname === '/' ? '/index.html' : url.pathname);
   } catch (error) {
     console.error(error);
@@ -313,7 +340,12 @@ async function handleApi(req, res, url) {
   const user = userQueries.findById(session.user_id);
   if (!user) return sendJson(res, 401, { error: { code: 'UNAUTHENTICATED' } });
 
-  // 审计员角色只能访问归档脱敏视图，不能触发办理/回执/批次等任何业务接口
+  // 异议处理人角色：只能访问被分配异议的处理工作台，不能触发任何办理/回执接口
+  if (user.role === 'processor') {
+    return handleProcessorApi(req, res, user, url);
+  }
+
+  // 审计员角色：归档脱敏视图 + 撤销异议完整审计记录，不能触发办理/回执等业务接口
   if (user.role === 'auditor') {
     if (url.pathname === '/api/state' && req.method === 'GET') {
       return sendJson(res, 200, { user: safeUser(user) });
@@ -402,6 +434,29 @@ async function handleApi(req, res, url) {
   const objectionRejectMatch = /^\/api\/reviews\/objections\/([^/]+)\/reject$/.exec(url.pathname);
   if (objectionRejectMatch && req.method === 'POST') {
     return resolveObjection(req, res, user, 'reject', objectionRejectMatch[1]);
+  }
+
+  // 回执撤销与异议处理（办理人发起 / 查看 / 补充材料）
+  if (url.pathname === '/api/receipt-objections' && req.method === 'POST') {
+    return createObjection(req, res, user);
+  }
+  if (url.pathname === '/api/receipt-objections' && req.method === 'GET') {
+    const receiptNo = url.searchParams.get('receiptNo') || '';
+    return sendJson(res, 200, { objections: listReceiptObjectionsForOwner(user.id, { receiptNo }) });
+  }
+  const receiptObjectionMatch = /^\/api\/receipt-objections\/([^/]+)$/.exec(url.pathname);
+  if (receiptObjectionMatch && req.method === 'GET') {
+    const objectionNo = formatObjectionNoInput(decodeURIComponent(receiptObjectionMatch[1]));
+    if (!OBJECTION_NO_PATTERN.test(objectionNo)) {
+      return sendJson(res, 400, { error: { code: 'INVALID_OBJECTION_NO', message: '异议编号格式不正确' } });
+    }
+    const objection = getOwnerObjectionByNo(objectionNo, user.id);
+    if (!objection) return sendJson(res, 404, { error: { code: 'OBJECTION_NOT_FOUND', message: '异议不存在或不属于当前账号' } });
+    return sendJson(res, 200, { objection });
+  }
+  const objectionSupplementMatch = /^\/api\/receipt-objections\/([^/]+)\/supplement$/.exec(url.pathname);
+  if (objectionSupplementMatch && req.method === 'POST') {
+    return supplementObjection(req, res, user, objectionSupplementMatch[1]);
   }
 
   // 多方复核批次（办理人）
@@ -663,8 +718,100 @@ async function handleApi(req, res, url) {
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
 }
 
+// 异议处理人侧：只能查看被分配的异议（脱敏回执），执行受理/补充/驳回/确认撤销
+function handleProcessorApi(req, res, user, url) {
+  if (url.pathname === '/api/state' && req.method === 'GET') {
+    return sendJson(res, 200, { user: safeUser(user) });
+  }
+  if (url.pathname === '/api/processor/objections' && req.method === 'GET') {
+    const status = url.searchParams.get('status') || '';
+    return sendJson(res, 200, { objections: listAssignedObjections(user.id, { status }) });
+  }
+  const detailMatch = /^\/api\/processor\/objections\/([^/]+)$/.exec(url.pathname);
+  if (detailMatch && req.method === 'GET') {
+    const objectionNo = formatObjectionNoInput(decodeURIComponent(detailMatch[1]));
+    if (!OBJECTION_NO_PATTERN.test(objectionNo)) {
+      return sendJson(res, 400, { error: { code: 'INVALID_OBJECTION_NO', message: '异议编号格式不正确' } });
+    }
+    const objection = getProcessorObjectionByNo(objectionNo, user.id);
+    if (!objection) {
+      return sendJson(res, 404, { error: { code: 'OBJECTION_NOT_FOUND', message: '异议不存在或未分配给当前处理人' } });
+    }
+    return sendJson(res, 200, { objection });
+  }
+  const actionMatch = /^\/api\/processor\/objections\/([^/]+)\/(accept|request-supplements|reject|confirm-revocation)$/.exec(url.pathname);
+  if (actionMatch && req.method === 'POST') {
+    return processorAction(req, res, user, actionMatch[1], actionMatch[2]);
+  }
+  return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
+}
+
+const PROCESSOR_ACTIONS = {
+  accept: acceptReceiptObjection,
+  'request-supplements': requestObjectionSupplements,
+  reject: rejectReceiptObjection,
+  'confirm-revocation': confirmObjectionRevocation,
+};
+
+async function processorAction(req, res, user, rawObjectionNo, action) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const objectionNo = formatObjectionNoInput(decodeURIComponent(rawObjectionNo));
+  if (!OBJECTION_NO_PATTERN.test(objectionNo)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_OBJECTION_NO', message: '异议编号格式不正确' } });
+  }
+  const objection = getProcessorObjectionByNo(objectionNo, user.id);
+  if (!objection) {
+    return sendJson(res, 404, { error: { code: 'OBJECTION_NOT_FOUND', message: '异议不存在或未分配给当前处理人' } });
+  }
+  const params = { userId: user.id, objectionId: objection.id };
+  if (action === 'reject') {
+    const check = validateRejectReason(body.reason);
+    if (!check.ok) return sendJson(res, 400, { error: { code: check.code, message: check.message } });
+    params.reason = check.value;
+  } else if (action === 'request-supplements') {
+    const check = validateSupplementNote(body.note || body.reason, { required: true });
+    if (!check.ok) return sendJson(res, 400, { error: { code: check.code, message: check.message } });
+    params.note = check.value;
+  } else if (action === 'confirm-revocation') {
+    params.reason = String(body.reason || body.note || '').trim().slice(0, 300);
+  } else {
+    params.reason = String(body.reason || '').trim().slice(0, 300);
+  }
+  const result = PROCESSOR_ACTIONS[action](params);
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '处理失败' },
+      objection: result.objection || null,
+    });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    objection: result.objection,
+    receiptStatus: result.receiptStatus,
+    objections: listAssignedObjections(user.id),
+  });
+}
+
 // 审计员侧：只能查看授权归档的脱敏视图、来源关系与摘要链校验结果
 function handleAuditorArchiveApi(req, res, user, url) {
+  // 撤销异议审计记录：审计角色按权限可查看全部异议的完整审计记录
+  // （含未脱敏冻结快照、文本说明原文与完整处理历史；只读，无任何写接口）
+  if (url.pathname === '/api/auditor/receipt-objections' && req.method === 'GET') {
+    const receiptNo = url.searchParams.get('receiptNo') || '';
+    const status = url.searchParams.get('status') || '';
+    return sendJson(res, 200, { objections: listAllObjectionsForAuditor({ receiptNo, status }) });
+  }
+  const objectionMatch = /^\/api\/auditor\/receipt-objections\/([^/]+)$/.exec(url.pathname);
+  if (objectionMatch && req.method === 'GET') {
+    const objectionNo = formatObjectionNoInput(decodeURIComponent(objectionMatch[1]));
+    if (!OBJECTION_NO_PATTERN.test(objectionNo)) {
+      return sendJson(res, 400, { error: { code: 'INVALID_OBJECTION_NO', message: '异议编号格式不正确' } });
+    }
+    const objection = getAuditorObjectionByNo(objectionNo);
+    if (!objection) return sendJson(res, 404, { error: { code: 'OBJECTION_NOT_FOUND', message: '异议不存在' } });
+    return sendJson(res, 200, { objection });
+  }
   if (url.pathname === '/api/auditor/archives' && req.method === 'GET') {
     return sendJson(res, 200, { archives: listArchivesForAuditor(user.id) });
   }
@@ -710,8 +857,8 @@ async function login(req, res) {
   }
   const session = createSession(user.id);
   setSessionCookies(res, session);
-  // 审计员不触发办理工作流创建，登录响应只携带身份与 CSRF
-  const extra = user.role === 'auditor' ? {} : getStateForUser(user.id);
+  // 审计员/处理人不触发办理工作流创建，登录响应只携带身份与 CSRF
+  const extra = (user.role === 'auditor' || user.role === 'processor') ? {} : getStateForUser(user.id);
   return sendJson(res, 200, {
     user: safeUser(user),
     csrfToken: session.csrf,
@@ -1025,6 +1172,88 @@ async function resolveObjection(req, res, user, action, rawId) {
     timeline: state.timeline,
     reviews: state.reviews,
     correction: state.correction,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 回执撤销与异议处理：办理人侧（发起、查看、补充材料）
+// ---------------------------------------------------------------------------
+
+async function createObjection(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const receiptNo = formatReceiptNoInput(String(body.receiptNo || ''));
+  if (!RECEIPT_NO_PATTERN.test(receiptNo)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_RECEIPT_NO', message: '回执编号格式不正确' } });
+  }
+  const reasonCheck = validateObjectionReason(body.reason);
+  if (!reasonCheck.ok) {
+    return sendJson(res, 400, { error: { code: reasonCheck.code, message: reasonCheck.message } });
+  }
+  const attachmentCheck = parseTextAttachment(body.attachment);
+  if (!attachmentCheck.ok) {
+    return sendJson(res, 400, { error: { code: attachmentCheck.code, message: attachmentCheck.message } });
+  }
+  const result = createReceiptObjection({
+    userId: user.id,
+    receiptNo,
+    reason: reasonCheck.value,
+    attachment: attachmentCheck.value,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '无法发起异议' },
+      objectionNo: result.objectionNo || null,
+      timeline: getTimelineForUser(user.id),
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    objection: result.objection,
+    records: state.records,
+    timeline: state.timeline,
+    receiptObjections: state.receiptObjections,
+  });
+}
+
+async function supplementObjection(req, res, user, rawObjectionNo) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const objectionNo = formatObjectionNoInput(decodeURIComponent(rawObjectionNo));
+  if (!OBJECTION_NO_PATTERN.test(objectionNo)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_OBJECTION_NO', message: '异议编号格式不正确' } });
+  }
+  const existing = getOwnerObjectionByNo(objectionNo, user.id);
+  if (!existing) {
+    return sendJson(res, 404, { error: { code: 'OBJECTION_NOT_FOUND', message: '异议不存在或不属于当前账号' } });
+  }
+  const attachmentCheck = parseTextAttachment(body.attachment);
+  if (!attachmentCheck.ok) {
+    return sendJson(res, 400, { error: { code: attachmentCheck.code, message: attachmentCheck.message } });
+  }
+  const noteCheck = validateSupplementNote(body.note, { required: true });
+  if (!noteCheck.ok) {
+    return sendJson(res, 400, { error: { code: noteCheck.code, message: noteCheck.message } });
+  }
+  const result = supplementReceiptObjection({
+    userId: user.id,
+    objectionId: existing.id,
+    note: noteCheck.value,
+    supplement: attachmentCheck.value,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '补充材料失败' },
+      objection: result.objection || null,
+    });
+  }
+  const state = getStateForUser(user.id);
+  return sendJson(res, 200, {
+    ok: true,
+    objection: result.objection,
+    timeline: state.timeline,
+    receiptObjections: state.receiptObjections,
   });
 }
 
