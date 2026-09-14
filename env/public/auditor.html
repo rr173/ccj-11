@@ -46,6 +46,37 @@
         <p class="muted small">审计员按角色权限可查看全部撤销异议：提交时冻结的<b>完整（未脱敏）</b>回执快照、文本说明原文、逐次状态变化（操作人/时间/原因/前后状态）。此区块只读，不提供任何处理操作。</p>
         <div id="objectionList" class="archive-list"></div>
       </section>
+      <section class="card">
+        <h2>异议提醒与超期升级通知留痕</h2>
+        <p class="muted small">全部待发送 / 已发送 / 已读通知，含到期提醒、逾期升级（按处理人 / 主管权限分流）、延期申请与决议通知。通知内容只含异议编号、当前状态、截止时间、来源回执，<b>不含</b>证件号、完整地址或完整手机号。</p>
+        <div class="filter-bar">
+          <label>类型
+            <select id="notifKindFilter">
+              <option value="">全部</option>
+              <option value="reminder">到期前提醒</option>
+              <option value="overdue">逾期升级</option>
+              <option value="extension-requested">延期申请</option>
+              <option value="extension-approved">延期批准</option>
+              <option value="extension-rejected">延期拒绝</option>
+            </select>
+          </label>
+          <label>接收角色
+            <select id="notifAudienceFilter">
+              <option value="">全部</option>
+              <option value="processor">处理人</option>
+              <option value="handler">办理人</option>
+              <option value="supervisor">主管</option>
+            </select>
+          </label>
+          <button id="refreshNotifsBtn" class="button secondary" type="button">刷新</button>
+        </div>
+        <div id="objectionNotificationList" class="archive-list"></div>
+      </section>
+      <section class="card">
+        <h2>异议延期申请与主管决议</h2>
+        <p class="muted small">每份异议至多一次延期申请；主管批准 / 拒绝均只追加记录，不可覆盖。</p>
+        <div id="objectionExtensionList" class="archive-list"></div>
+      </section>
       <section id="objectionView" class="card hidden"></section>
       <section id="detailView" class="card hidden"></section>
       <section id="comparisonView" class="card hidden"></section>

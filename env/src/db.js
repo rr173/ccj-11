@@ -47,6 +47,8 @@ import * as archiveNs from './archiveStore.js';
 import * as comparisonNs from './comparisonStore.js';
 // 回执撤销与异议处理模块（其依赖 db.js）：顶层导入，函数在表结构就绪后调用
 import * as objectionNs from './receiptObjectionStore.js';
+// 异议超期升级与通知留痕模块（同样依赖 db.js / 异议 store）
+import * as escalationNs from './objectionEscalationStore.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -102,7 +104,8 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
   display_name TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'handler' CHECK (role IN ('handler', 'auditor', 'processor')),
+  role TEXT NOT NULL DEFAULT 'handler'
+    CHECK (role IN ('handler', 'auditor', 'processor', 'supervisor')),
   password_salt TEXT NOT NULL,
   password_hash TEXT NOT NULL,
   created_at INTEGER NOT NULL
@@ -1293,6 +1296,71 @@ CREATE TABLE IF NOT EXISTS receipt_objection_materials (
 );
 CREATE INDEX IF NOT EXISTS idx_receipt_objection_materials_objection
   ON receipt_objection_materials(objection_id, ordinal);
+
+-- ---------------------------------------------------------------------------
+-- 异议超期升级与通知留痕：
+--   到期前按配置的提前提醒时间生成【待发送】提醒（kind=reminder，status=pending）；
+--   超过处理期限自动标记逾期，并按处理人 / 主管 / 审计员的权限分流升级记录
+--   （kind=overdue；同时发给处理人与主管，审计员经审计接口查看全部通知）；
+--   延期申请 / 批准 / 拒绝各生成一条通知。
+--   payload_json 在生成瞬间定型，只含异议编号、当前状态、截止时间、来源回执，
+--   不含证件号 / 完整地址 / 完整手机号。
+--   行只有“待发送 → 已发送”和“确认已读”两类状态推进，内容永不 UPDATE。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS receipt_objection_notifications (
+  id TEXT PRIMARY KEY,
+  objection_id TEXT NOT NULL REFERENCES receipt_objections(id) ON DELETE CASCADE,
+  receipt_no TEXT NOT NULL,
+  kind TEXT NOT NULL
+    CHECK (kind IN ('reminder', 'overdue', 'extension-requested',
+                    'extension-approved', 'extension-rejected')),
+  dedupe_key TEXT NOT NULL DEFAULT '',
+  audience TEXT NOT NULL
+    CHECK (audience IN ('processor', 'handler', 'supervisor')),
+  target_user_id TEXT,
+  level INTEGER NOT NULL DEFAULT 1,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'sent', 'read')),
+  created_at INTEGER NOT NULL,
+  sent_at INTEGER,
+  read_at INTEGER,
+  read_by_user_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_obj_notifications_objection
+  ON receipt_objection_notifications(objection_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_obj_notifications_target
+  ON receipt_objection_notifications(audience, target_user_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_obj_notifications_dispatch
+  ON receipt_objection_notifications(status, created_at);
+
+-- 同一异议、同一去重键、同一接收角色、同一接收人的通知至多一条：
+-- 重复调度 / 定时器重入 / 服务重启后补扫都不会产生重复通知。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_obj_notifications_dedupe
+  ON receipt_objection_notifications(objection_id, kind, dedupe_key, audience, target_user_id);
+
+-- 异议延期：每份异议至多一条申请（ordinal 恒为 0，UNIQUE 兜底并发申请）；
+-- pending 期间主管可批准 / 拒绝一次，决议为终态不可覆盖。
+CREATE TABLE IF NOT EXISTS receipt_objection_extensions (
+  id TEXT PRIMARY KEY,
+  objection_id TEXT NOT NULL REFERENCES receipt_objections(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'approved', 'rejected')),
+  reason TEXT NOT NULL,
+  requested_duration_ms INTEGER NOT NULL,
+  requested_by_user_id TEXT,
+  previous_deadline_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER,
+  decided_by_user_id TEXT,
+  decision_note TEXT NOT NULL DEFAULT '',
+  UNIQUE(objection_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_obj_extensions_objection
+  ON receipt_objection_extensions(objection_id);
+CREATE INDEX IF NOT EXISTS idx_obj_extensions_status
+  ON receipt_objection_extensions(status, created_at);
 `);
 
 // 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
@@ -1308,10 +1376,11 @@ if (columnInfo('users').length > 0 && !columnInfo('users').some((c) => c.name ==
   db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'handler';");
 }
 // 撤销异议模块新增 processor 角色：旧库 users 的 CHECK 只允许 handler/auditor，
-// 用“改名重建”方式拓宽约束，会话表通过显式外键引用 users 表名（重建期间关外键）。
+// 超期升级模块再新增 supervisor 角色；用“改名重建”方式拓宽约束，
+// 会话表通过显式外键引用 users 表名（重建期间关外键）。
 {
   const usersCheckSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'").get()?.sql || '';
-  if (usersCheckSql && !usersCheckSql.includes('processor')) {
+  if (usersCheckSql && (!usersCheckSql.includes('processor') || !usersCheckSql.includes('supervisor'))) {
     db.pragma('foreign_keys = OFF');
     db.pragma('legacy_alter_table = ON');
     db.exec('ALTER TABLE users RENAME TO users_old;');
@@ -1321,7 +1390,8 @@ if (columnInfo('users').length > 0 && !columnInfo('users').some((c) => c.name ==
         id TEXT PRIMARY KEY,
         username TEXT NOT NULL UNIQUE,
         display_name TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'handler' CHECK (role IN ('handler', 'auditor', 'processor')),
+        role TEXT NOT NULL DEFAULT 'handler'
+          CHECK (role IN ('handler', 'auditor', 'processor', 'supervisor')),
         password_salt TEXT NOT NULL,
         password_hash TEXT NOT NULL,
         created_at INTEGER NOT NULL
@@ -1332,6 +1402,11 @@ if (columnInfo('users').length > 0 && !columnInfo('users').some((c) => c.name ==
     `);
     db.pragma('foreign_keys = ON');
   }
+}
+// 超期升级模块：异议记录补充“首次逾期时刻”（由调度器在条件更新事务内写入）
+if (columnInfo('receipt_objections').length > 0
+  && !columnInfo('receipt_objections').some((c) => c.name === 'overdue_at')) {
+  db.exec('ALTER TABLE receipt_objections ADD COLUMN overdue_at INTEGER;');
 }
 for (const [table, column, ddl] of [
   ['review_batch_opinions', 'correction_receipt_no', "TEXT NOT NULL DEFAULT ''"],
@@ -1535,6 +1610,8 @@ seedUser('auditor2', '审计员二号（角色：auditor，未授权对照）', 
 // 异议处理人账号：受理/补充/驳回/确认撤销办理人发起的回执撤销异议
 seedUser('processor1', '异议处理人一号（角色：processor）', 'processor');
 seedUser('processor2', '异议处理人二号（角色：processor，分配对照）', 'processor');
+// 主管账号：审批处理人提交的一次延期申请（角色：supervisor）
+seedUser('supervisor1', '异议主管一号（角色：supervisor，审批延期）', 'supervisor');
 
 // 旧库已完成但当时尚未签发回执的记录，在升级时补签（内容按已持久化的确认冻结）
 if (legacyWorkflows || !hasReceipts) {
@@ -2805,6 +2882,10 @@ export function getStateForUser(userId) {
   envelope.mediationPackages = listMediationPackagesForOwner(userId);
   envelope.caseGroups = listCaseGroupsForOwner(userId);
   envelope.receiptObjections = objectionNs.listReceiptObjectionsForOwner(userId);
+  // 办理人视角的异议提醒/升级/延期通知（刷新、重登、重启后恢复提醒状态）
+  envelope.objectionNotifications = escalationNs.listNotificationsForUser({ userId, role: 'handler' });
+  envelope.objectionUnreadCount = escalationNs.unreadNotificationCount({ userId, role: 'handler' });
+  envelope.objectionExtensions = escalationNs.listExtensionsForOwner(userId);
   // 归档模块通过重导出供路由使用；经命名空间惰性访问，规避模块求值期循环依赖
   envelope.archives = archiveNs.listArchivesForOwner(userId);
   envelope.archiveRejections = archiveNs.listArchiveRejectionsForOwner(userId);
@@ -2948,3 +3029,21 @@ export {
   listAllObjectionsForAuditor,
   buildObjectionTimelineEntries,
 } from './receiptObjectionStore.js';
+
+// 异议超期升级与通知留痕：统一从 db.js 重导出
+export {
+  sweepObjectionNotifications,
+  dispatchPendingObjectionNotifications,
+  markObjectionNotificationRead,
+  requestObjectionExtension,
+  decideObjectionExtension,
+  listNotificationsForUser,
+  unreadNotificationCount,
+  listPendingExtensionsForSupervisor,
+  listExtensionsForSupervisor,
+  getExtensionForSupervisor,
+  listExtensionsForOwner,
+  listAllNotificationsForAuditor,
+  listAllExtensionsForAuditor,
+  escalationSummaryForObjection,
+} from './objectionEscalationStore.js';

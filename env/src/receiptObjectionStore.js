@@ -31,6 +31,17 @@ function now() {
 function addObjectionEventTx({
   objection, type, fromStatus, toStatus, actorUserId, actorRole, reason = '', note = '', extra = {},
 }) {
+  return appendObjectionEventTx({
+    objection, type, fromStatus, toStatus, actorUserId, actorRole, reason, note, extra,
+  });
+}
+
+// 异议超期升级模块复用的事务内事件追加（INSERT-only，ordinal 连续分配）。
+// 必须在 immediate 事务内调用：MAX(ordinal)+1 与 INSERT 同事务，并发调用由写锁串行化。
+export function appendObjectionEventTx({
+  objection, type, fromStatus = '', toStatus = '', actorUserId = null, actorRole = '',
+  reason = '', note = '', extra = {},
+}) {
   const ordinalRow = db.prepare(`
     SELECT COALESCE(MAX(ordinal), -1) + 1 AS next_ordinal
     FROM receipt_objection_events WHERE objection_id = ?
@@ -434,6 +445,7 @@ function objectionBase(row, viewer) {
     createdAt: row.created_at,
     deadlineAt: row.deadline_at,
     overdue,
+    overdueAt: row.overdue_at || null,
     acceptedAt: row.accepted_at || null,
     supplementRequestedAt: row.supplement_requested_at || null,
     supplementNote: row.supplement_request_note || '',

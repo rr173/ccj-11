@@ -42,6 +42,15 @@ export const config = {
   replaySubmitTokenTtlMs: Number(process.env.REPLAY_SUBMIT_TOKEN_TTL_MS || 10 * 60 * 1000),
   // 回执撤销异议：默认处理期限 7 个自然日（仅影响截止时间与逾期标记，不自动流转）
   receiptObjectionTtlMs: Number(process.env.RECEIPT_OBJECTION_TTL_MS || 7 * 24 * 60 * 60 * 1000),
+  // 异议超期升级与通知留痕：
+  // 到期前提前提醒时间点（毫秒，逗号分隔；可多个，如 24 小时、2 小时）
+  objectionReminderLeadMs: String(process.env.OBJECTION_REMINDER_LEAD_MS
+    || `${24 * 60 * 60 * 1000},${2 * 60 * 60 * 1000}`)
+    .split(',').map((v) => Number(v.trim())).filter((v) => Number.isFinite(v) && v > 0),
+  // 批准一次延期后顺延的时长（默认 3 个自然日）
+  objectionExtensionMs: Number(process.env.OBJECTION_EXTENSION_MS || 3 * 24 * 60 * 60 * 1000),
+  // 后台扫描间隔（生成提醒/逾期升级、发送待发送通知；NO_OBJECTION_SWEEP=1 可关闭定时器）
+  objectionSweepMs: Number(process.env.OBJECTION_SWEEP_MS || 1000),
 };
 
 config.isProduction = config.nodeEnv === 'production';

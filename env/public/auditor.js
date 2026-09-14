@@ -69,6 +69,8 @@ async function boot(knownUser = null) {
     await loadArchives();
     await loadComparisons();
     await loadObjections();
+    await loadObjectionNotifications();
+    await loadObjectionExtensions();
   } catch (error) {
     $('#loginView').classList.remove('hidden');
     $('#appView').classList.add('hidden');
@@ -273,6 +275,88 @@ async function loadComparisons() {
   list.querySelectorAll('[data-compare]').forEach((btn) => {
     btn.addEventListener('click', () => loadComparisonDetail(btn.dataset.compare));
   });
+}
+
+// ---------------------------------------------------------------------------
+// 异议通知留痕 / 延期审批：审计员只读完整记录
+// ---------------------------------------------------------------------------
+const NOTIF_KIND_TEXT = {
+  reminder: '到期前提醒',
+  overdue: '逾期升级',
+  'extension-requested': '延期申请待审批',
+  'extension-approved': '延期已批准',
+  'extension-rejected': '延期已拒绝',
+};
+const NOTIF_AUDIENCE_TEXT = { processor: '处理人', handler: '办理人', supervisor: '主管' };
+const EXT_STATUS_TEXT = { pending: '待主管审批', approved: '已批准', rejected: '已拒绝' };
+
+$('#refreshNotifsBtn')?.addEventListener('click', loadObjectionNotifications);
+$('#notifKindFilter')?.addEventListener('change', loadObjectionNotifications);
+$('#notifAudienceFilter')?.addEventListener('change', loadObjectionNotifications);
+
+async function loadObjectionNotifications() {
+  const kind = $('#notifKindFilter')?.value || '';
+  const audience = $('#notifAudienceFilter')?.value || '';
+  const params = new URLSearchParams();
+  if (kind) params.set('kind', kind);
+  if (audience) params.set('audience', audience);
+  const result = await api('GET', `/api/auditor/receipt-objection-notifications${params.size ? `?${params}` : ''}`);
+  const list = $('#objectionNotificationList');
+  if (!result.notifications.length) {
+    list.innerHTML = '<p class="muted">暂无通知记录。</p>';
+    return;
+  }
+  list.innerHTML = result.notifications.map((n) => `
+    <div class="archive-item card-inner">
+      <div class="record-main">
+        <span class="tag ${n.kind === 'overdue' ? 'tag-reject' : n.kind === 'reminder' ? 'tag-warn' : 'tag-ok'}">
+          ${escapeHtml(NOTIF_KIND_TEXT[n.kind] || n.kind)}
+        </span>
+        <b class="mono">${escapeHtml(n.objectionNo)}</b>
+        <span class="muted small">接收：${escapeHtml(NOTIF_AUDIENCE_TEXT[n.audience] || n.audience)}${n.targetUser ? `（${escapeHtml(n.targetUser.displayName)}）` : '（按角色广播）'}</span>
+      </div>
+      <div class="muted small">
+        来源回执 <span class="mono">${escapeHtml(n.receiptNo)}</span>
+        · 异议状态：${escapeHtml(n.payload.statusLabel || n.payload.status)}
+        · 截止：${formatTime(n.payload.deadlineAt)}
+        ${n.level > 1 ? ` · 升级第 ${n.level} 层` : ''}
+      </div>
+      <div class="muted small">
+        生成 ${formatTime(n.createdAt)}${n.sentAt ? ` · 发送 ${formatTime(n.sentAt)}` : ''}${n.readAt ? ` · 已读 ${formatTime(n.readAt)}${n.readBy ? `（${escapeHtml(n.readBy)}）` : ''}` : ''}
+        · 去重键 <span class="mono">${escapeHtml(n.dedupeKey)}</span>
+      </div>
+      <details><summary class="muted small">通知内容（已脱敏）</summary>
+        <pre class="archive-pre">${escapeHtml(JSON.stringify(n.payload, null, 2))}</pre>
+      </details>
+    </div>`).join('');
+}
+
+async function loadObjectionExtensions() {
+  const result = await api('GET', '/api/auditor/receipt-objection-extensions');
+  const list = $('#objectionExtensionList');
+  if (!result.extensions.length) {
+    list.innerHTML = '<p class="muted">暂无延期申请。</p>';
+    return;
+  }
+  list.innerHTML = result.extensions.map((e) => `
+    <div class="archive-item card-inner">
+      <div class="record-main">
+        <b class="mono">${escapeHtml(e.objectionNo)}</b>
+        <span class="tag ${e.status === 'approved' ? 'tag-ok' : e.status === 'rejected' ? 'tag-reject' : 'tag-warn'}">
+          ${escapeHtml(EXT_STATUS_TEXT[e.status] || e.status)}
+        </span>
+        <span class="muted small">来源回执 <span class="mono">${escapeHtml(e.receiptNo)}</span></span>
+      </div>
+      <div class="small">延期原因：${escapeHtml(e.reason)}</div>
+      <div class="muted small">
+        申请人：${escapeHtml(e.requestedBy?.displayName || '—')} · 申请于 ${formatTime(e.requestedAt)}
+        · 顺延 ${Math.round(e.requestedDurationMs / 3600000)} 小时
+      </div>
+      <div class="muted small">
+        原截止 ${formatTime(e.previousDeadlineAt)} → 当前截止 ${formatTime(e.currentDeadlineAt)}
+      </div>
+      ${e.decidedAt ? `<div class="small review-obj-result">${e.status === 'approved' ? '批准' : '拒绝'}（${formatTime(e.decidedAt)}，${escapeHtml(e.decidedBy?.displayName || '—')}）：${escapeHtml(e.decisionNote || '—')}</div>` : ''}
+    </div>`).join('');
 }
 
 async function loadComparisonDetail(comparisonId) {

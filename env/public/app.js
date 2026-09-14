@@ -41,7 +41,9 @@ const els = {
   userBox: $('#userBox'), userName: $('#userName'), logoutBtn: $('#logoutBtn'), stepList: $('#stepList'),
   stateVersion: $('#stateVersion'), currentStepLabel: $('#currentStepLabel'), globalAlert: $('#globalAlert'),
   stepForm: $('#stepForm'), receiptPanel: $('#receiptPanel'), correctionPanel: $('#correctionPanel'),
-  reviewPanel: $('#reviewPanel'), objectionPanel: $('#objectionPanel'), batchPanel: $('#batchPanel'),
+  reviewPanel: $('#reviewPanel'), objectionPanel: $('#objectionPanel'),
+  objectionNotificationPanel: $('#objectionNotificationPanel'),
+  batchPanel: $('#batchPanel'),
   archivePanel: $('#archivePanel'),
   comparisonPanel: $('#comparisonPanel'),
   recordsPanel: $('#recordsPanel'), recordsList: $('#recordsList'),
@@ -57,6 +59,8 @@ const state = {
   correction: null,
   reviews: { invitations: [], objections: [] },
   receiptObjections: [],
+  objectionNotifications: [],
+  objectionUnreadCount: 0,
   reviewBatches: [],
   reviewAppeals: [],
   mediationPackages: [],
@@ -126,6 +130,9 @@ function applyState(result) {
   state.archiveExports = Array.isArray(result.archiveExports) ? result.archiveExports : [];
   state.archiveComparisons = Array.isArray(result.archiveComparisons) ? result.archiveComparisons : [];
   state.replaySessions = Array.isArray(result.replaySessions) ? result.replaySessions : [];
+  state.objectionNotifications = Array.isArray(result.objectionNotifications)
+    ? result.objectionNotifications : [];
+  state.objectionUnreadCount = Number(result.objectionUnreadCount || 0);
 }
 
 async function login(event) {
@@ -155,6 +162,8 @@ async function logout() {
     state.correction = null;
     state.reviews = { invitations: [], objections: [] };
     state.receiptObjections = [];
+    state.objectionNotifications = [];
+    state.objectionUnreadCount = 0;
     state.reviewBatches = [];
     state.reviewAppeals = [];
     state.mediationPackages = [];
@@ -185,6 +194,7 @@ function render() {
 
   renderTimeline();
   renderCorrectionPanel();
+  renderObjectionNotificationPanel();
   if (state.workflow.completed) {
     renderReceipt(state.receipt || state.viewingReceipt || null);
     renderObjectionPanel();
@@ -1318,6 +1328,48 @@ function renderReceiptObjectionTimelineCard(entry) {
   }
   return card;
 }
+
+function renderObjectionNotificationPanel() {
+  const panel = els.objectionNotificationPanel;
+  if (!panel) return;
+  const notifications = state.objectionNotifications || [];
+  if (!notifications.length) {
+    panel.classList.add('hidden');
+    panel.innerHTML = '';
+    return;
+  }
+  panel.classList.remove('hidden');
+  const items = notifications.map((n) => `
+    <li class="objection-item small ${escapeHtml(n.status)}">
+      <span class="tag ${n.kind === 'overdue' ? 'tag-reject' : n.kind === 'reminder' ? 'tag-warn' : 'tag-ok'}">
+        ${escapeHtml(NOTIF_KIND_TEXT[n.kind] || n.kind)}
+      </span>
+      <b class="mono small">${escapeHtml(n.objectionNo)}</b>
+      <span class="muted small">来源回执 <span class="mono small">${escapeHtml(n.receiptNo)}</span></span>
+      <div class="muted small">
+        异议状态：${escapeHtml(n.payload.statusLabel || n.payload.status)}
+        · 处理截止：${formatTime(n.payload.deadlineAt)}
+      </div>
+      <div class="muted small">
+        ${formatTime(n.createdAt)} 生成
+        ${n.status === 'pending' ? ' · 待发送' : n.status === 'sent' ? ' · 已发送（未读）' : ` · 已读于 ${formatTime(n.readAt)}`}
+      </div>
+    </li>`).join('');
+  panel.innerHTML = `
+    <div class="receipt-head">
+      <h2>我的异议提醒 / 升级通知</h2>
+      <span class="muted small">通知只含异议编号、状态、截止时间与来源回执；共 ${notifications.length} 条，未读 ${state.objectionUnreadCount} 条</span>
+    </div>
+    <ul class="objection-list">${items}</ul>`;
+}
+
+const NOTIF_KIND_TEXT = {
+  reminder: '到期前提醒',
+  overdue: '逾期升级',
+  'extension-requested': '延期申请待审批',
+  'extension-approved': '延期申请已批准',
+  'extension-rejected': '延期申请已拒绝',
+};
 
 function renderObjectionPanel() {
   const panel = els.objectionPanel;

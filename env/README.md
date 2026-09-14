@@ -9,7 +9,8 @@
 - `carol` / `password123`
 - `dave` / `erin`（回执功能测试账号，密码相同）
 - `processor1` / `processor2`（异议处理人角色账号，密码相同；处理撤销异议，只能看到分配给自己的异议与脱敏回执）
-- `auditor1` / `auditor2`（审计员角色账号，密码相同；`auditor2` 为未授权对照账号，只能看到显式授权的归档脱敏视图；审计员均可只读查看全部撤销异议的完整审计记录）
+- `supervisor1`（异议主管角色账号，密码相同；查看逾期升级通知留痕、审批一次延期申请）
+- `auditor1` / `auditor2`（审计员角色账号，密码相同；`auditor2` 为未授权对照账号，只能看到显式授权的归档脱敏视图；审计员均可只读查看全部撤销异议、通知留痕与延期记录的完整审计记录）
 
 可通过环境变量 `DEMO_PASSWORD` 修改演示密码。生产环境应替换为正式的用户目录、密码轮换和 HTTPS。
 
@@ -261,6 +262,36 @@ accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ reject
 - 审计员：`GET /api/auditor/receipt-objections[?receiptNo=&status=]`、`GET /api/auditor/receipt-objections/{YY编号}`。
 - `/api/state` 的回执版本时间线在对应回执之后插入 `kind: 'receiptObjection'` 条目，携带异议编号、来源回执、状态、处理期限与完整处理历史（`receipt.objection.*` 事件同时写入回执所属办理记录的审计时间线）。
 
+
+## 异议超期升级与通知留痕（objection escalation & notifications）
+
+在撤销异议模块之上新增的**到期提醒 → 逾期升级 → 一次延期审批**闭环。所有提醒、升级、已读与延期动作均持久化且只追加；后台调度（默认每 1 秒扫描，`OBJECTION_SWEEP_MS`，`NO_OBJECTION_SWEEP=1` 关闭定时器）、服务启动恢复扫描与各列表接口惰性触发，全部幂等。
+
+### 1. 提醒与升级规则
+
+- **到期前提醒**：按配置的提前提醒时间点（`OBJECTION_REMINDER_LEAD_MS`，默认 `24h,2h`，逗号分隔多个）生成**待发送**（`pending`）通知，同次扫描立即推进为已发送（`sent`）。每个提醒点向**处理人**（定向）与**办理人**（定向）各生成一条。
+- **逾期升级**：异议超过处理期限（且仍处于 `submitted/accepted/supplementing`）时，首个扫描事务条件更新 `overdue_at`（`WHERE overdue_at IS NULL`，只成功一次），并按权限分流升级记录：**处理人**定向一条、**主管**（supervisor 角色）按角色广播一条；审计员不持有个人通知行，由审计接口查看全部。
+- **停机恢复**：服务停机期间错过的提醒点在启动恢复扫描时**补生成留痕**（负载含 `backfilled: true`）；终态异议不再产生任何通知。
+- 通知负载在**生成瞬间定型**，只含异议编号、当前状态、截止时间、来源回执与升级层级，**从数据源上**不含证件号、完整地址、完整手机号——任何角色视角都不可能因漏脱敏而泄露。
+
+### 2. 一次延期（处理人申请 / 主管审批）
+
+- 被分配处理人可对进行中的异议填写延期原因（5-300 字）申请**唯一一次**延期（`receipt_objection_extensions`，`UNIQUE(objection_id, ordinal)` 兜底并发申请，两个页面同时提交只有一个成功）。
+- 主管在 `/supervisor` 工作台（演示账号 `supervisor1`）看到待审批申请（不含敏感快照字段），可**批准**（截止时间顺延 `OBJECTION_EXTENSION_MS`，默认 3 天；清除逾期标记）或**拒绝**（拒绝必须填写 ≥2 字说明；截止时间不变）。每个 pending 申请只能决议一次（条件更新兜底双击/并发批准+拒绝只落一个）。
+- 批准后若再次逾期，按第 2 层升级（`overdue-l2`），第 1 层升级记录永久保留；延期通知（申请/批准/拒绝）同样留痕。
+
+### 3. 只追加与幂等
+
+- 通知唯一索引 `(objection_id, kind, dedupe_key, audience, target_user_id)`：重复调度、定时器重入、多实例同时扫描、服务重启补扫都不会产生重复通知；`pending→sent→read` 是仅有的状态推进，负载永不更新。
+- 每次提醒生成、逾期标记、升级、确认已读、延期申请/批准/拒绝都向 `receipt_objection_events` **追加**事件（`receipt.objection.reminder.scheduled / overdue / notification.read / extension.requested|approved|rejected`），历史没有 UPDATE/DELETE 路径。
+- 处理人确认已读（`POST .../notifications/{id}/read`）带接收人校验，重复确认幂等且只在首次追加事件；他人通知一律返回 404（不暴露存在性）。
+
+### 4. 权限分流
+
+- **办理人**（handler）：`GET /api/receipt-objection-notifications`（仅本人定向：提醒、延期结果）、`POST /api/receipt-objection-notifications/{id}/read`；`/api/state` 带回 `objectionNotifications` 与未读数——刷新、重新登录、服务重启后提醒状态一致。
+- **处理人**（processor）：`GET /api/processor/notifications[?status=&kind=]`、`POST /api/processor/notifications/{id}/read`、`POST /api/processor/objections/{YY编号}/extension`；异议详情附 `escalation`（本人可见接收方的通知与延期记录）。
+- **主管**（supervisor）：只能访问 `/api/supervisor/*`——通知留痕（逾期升级广播、延期申请通知）、确认已读、延期审批；不能办理、不能访问业务或审计接口。
+- **审计员**（auditor）：`GET /api/auditor/receipt-objection-notifications[?kind=&audience=&status=&objectionNo=]` 查看**全部通知**完整留痕（含接收人、发送/已读时刻、去重键、定型负载），`GET /api/auditor/receipt-objection-extensions[?status=]` 查看全部延期申请与决议；只读，无任何写接口。完整证件号/地址/手机号仍只在异议冻结快照审计视图中按需返回。
 
 ## 分阶段复核编排（staged orchestration）
 
@@ -588,6 +619,18 @@ accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ reject
 | POST | `/api/processor/objections/{YY编号}/request-supplements` | 是（处理人） | 要求补充材料（accepted → supplementing，必带说明） |
 | POST | `/api/processor/objections/{YY编号}/reject` | 是（处理人） | 驳回（accepted/supplementing → rejected，理由 5-300 字） |
 | POST | `/api/processor/objections/{YY编号}/confirm-revocation` | 是（处理人） | 确认撤销（accepted → revoked，同事务撤销原回执） |
+| POST | `/api/processor/objections/{YY编号}/extension` | 是（处理人） | 对被分配的进行中异议申请唯一一次延期（原因 5-300 字） |
+| GET | `/api/processor/notifications[?status=&kind=]` | 是（处理人） | 本人定向通知（提醒/逾期升级/延期结果）与未读数 |
+| POST | `/api/processor/notifications/{id}/read` | 是（处理人） | 确认已读（重复确认幂等；他人通知 404） |
+| GET | `/api/receipt-objection-notifications[?status=&kind=]` | 是（办理人） | 本人定向的提醒/延期结果通知与未读数 |
+| POST | `/api/receipt-objection-notifications/{id}/read` | 是（办理人） | 确认已读本人通知（重复确认幂等） |
+| GET | `/api/supervisor/notifications[?status=&kind=]` | 是（主管） | 逾期升级广播与延期申请通知（可确认已读） |
+| POST | `/api/supervisor/notifications/{id}/read` | 是（主管） | 确认已读主管通知（幂等） |
+| GET | `/api/supervisor/extensions[?status=]` | 是（主管） | 全部延期申请与决议（默认列待审批） |
+| POST | `/api/supervisor/extensions/{id}/approve` | 是（主管） | 批准延期（顺延截止、清除逾期标记；决议仅一次） |
+| POST | `/api/supervisor/extensions/{id}/reject` | 是（主管） | 拒绝延期（必须 ≥2 字说明；截止时间不变） |
+| GET | `/api/auditor/receipt-objection-notifications[?kind=&audience=&status=&objectionNo=]` | 是（审计员） | 全部通知完整留痕（接收人/发送/已读/去重键/定型负载，只读） |
+| GET | `/api/auditor/receipt-objection-extensions[?status=]` | 是（审计员） | 全部延期申请与主管决议（只读） |
 | GET | `/api/auditor/receipt-objections[?receiptNo=&status=]` | 是（审计员） | 全部撤销异议列表（只读、脱敏摘要） |
 | GET | `/api/auditor/receipt-objections/{YY编号}` | 是（审计员） | 完整审计记录（未脱敏冻结快照、文本原文、逐次状态变化） |
 | POST | `/api/archives/external-verify` | 否 | 外部一次性核验码核验，仅返回事件数量/时间范围/摘要链连续性/最终状态 |
@@ -601,6 +644,7 @@ accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ reject
 | GET | `/arbitration-review` | 否 | 免登录第二层仲裁评议页面（第一层升级后才开放） |
 | GET | `/auditor` | 否（审计员登录） | 审计员归档查阅页面 |
 | GET | `/processor` | 否（处理人登录） | 异议处理人工作台（受理/补充/驳回/确认撤销） |
+| GET | `/supervisor` | 否（主管登录） | 异议主管工作台（逾期升级留痕/延期审批） |
 | GET | `/archive-verify` | 否 | 免登录归档外部核验页面（一次性核验码） |
 
 所有非 GET 的登录态接口要求 `X-CSRF-Token`。会话 Cookie 为 `HttpOnly; SameSite=Lax`，HTTPS 环境可启用 `Secure`。
@@ -613,6 +657,8 @@ accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ reject
 - `receipt_objections`：回执撤销异议（编号 `YY-…`、归属回执/办理/办理人、处理人分配、状态 `submitted/accepted/supplementing/rejected/revoked`、原因、**提交时独立复制的冻结快照**与 SHA-256 摘要、发起时间与处理期限、受理/补充/终局各列）；部分唯一索引保证同一回执至多一条进行中异议
 - `receipt_objection_events`：异议状态变化的只追加历史（顺序号、动作类型、前后状态、操作人/角色、原因/备注、时间），无任何更新/删除路径
 - `receipt_objection_materials`：文本说明与补充材料（每份异议顺序号、文件名、逐字正文、上传人/角色、备注、时间）；列表只下发摘要，正文仅详情接口返回
+- `receipt_objection_notifications`：异议提醒/升级/延期通知留痕（类型、去重键、接收角色与接收人、升级层级、生成瞬间定型的脱敏负载 `payload_json`、`pending/sent/read` 状态与发送/已读时刻）；部分唯一索引 `(objection_id, kind, dedupe_key, audience, target_user_id)` 保证重复调度/重启补扫不产生重复通知，行内容无更新路径
+- `receipt_objection_extensions`：每份异议至多一条延期申请（`UNIQUE(objection_id, ordinal)` 兜底并发），含延期原因、申请顺延时长、原截止时间与主管批准/拒绝决议（决议人/时间/说明）；批准时异议截止时间顺延并清除逾期标记
 - `review_invitations`：复核邀请（令牌只存哈希、有效期、`active/used/revoked/expired` 状态、使用时间/来源）
 - `review_sessions`：免登录复核会话（只存令牌哈希、绑定邀请与单份回执、独立 CSRF、有效期）
 - `review_objections`：字段级异议（字段、脱敏值快照、说明、`open/accepted/rejected`、提交/处理时间、处理人、驳回理由、关联更正办理与新回执编号、咨询锁、幂等键）
@@ -689,4 +735,7 @@ SQLite 启用 WAL 和外键；所有推进与回执签发都在同步 `BEGIN IMM
 | `REPLAY_DEFAULT_TTL_MS` | `3600000` | 重放会话默认有效期（1 小时） |
 | `REPLAY_SUBMIT_TOKEN_TTL_MS` | `600000` | 重放一次性提交令牌有效期（10 分钟） |
 | `RECEIPT_OBJECTION_TTL_MS` | `604800000` | 撤销异议处理期限（默认 7 个自然日；仅决定截止时间与逾期标记，不自动流转） |
+| `OBJECTION_REMINDER_LEAD_MS` | `86400000,7200000` | 到期前提醒时间点（毫秒，逗号分隔多个；提前量越大越早生成；停机错过会在恢复时补留痕） |
+| `OBJECTION_EXTENSION_MS` | `259200000` | 主管批准一次延期后顺延的时长（默认 3 天；每份异议至多一次） |
+| `OBJECTION_SWEEP_MS` | `1000` | 异议提醒/逾期升级/待发送通知后台扫描间隔；`NO_OBJECTION_SWEEP=1` 关闭定时器（启动恢复扫描仍执行） |
 | `DISPLAY_TIMEZONE` | `Asia/Shanghai` | 回执文档时间展示时区 |

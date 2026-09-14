@@ -38,7 +38,26 @@ const EVENT_TEXT = {
   'receipt.objection.supplemented': '办理人补充材料',
   'receipt.objection.rejected': '驳回',
   'receipt.objection.revocation-confirmed': '确认撤销',
+  'receipt.objection.reminder.scheduled': '系统生成到期提醒',
+  'receipt.objection.overdue': '逾期标记/升级',
+  'receipt.objection.notification.read': '确认已读',
+  'receipt.objection.extension.requested': '申请延期',
+  'receipt.objection.extension.approved': '主管批准延期',
+  'receipt.objection.extension.rejected': '主管拒绝延期',
 };
+
+const NOTIF_KIND_TEXT = {
+  reminder: '到期前提醒',
+  overdue: '逾期升级',
+  'extension-requested': '延期申请待审批',
+  'extension-approved': '延期申请已批准',
+  'extension-rejected': '延期申请已拒绝',
+};
+const NOTIF_KIND_CLASS = {
+  reminder: 'tag-warn', overdue: 'tag-reject',
+  'extension-requested': 'tag-warn', 'extension-approved': 'tag-ok', 'extension-rejected': 'tag-reject',
+};
+const EXT_STATUS_TEXT = { pending: '待主管审批', approved: '已批准', rejected: '已拒绝' };
 
 async function api(method, url, body) {
   const headers = { Accept: 'application/json' };
@@ -83,6 +102,9 @@ $('#logoutBtn').addEventListener('click', async () => {
 });
 $('#refreshBtn').addEventListener('click', loadList);
 $('#statusFilter').addEventListener('change', loadList);
+$('#refreshNotifsBtn').addEventListener('click', loadNotifications);
+$('#notificationStatusFilter').addEventListener('change', loadNotifications);
+$('#notificationKindFilter').addEventListener('change', loadNotifications);
 
 async function boot(knownUser = null) {
   try {
@@ -95,11 +117,59 @@ async function boot(knownUser = null) {
     $('#userName').textContent = state.user.displayName;
     $('#loginView').classList.add('hidden');
     $('#appView').classList.remove('hidden');
-    await loadList();
+    await Promise.all([loadList(), loadNotifications()]);
   } catch {
     $('#loginView').classList.remove('hidden');
     $('#appView').classList.add('hidden');
   }
+}
+
+async function loadNotifications() {
+  const status = $('#notificationStatusFilter').value;
+  const kind = $('#notificationKindFilter').value;
+  const params = new URLSearchParams();
+  if (status) params.set('status', status);
+  if (kind) params.set('kind', kind);
+  const result = await api('GET', `/api/processor/notifications${params.size ? `?${params}` : ''}`);
+  const list = $('#notificationList');
+  if (!result.notifications.length) {
+    list.innerHTML = '<p class="muted">暂无通知。</p>';
+    return;
+  }
+  list.innerHTML = result.notifications.map((n) => `
+    <div class="archive-item card-inner">
+      <div class="record-main">
+        <span class="tag ${NOTIF_KIND_CLASS[n.kind] || 'tag-warn'}">${escapeHtml(NOTIF_KIND_TEXT[n.kind] || n.kind)}</span>
+        <b class="mono">${escapeHtml(n.objectionNo)}</b>
+        <span class="muted small">来源回执 <span class="mono">${escapeHtml(n.receiptNo)}</span></span>
+      </div>
+      <div class="muted small">
+        异议状态：${escapeHtml(n.payload.statusLabel || n.payload.status)}
+        · 处理截止：${formatTime(n.payload.deadlineAt)}
+        ${n.level > 1 ? ` · 升级第 ${n.level} 层` : ''}
+      </div>
+      <div class="muted small">
+        生成于 ${formatTime(n.createdAt)}${n.sentAt ? ` · 发送于 ${formatTime(n.sentAt)}` : ''}
+        ${n.readAt ? ` · 已读于 ${formatTime(n.readAt)}` : ' · <b>未读</b>'}
+      </div>
+      <div class="record-actions">
+        ${n.readAt ? '' : `<button class="button secondary" type="button" data-read="${escapeHtml(n.id)}">确认已读</button>`}
+        <button class="button secondary" type="button" data-detail="${escapeHtml(n.objectionNo)}">查看异议</button>
+      </div>
+    </div>`).join('');
+  list.querySelectorAll('[data-read]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      try {
+        await api('POST', `/api/processor/notifications/${encodeURIComponent(btn.dataset.read)}/read`, {});
+        await Promise.all([loadNotifications(), loadList()]);
+      } catch (error) {
+        window.alert(`确认已读失败：${error.message}`);
+      }
+    });
+  });
+  list.querySelectorAll('[data-detail]').forEach((btn) => {
+    btn.addEventListener('click', () => loadDetail(btn.dataset.detail));
+  });
 }
 
 async function loadList() {
@@ -115,6 +185,7 @@ async function loadList() {
       <div class="record-main">
         <b class="mono">${escapeHtml(o.objectionNo)}</b>
         <span class="badge ${STATUS_CLASS[o.status] || 'current'}">${STATUS_LABELS[o.status] || o.status}</span>
+        ${o.overdueAt ? '<span class="badge invalidated">已逾处理期限</span>' : o.overdue ? '<span class="tag tag-reject">已逾处理期限</span>' : ''}
       </div>
       <div class="muted small">
         来源回执 <span class="mono">${escapeHtml(o.receiptNo)}</span>
@@ -163,6 +234,37 @@ function eventsHtml(o) {
     </li>`).join('');
 }
 
+function escalationHtml(o) {
+  const esc = o.escalation;
+  if (!esc) return '';
+  const notifs = (esc.notifications || []).map((n) => `
+      <li class="muted small">
+        ${formatTime(n.createdAt)} · ${escapeHtml(NOTIF_KIND_TEXT[n.kind] || n.kind)}
+        · 接收方：${escapeHtml(n.audience === 'processor' ? '处理人（本人）' : n.audience)}
+        · 状态：${({ pending: '待发送', sent: '已发送', read: '已读' })[n.status] || n.status}
+        ${n.payload.deadlineAt ? ` · 截止 ${formatTime(n.payload.deadlineAt)}` : ''}
+        ${n.readAt ? ` · 已读于 ${formatTime(n.readAt)}` : ''}
+      </li>`).join('');
+  const extensions = (esc.extensions || []).map((e) => `
+      <li class="small">
+        <b>${escapeHtml(EXT_STATUS_TEXT[e.status] || e.status)}</b>
+        · 申请于 ${formatTime(e.requestedAt)}
+        · 原截止 ${formatTime(e.previousDeadlineAt)} → 当前截止 ${formatTime(e.currentDeadlineAt)}
+        <div>延期原因：${escapeHtml(e.reason)}</div>
+        ${e.decidedAt ? `<div class="muted small">主管决议（${formatTime(e.decidedAt)}）：${escapeHtml(e.decisionNote || '—')}</div>` : ''}
+      </li>`).join('');
+  return `
+    <h3>提醒 / 升级 / 延期留痕（只追加，不可覆盖）</h3>
+    <details class="batch-history" open>
+      <summary class="muted small">本异议的通知记录（${(esc.notifications || []).length} 条，仅含本人可见接收方）</summary>
+      <ul class="batch-history-list">${notifs || '<li class="muted small">暂无</li>'}</ul>
+    </details>
+    <details class="batch-history">
+      <summary class="muted small">延期申请（${(esc.extensions || []).length} 条，每异议至多一次）</summary>
+      <ul class="batch-history-list">${extensions || '<li class="muted small">尚未申请</li>'}</ul>
+    </details>`;
+}
+
 async function loadDetail(objectionNo) {
   currentDetailNo = objectionNo;
   const view = $('#detailView');
@@ -172,10 +274,15 @@ async function loadDetail(objectionNo) {
   try {
     const { objection: o } = await api('GET', `/api/processor/objections/${encodeURIComponent(objectionNo)}`);
     const terminal = o.status === 'rejected' || o.status === 'revoked';
+    const extensions = o.escalation?.extensions || [];
+    const extension = extensions[0] || null;
     view.innerHTML = `
       <div class="receipt-head">
         <h2>撤销异议 <span class="mono">${escapeHtml(o.objectionNo)}</span>
-          <span class="badge ${STATUS_CLASS[o.status]}">${STATUS_LABELS[o.status]}</span></h2>
+          <span class="badge ${STATUS_CLASS[o.status]}">${STATUS_LABELS[o.status]}</span>
+          ${o.overdueAt ? '<span class="badge invalidated">已逾处理期限</span>' : ''}
+          ${extension ? `<span class="tag ${extension.status === 'approved' ? 'tag-ok' : extension.status === 'rejected' ? 'tag-reject' : 'tag-warn'}">延期：${escapeHtml(EXT_STATUS_TEXT[extension.status] || extension.status)}</span>` : ''}
+        </h2>
       </div>
       <div class="receipt-meta">
         <div><span class="muted">来源回执</span><b class="mono">${escapeHtml(o.receiptNo)}</b></div>
@@ -183,6 +290,7 @@ async function loadDetail(objectionNo) {
         <div><span class="muted">发起人</span><b>${escapeHtml(o.owner?.displayName || '—')}</b></div>
         <div><span class="muted">发起时间</span><b>${formatTime(o.createdAt)}</b></div>
         <div><span class="muted">处理期限</span><b>${formatTime(o.deadlineAt)}（${escapeHtml(formatRemaining(o.deadlineAt))}）</b></div>
+        ${o.overdueAt ? `<div><span class="muted">首次逾期时刻</span><b>${formatTime(o.overdueAt)}</b></div>` : ''}
         <div><span class="muted">冻结快照摘要</span><b class="mono small">${escapeHtml(o.snapshotDigest.slice(0, 16))}…</b></div>
       </div>
       <div class="small"><b>异议原因：</b>${escapeHtml(o.reason)}</div>
@@ -196,18 +304,25 @@ async function loadDetail(objectionNo) {
       <h3>处理历史（只追加，不可覆盖）</h3>
       <ul class="batch-history-list">${eventsHtml(o)}</ul>
 
+      ${escalationHtml(o)}
+
       <div class="receipt-actions" data-actions>
         ${o.status === 'submitted' ? '<button class="button primary" data-act="accept">受理</button>' : ''}
         ${o.status === 'accepted' ? '<button class="button secondary" data-act="request-supplements">要求补充材料</button>' : ''}
         ${o.status === 'accepted' || o.status === 'supplementing' ? '<button class="button secondary" data-act="reject">驳回（需理由）</button>' : ''}
         ${o.status === 'accepted' ? '<button class="button danger" data-act="confirm-revocation">确认撤销回执</button>' : ''}
+        ${!terminal && !extension ? '<button class="button secondary" data-act="request-extension">申请延期（仅一次）</button>' : ''}
+        ${extension ? `<p class="muted small">延期申请：${escapeHtml(EXT_STATUS_TEXT[extension.status] || extension.status)}${extension.status === 'pending' ? '，等待主管审批，不能重复申请' : ''}</p>` : ''}
         ${terminal ? '<p class="muted small">该异议已处理完结，不能重复受理或覆盖历史。</p>' : ''}
         ${o.status === 'supplementing' ? '<p class="muted small">当前等待办理人补充材料，材料提交后异议将回到“已受理”。</p>' : ''}
       </div>
       ${o.status === 'revoked' ? '<div class="alert error">原回执已撤销：免登录核验将返回“已撤销”；原始冻结快照仍可供授权审计查看。</div>' : ''}
     `;
     view.querySelectorAll('[data-act]').forEach((btn) => {
-      btn.addEventListener('click', () => runAction(o, btn.dataset.act));
+      btn.addEventListener('click', () => {
+        if (btn.dataset.act === 'request-extension') return requestExtension(o);
+        return runAction(o, btn.dataset.act);
+      });
     });
   } catch (error) {
     view.innerHTML = `<div class="alert error">${escapeHtml(error.message)}</div>`;
@@ -241,6 +356,27 @@ async function runAction(o, action) {
   } catch (error) {
     window.alert(`操作被拒绝：${error.message}（${error.code || ''}）`);
     await loadList();
+    if (currentDetailNo === o.objectionNo) await loadDetail(o.objectionNo);
+  }
+}
+
+async function requestExtension(o) {
+  const reason = window.prompt('请填写延期原因（5-300 字）：', '');
+  if (reason === null) return;
+  if (reason.trim().length < 5 || reason.trim().length > 300) {
+    window.alert('延期原因需为 5-300 个字符');
+    return;
+  }
+  try {
+    await api('POST', `/api/processor/objections/${encodeURIComponent(o.objectionNo)}/extension`, {
+      reason: reason.trim(),
+    });
+    window.alert('延期申请已提交，等待主管审批');
+    await Promise.all([loadList(), loadNotifications()]);
+    if (currentDetailNo === o.objectionNo) await loadDetail(o.objectionNo);
+  } catch (error) {
+    window.alert(`延期申请被拒绝：${error.message}（${error.code || ''}）`);
+    await Promise.all([loadList(), loadNotifications()]);
     if (currentDetailNo === o.objectionNo) await loadDetail(o.objectionNo);
   }
 }

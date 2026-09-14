@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>撤销异议处理工作台（异议处理人）</title>
+  <title>异议超期升级与延期审批（主管）</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <main class="shell">
     <header class="topbar">
       <div>
-        <h1>回执撤销异议处理工作台</h1>
-        <p class="subtitle">仅展示分配给当前处理人的异议；回执内容一律脱敏，完整记录仅审计员可查</p>
+        <h1>异议超期升级与延期审批</h1>
+        <p class="subtitle">逾期升级记录只读留痕；每份异议至多一次延期，由主管批准或拒绝</p>
       </div>
       <div class="top-actions">
         <span id="userName" class="user-box"></span>
@@ -20,8 +20,8 @@
     </header>
 
     <section id="loginView" class="card login-card">
-      <h2>处理人登录</h2>
-      <p class="muted">演示处理人账号：processor1 / processor2，密码：password123</p>
+      <h2>主管登录</h2>
+      <p class="muted">演示主管账号：supervisor1，密码：password123</p>
       <form id="loginForm">
         <label>用户名<input name="username" autocomplete="username" required></label>
         <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
@@ -34,23 +34,16 @@
       <div id="globalAlert" class="alert hidden"></div>
       <section class="card">
         <div class="receipt-head">
-          <h2>我的提醒与升级通知</h2>
+          <h2>逾期升级与通知留痕</h2>
           <div class="filter-bar">
-            <label>状态
-              <select id="notificationStatusFilter">
-                <option value="">全部</option>
-                <option value="pending">待发送</option>
-                <option value="sent">已发送未读</option>
-                <option value="read">已读</option>
-              </select>
-            </label>
             <label>类型
-              <select id="notificationKindFilter">
+              <select id="kindFilter">
                 <option value="">全部</option>
-                <option value="reminder">到期前提醒</option>
                 <option value="overdue">逾期升级</option>
+                <option value="extension-requested">延期申请待审批</option>
                 <option value="extension-approved">延期已批准</option>
                 <option value="extension-rejected">延期已拒绝</option>
+                <option value="reminder">到期前提醒</option>
               </select>
             </label>
             <button id="refreshNotifsBtn" class="button secondary" type="button">刷新</button>
@@ -58,29 +51,26 @@
         </div>
         <div id="notificationList" class="archive-list"></div>
       </section>
+
       <section class="card">
         <div class="receipt-head">
-          <h2>分配给我的异议</h2>
+          <h2>延期审批</h2>
           <div class="filter-bar">
-            <label>状态筛选
-              <select id="statusFilter">
-                <option value="open">进行中（待受理/已受理/待补充）</option>
+            <label>状态
+              <select id="extensionFilter">
+                <option value="pending">待审批</option>
                 <option value="">全部</option>
-                <option value="submitted">待受理</option>
-                <option value="accepted">已受理</option>
-                <option value="supplementing">待补充材料</option>
-                <option value="rejected">已驳回</option>
-                <option value="revoked">已确认撤销</option>
+                <option value="approved">已批准</option>
+                <option value="rejected">已拒绝</option>
               </select>
             </label>
-            <button id="refreshBtn" class="button secondary" type="button">刷新</button>
+            <button id="refreshExtBtn" class="button secondary" type="button">刷新</button>
           </div>
         </div>
-        <div id="objectionList" class="archive-list"></div>
+        <div id="extensionList" class="archive-list"></div>
       </section>
-      <section id="detailView" class="card hidden"></section>
     </section>
   </main>
-  <script type="module" src="/processor.js"></script>
+  <script type="module" src="/supervisor.js"></script>
 </body>
 </html>

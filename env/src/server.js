@@ -132,6 +132,19 @@ import {
   listReceiptObjectionsForOwner,
   listAssignedObjections,
   listAllObjectionsForAuditor,
+  sweepObjectionNotifications,
+  dispatchPendingObjectionNotifications,
+  markObjectionNotificationRead,
+  requestObjectionExtension,
+  decideObjectionExtension,
+  listNotificationsForUser,
+  unreadNotificationCount,
+  listPendingExtensionsForSupervisor,
+  listExtensionsForSupervisor,
+  getExtensionForSupervisor,
+  listAllNotificationsForAuditor,
+  listAllExtensionsForAuditor,
+  escalationSummaryForObjection,
 } from './db.js';
 import {
   parseComparisonCreateInput,
@@ -163,6 +176,10 @@ import {
   validateRejectReason,
   validateSupplementNote,
 } from './receiptObjections.js';
+import {
+  validateExtensionReason,
+  validateExtensionDecision,
+} from './objectionEscalations.js';
 import { parseBatchInput, BATCH_ERRORS, BATCH_SESSION_COOKIE, BATCH_CSRF_COOKIE, ALL_BATCH_FIELDS, BATCH_MAX_INVITATIONS } from './batchReviews.js';
 import { parseAppealCreateInput, APPEAL_ERRORS, APPEAL_SESSION_COOKIE, APPEAL_CSRF_COOKIE, APPEAL_REASONS } from './appealReviews.js';
 import {
@@ -228,6 +245,10 @@ const server = createServer(async (req, res) => {
     // 异议处理人工作台（processor 角色登录后处理撤销异议）
     if (url.pathname === '/processor' && req.method === 'GET') {
       return serveStaticFile(req, res, '/processor.html');
+    }
+    // 异议主管工作台（supervisor 角色：逾期升级记录与延期审批）
+    if (url.pathname === '/supervisor' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/supervisor.html');
     }
     if (url.pathname === '/api/archives/external-verify' && req.method === 'POST') {
       return archiveExternalVerify(req, res);
@@ -345,6 +366,11 @@ async function handleApi(req, res, url) {
     return handleProcessorApi(req, res, user, url);
   }
 
+  // 异议主管角色：只能查看逾期升级/提醒通知留痕并审批一次延期，无业务写权限
+  if (user.role === 'supervisor') {
+    return handleSupervisorApi(req, res, user, url);
+  }
+
   // 审计员角色：归档脱敏视图 + 撤销异议完整审计记录，不能触发办理/回执等业务接口
   if (user.role === 'auditor') {
     if (url.pathname === '/api/state' && req.method === 'GET') {
@@ -452,11 +478,35 @@ async function handleApi(req, res, url) {
     }
     const objection = getOwnerObjectionByNo(objectionNo, user.id);
     if (!objection) return sendJson(res, 404, { error: { code: 'OBJECTION_NOT_FOUND', message: '异议不存在或不属于当前账号' } });
+    objection.escalation = escalationSummaryForObjection(objection.id, { viewer: 'handler', userId: user.id });
     return sendJson(res, 200, { objection });
   }
   const objectionSupplementMatch = /^\/api\/receipt-objections\/([^/]+)\/supplement$/.exec(url.pathname);
   if (objectionSupplementMatch && req.method === 'POST') {
     return supplementObjection(req, res, user, objectionSupplementMatch[1]);
+  }
+
+  // 异议超期升级与通知留痕（办理人本人的提醒/升级/延期结果通知）
+  if (url.pathname === '/api/receipt-objection-notifications' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      notifications: listNotificationsForUser({
+        userId: user.id,
+        role: 'handler',
+        status: url.searchParams.get('status') || '',
+        kind: url.searchParams.get('kind') || '',
+      }),
+      unreadCount: unreadNotificationCount({ userId: user.id, role: 'handler' }),
+    });
+  }
+  const ownerNotifyReadMatch = /^\/api\/receipt-objection-notifications\/([^/]+)\/read$/.exec(url.pathname);
+  if (ownerNotifyReadMatch && req.method === 'POST') {
+    const result = markObjectionNotificationRead({
+      userId: user.id, role: 'handler', notificationId: decodeURIComponent(ownerNotifyReadMatch[1]),
+    });
+    if (!result.ok) {
+      return sendJson(res, result.status, { error: { code: result.code, message: result.message } });
+    }
+    return sendJson(res, 200, { ok: true, notification: result.notification, idempotent: Boolean(result.idempotent) });
   }
 
   // 多方复核批次（办理人）
@@ -718,14 +768,49 @@ async function handleApi(req, res, url) {
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
 }
 
-// 异议处理人侧：只能查看被分配的异议（脱敏回执），执行受理/补充/驳回/确认撤销
+// 异议处理人侧：只能查看被分配的异议（脱敏回执），执行受理/补充/驳回/确认撤销；
+// 以及本人定向收到的提醒/升级通知（确认已读）与一次延期申请
 function handleProcessorApi(req, res, user, url) {
   if (url.pathname === '/api/state' && req.method === 'GET') {
-    return sendJson(res, 200, { user: safeUser(user) });
+    return sendJson(res, 200, {
+      user: safeUser(user),
+      notifications: listNotificationsForUser({ userId: user.id, role: 'processor' }),
+      unreadCount: unreadNotificationCount({ userId: user.id, role: 'processor' }),
+    });
+  }
+  // 异议通知留痕（提醒 / 逾期升级 / 延期结论）
+  if (url.pathname === '/api/processor/notifications' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      notifications: listNotificationsForUser({
+        userId: user.id,
+        role: 'processor',
+        status: url.searchParams.get('status') || '',
+        kind: url.searchParams.get('kind') || '',
+      }),
+      unreadCount: unreadNotificationCount({ userId: user.id, role: 'processor' }),
+    });
+  }
+  const notifyReadMatch = /^\/api\/processor\/notifications\/([^/]+)\/read$/.exec(url.pathname);
+  if (notifyReadMatch && req.method === 'POST') {
+    const result = markObjectionNotificationRead({
+      userId: user.id, role: 'processor', notificationId: decodeURIComponent(notifyReadMatch[1]),
+    });
+    if (!result.ok) {
+      return sendJson(res, result.status, { error: { code: result.code, message: result.message } });
+    }
+    return sendJson(res, 200, { ok: true, notification: result.notification, idempotent: Boolean(result.idempotent) });
+  }
+  // 延期申请：填写延期原因，每份异议至多一次，主管审批
+  const extensionMatch = /^\/api\/processor\/objections\/([^/]+)\/extension$/.exec(url.pathname);
+  if (extensionMatch && req.method === 'POST') {
+    return processorRequestExtension(req, res, user, extensionMatch[1]);
   }
   if (url.pathname === '/api/processor/objections' && req.method === 'GET') {
     const status = url.searchParams.get('status') || '';
-    return sendJson(res, 200, { objections: listAssignedObjections(user.id, { status }) });
+    return sendJson(res, 200, {
+      objections: listAssignedObjections(user.id, { status }),
+      unreadCount: unreadNotificationCount({ userId: user.id, role: 'processor' }),
+    });
   }
   const detailMatch = /^\/api\/processor\/objections\/([^/]+)$/.exec(url.pathname);
   if (detailMatch && req.method === 'GET') {
@@ -737,6 +822,7 @@ function handleProcessorApi(req, res, user, url) {
     if (!objection) {
       return sendJson(res, 404, { error: { code: 'OBJECTION_NOT_FOUND', message: '异议不存在或未分配给当前处理人' } });
     }
+    objection.escalation = escalationSummaryForObjection(objection.id, { viewer: 'processor', userId: user.id });
     return sendJson(res, 200, { objection });
   }
   const actionMatch = /^\/api\/processor\/objections\/([^/]+)\/(accept|request-supplements|reject|confirm-revocation)$/.exec(url.pathname);
@@ -744,6 +830,108 @@ function handleProcessorApi(req, res, user, url) {
     return processorAction(req, res, user, actionMatch[1], actionMatch[2]);
   }
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
+}
+
+async function processorRequestExtension(req, res, user, rawObjectionNo) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const objectionNo = formatObjectionNoInput(decodeURIComponent(rawObjectionNo));
+  if (!OBJECTION_NO_PATTERN.test(objectionNo)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_OBJECTION_NO', message: '异议编号格式不正确' } });
+  }
+  const objection = getProcessorObjectionByNo(objectionNo, user.id);
+  if (!objection) {
+    return sendJson(res, 404, { error: { code: 'OBJECTION_NOT_FOUND', message: '异议不存在或未分配给当前处理人' } });
+  }
+  const check = validateExtensionReason(body.reason);
+  if (!check.ok) return sendJson(res, 400, { error: { code: check.code, message: check.message } });
+  const result = requestObjectionExtension({
+    userId: user.id, objectionId: objection.id, reason: check.value,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '延期申请失败' },
+      extension: result.extension || null,
+    });
+  }
+  const refreshed = getProcessorObjectionByNo(objectionNo, user.id);
+  refreshed.escalation = escalationSummaryForObjection(objection.id, { viewer: 'processor', userId: user.id });
+  return sendJson(res, 200, {
+    ok: true,
+    extension: result.extension,
+    objection: refreshed,
+    notifications: listNotificationsForUser({ userId: user.id, role: 'processor' }),
+  });
+}
+
+// 异议主管侧：只读通知留痕（含逾期升级广播）+ 延期审批；不能触碰任何业务数据
+function handleSupervisorApi(req, res, user, url) {
+  if (url.pathname === '/api/state' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      user: safeUser(user),
+      notifications: listNotificationsForUser({ userId: user.id, role: 'supervisor' }),
+      unreadCount: listPendingExtensionsForSupervisor().length,
+    });
+  }
+  if (url.pathname === '/api/supervisor/notifications' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      notifications: listNotificationsForUser({
+        userId: user.id,
+        role: 'supervisor',
+        status: url.searchParams.get('status') || '',
+        kind: url.searchParams.get('kind') || '',
+      }),
+      pendingExtensions: listPendingExtensionsForSupervisor().length,
+    });
+  }
+  const notifyReadMatch = /^\/api\/supervisor\/notifications\/([^/]+)\/read$/.exec(url.pathname);
+  if (notifyReadMatch && req.method === 'POST') {
+    const result = markObjectionNotificationRead({
+      userId: user.id, role: 'supervisor', notificationId: decodeURIComponent(notifyReadMatch[1]),
+    });
+    if (!result.ok) {
+      return sendJson(res, result.status, { error: { code: result.code, message: result.message } });
+    }
+    return sendJson(res, 200, { ok: true, notification: result.notification, idempotent: Boolean(result.idempotent) });
+  }
+  if (url.pathname === '/api/supervisor/extensions' && req.method === 'GET') {
+    const status = url.searchParams.get('status') || '';
+    return sendJson(res, 200, { extensions: listExtensionsForSupervisor({ status }) });
+  }
+  const extensionMatch = /^\/api\/supervisor\/extensions\/([^/]+)\/(approve|reject)$/.exec(url.pathname);
+  if (extensionMatch && req.method === 'POST') {
+    return supervisorDecideExtension(req, res, user, extensionMatch[1], extensionMatch[2]);
+  }
+  return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
+}
+
+async function supervisorDecideExtension(req, res, user, rawExtensionId, decision) {
+  const extensionId = decodeURIComponent(rawExtensionId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(extensionId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_EXTENSION_ID', message: '延期申请标识不正确' } });
+  }
+  const extension = getExtensionForSupervisor(extensionId);
+  if (!extension) return sendJson(res, 404, { error: { code: 'EXTENSION_NOT_FOUND', message: '延期申请不存在' } });
+  const body = await readJson(req, res);
+  if (!body) return;
+  // 拒绝必须填写理由；批准可填写说明
+  const check = validateExtensionDecision(body.note || body.reason, { required: decision === 'reject' });
+  if (!check.ok) return sendJson(res, 400, { error: { code: check.code, message: check.message } });
+  const result = decideObjectionExtension({
+    userId: user.id, extensionId, decision: decision === 'approve' ? 'approve' : 'reject', note: check.value,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, {
+      error: { code: result.code, message: result.message || '决议失败' },
+      extension: result.extension || null,
+    });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    extension: getExtensionForSupervisor(extensionId),
+    newDeadlineAt: result.newDeadlineAt,
+    pendingExtensions: listPendingExtensionsForSupervisor(),
+  });
 }
 
 const PROCESSOR_ACTIONS = {
@@ -810,7 +998,26 @@ function handleAuditorArchiveApi(req, res, user, url) {
     }
     const objection = getAuditorObjectionByNo(objectionNo);
     if (!objection) return sendJson(res, 404, { error: { code: 'OBJECTION_NOT_FOUND', message: '异议不存在' } });
+    // 完整通知留痕与延期审批记录（通知负载本身即不含证件号/完整地址/完整手机号）
+    objection.escalation = escalationSummaryForObjection(objection.id, { viewer: 'auditor' });
     return sendJson(res, 200, { objection });
+  }
+  // 异议通知完整审计记录（提醒 / 逾期升级 / 延期通知，按接收角色与类型过滤）
+  if (url.pathname === '/api/auditor/receipt-objection-notifications' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      notifications: listAllNotificationsForAuditor({
+        kind: url.searchParams.get('kind') || '',
+        audience: url.searchParams.get('audience') || '',
+        status: url.searchParams.get('status') || '',
+        objectionNo: url.searchParams.get('objectionNo') || '',
+      }),
+    });
+  }
+  // 延期申请与主管决议完整记录
+  if (url.pathname === '/api/auditor/receipt-objection-extensions' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      extensions: listAllExtensionsForAuditor({ status: url.searchParams.get('status') || '' }),
+    });
   }
   if (url.pathname === '/api/auditor/archives' && req.method === 'GET') {
     return sendJson(res, 200, { archives: listArchivesForAuditor(user.id) });
@@ -2408,7 +2615,11 @@ function stopArchiveSweep() {
   archiveSweepTimer = null;
 }
 function startBatchTimeoutSweep() {
-  if (batchSweepTimer || process.env.NO_BATCH_SWEEP === '1') return;
+  if (batchSweepTimer || process.env.NO_BATCH_SWEEP === '1') {
+    // 即使关闭批次扫描（如测试环境），异议调度仍需独立注册与启动恢复
+    startObjectionSweep();
+    return;
+  }
   // 启动时先恢复一次：服务在限时内重启后，到点的批次阶段/申诉回合/调解包层级/案件组仍会被落定
   try { sweepBatchTimeouts(); } catch { /* 记录但不阻塞启动 */ }
   try { sweepAppealTimeouts(); } catch { /* 同上 */ }
@@ -2431,6 +2642,24 @@ function startBatchTimeoutSweep() {
     try { sweepReplaySessions(); } catch (error) { console.error('replay session sweep failed', error); }
   }, config.archiveSweepMs);
   archiveSweepTimer.unref?.();
+  startObjectionSweep();
+}
+
+// 异议提醒/逾期升级/待发送通知：独立于批次扫描注册，重复调用幂等。
+// 启动恢复先扫一次——重启期间错过的提醒/逾期升级全部补落，
+// 唯一索引保证不会与重启前的记录重复。
+let objectionSweepTimer = null;
+function startObjectionSweep() {
+  try { sweepObjectionNotifications(); } catch (error) {
+    console.error('objection escalation sweep failed', error);
+  }
+  if (objectionSweepTimer || process.env.NO_OBJECTION_SWEEP === '1') return;
+  objectionSweepTimer = setInterval(() => {
+    try { sweepObjectionNotifications(); } catch (error) {
+      console.error('objection escalation sweep failed', error);
+    }
+  }, config.objectionSweepMs);
+  objectionSweepTimer.unref?.();
 }
 
 async function batchReviewContext(req, res) {
