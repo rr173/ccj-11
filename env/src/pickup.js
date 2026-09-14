@@ -267,9 +267,14 @@ export function parseRescheduleInput(body) {
 }
 
 export function parseCancelInput(body) {
+  // 取消与改约/确认交付互斥：必须携带当前预约版本号，版本不符即并发冲突
+  const version = Number(body?.expectedVersion ?? body?.version);
+  if (!Number.isInteger(version) || version < 1) {
+    return { error: { code: 'INVALID_INPUT', message: '取消必须携带当前预约版本号（≥1 的整数）' } };
+  }
   const reason = String(body?.reason ?? '').trim();
   if (reason.length > 200) return { error: { code: 'INVALID_INPUT', message: '取消原因不超过 200 个字符' } };
-  return { value: { reason } };
+  return { value: { reason, expectedVersion: version } };
 }
 
 export function parseConfirmDeliveryInput(body) {

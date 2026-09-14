@@ -161,7 +161,7 @@ function renderAppointmentCard(appt) {
         <tr><th>网点地址（冻结）</th><td>${escapeHtml(appt.frozen.locationAddress)}</td></tr>
         <tr><th>领取时间（冻结）</th><td>${formatTime(appt.frozen.startAt)} – ${formatTime(appt.frozen.endAt)}</td></tr>
         <tr><th>容量版本（冻结）</th><td>v${appt.frozen.capacityVersion}</td></tr>
-        <tr><th>预约版本</th><td>v${appt.version}（改约需携带此版本号）</td></tr>
+        <tr><th>预约版本</th><td>v${appt.version}（改约/取消需携带此版本号）</td></tr>
         <tr><th>领取窗口</th><td>开始时间起，至结束时间后宽限 ${Math.round(appt.graceMs / 60000)} 分钟止（端点包含）</td></tr>
         <tr><th>创建时间</th><td>${formatTime(appt.createdAt)}</td></tr>
         ${appt.cancelReason ? `<tr><th>取消原因</th><td>${escapeHtml(appt.cancelReason)}</td></tr>` : ''}
@@ -174,7 +174,7 @@ function renderAppointmentCard(appt) {
             ${slots.map((slot) => `<option value="${escapeHtml(slot.id)}"${slot.id === appt.slotId ? ' selected' : ''}>${escapeHtml(slotLabel(slot))}</option>`).join('')}
           </select>
           <button type="button" class="button secondary" data-action="reschedule" data-id="${escapeHtml(appt.id)}" data-version="${appt.version}">改约（旧领取码立即失效）</button>
-          <button type="button" class="button danger" data-action="cancel" data-id="${escapeHtml(appt.id)}">取消并释放名额</button>
+          <button type="button" class="button danger" data-action="cancel" data-id="${escapeHtml(appt.id)}" data-version="${appt.version}">取消并释放名额</button>
         </div>
         <div class="js-result" aria-live="polite"></div>
       ` : `<p class="muted small">该预约为只读终态：${escapeHtml(appt.statusLabel)}。</p>`}
@@ -194,7 +194,8 @@ async function onAction(button) {
   try {
     if (action === 'cancel') {
       const reason = window.prompt('取消原因（可选）：', '') ?? '';
-      const data = await api('POST', `/api/pickup/appointments/${encodeURIComponent(id)}/cancel`, { reason });
+      const expectedVersion = Number(button.dataset.version);
+      const data = await api('POST', `/api/pickup/appointments/${encodeURIComponent(id)}/cancel`, { reason, expectedVersion });
       applyState(data);
       showAlert('已取消并释放名额。', 'success');
     } else if (action === 'reschedule') {
@@ -209,7 +210,7 @@ async function onAction(button) {
     }
   } catch (error) {
     if (error.code === 'APPOINTMENT_VERSION_CONFLICT') {
-      showAlert('预约已被其他操作改变（旧版本改约被拒绝），已为你刷新最新版本。', 'warning');
+      showAlert('预约已被其他操作改变（旧版本操作被拒绝），已为你刷新最新版本。', 'warning');
     } else {
       showAlert(error.message);
     }

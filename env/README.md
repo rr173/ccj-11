@@ -431,14 +431,14 @@ accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ reject
 - 创建瞬间冻结预约编号 `YY-YYYYMMDD-XXXXXXXX`、网点名称/地址、时间范围、容量版本与宽限；之后主管的任何调整都不影响这些字段。
 - 同一回执至多一条进行中预约（部分唯一索引兜底并发）。
 - 领取码为 10 位（`XXXXX-XXXXX`）随机码，**明文只在预约/改约成功的当次响应出现一次**；服务端只保存按 `(预约编号, 码版本)` 计算的 HMAC 摘要（`pickup_codes`，状态 current/rotated/consumed），任何列表或详情接口都不再返回明文，数据库也不含明文。
-- 改约必须携带当前预约版本号（乐观锁，旧版本返回 `APPOINTMENT_VERSION_CONFLICT`），在同一事务内先原子占用新名额、再释放旧名额，并轮换领取码（旧码状态 `rotated`，立即失效）；交付前可取消并释放名额。
+- 改约与取消都必须携带当前预约版本号（乐观锁，旧版本返回 `APPOINTMENT_VERSION_CONFLICT`）。改约在同一事务内先原子占用新名额、再释放旧名额，并轮换领取码（旧码状态 `rotated`，立即失效）；取消成功即释放名额。**同一预约上并发的取消/改约/确认交付在同一版本号上互斥：恰好一个动作成功，其余明确返回冲突（版本冲突 / 状态不允许 / 已交付只读），名额账、版本号与最终状态保持一致。**
 - 预约状态：`booked`（已预约）/ `rescheduled`（已改约）/ `cancelled`（已取消）/ `delivered`（已交付，只读终态）/ `revoked`（回执撤销失效）/ `expired`（超过结束+宽限未领取）。
 
 ### 一次性交付与明确拒绝
 
 - 可领取区间为 `[startAt, endAt + graceMs]`，两端点都包含；交付先判窗口再判码：
   - 早于开始 → `PICKUP_TOO_EARLY`；晚于结束+宽限 → `PICKUP_TOO_LATE`（即使已被后台扫描落定为 expired 也给同一结果）。
-  - 码不匹配（错码 / 其他预约的码）→ `PICKUP_CODE_INVALID`；命中已轮换的旧码 → `PICKUP_CODE_OLD`；命中已消费码或预约已交付 → `PICKUP_ALREADY_DELIVERED`。
+  - 码不匹配（错码）→ `PICKUP_CODE_INVALID`；**该码属于其他预约（跨预约使用）→ `PICKUP_MISMATCH`，且不改变任何预约或领取码状态**；命中已轮换的旧码 → `PICKUP_CODE_OLD`；命中已消费码或预约已交付 → `PICKUP_ALREADY_DELIVERED`。
 - 成功交付把当前码标记为 `consumed`、预约置为 `delivered`，任何重放（同人/他人/跨会话）都无法再通过；交付后取消、改约、重复交付一律只读拒绝。
 - 领取人员页面只显示履约所需最小信息（预约编号、冻结的网点/地址/时间窗口、状态、交付时间），不含办理人身份、备注等。
 
@@ -713,7 +713,7 @@ accepted / supplementing ──驳回(reject，理由 5-300 字)──▶ reject
 | GET | `/api/pickup/appointments/{id}` | 是（办理人） | 预约详情（冻结信息）+ 只追加操作历史 |
 | GET | `/api/pickup/appointments/{id}/history` | 是（办理人） | 该预约的只追加审计事件（含成功与明确拒绝） |
 | POST | `/api/pickup/appointments/{id}/reschedule` | 是（办理人） | 改约（必带 expectedVersion；原子释放旧名额/占用新名额；旧领取码立即失效，返回新领取码一次） |
-| POST | `/api/pickup/appointments/{id}/cancel` | 是（办理人） | 交付前取消并释放名额（已交付只读拒绝） |
+| POST | `/api/pickup/appointments/{id}/cancel` | 是（办理人） | 交付前取消并释放名额（必带 expectedVersion；已交付只读拒绝，版本不符明确冲突） |
 | GET | `/api/pickup-delivery/context?appointmentNo=` | 是（领取人员） | 仅履约所需最小信息（网点/地址/时间窗口/状态，不含办理人身份） |
 | POST | `/api/pickup-delivery/confirm` | 是（领取人员） | 窗口（含宽限）内凭预约编号+一次性领取码确认交付；错码/旧码/跨预约/过早/过期/重复均明确拒绝 |
 | GET | `/api/supervisor/pickup/locations` | 是（主管） | 网点、全部预约占用、最近失败原因 |

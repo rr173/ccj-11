@@ -134,7 +134,9 @@ async function cleanupActive(client) {
   const list = await request('GET', '/api/pickup/appointments', auth(client));
   for (const appt of list.data.appointments || []) {
     if (appt.status === 'booked' || appt.status === 'rescheduled') {
-      await request('POST', `/api/pickup/appointments/${appt.id}/cancel`, auth(client, { body: { reason: '用例间清理' } }));
+      await request('POST', `/api/pickup/appointments/${appt.id}/cancel`, auth(client, {
+        body: { reason: '用例间清理', expectedVersion: appt.version },
+      }));
     }
   }
 }
@@ -401,10 +403,22 @@ test('领取码错误与跨预约使用都被明确拒绝，且不泄露明文',
     const wrong = await deliver(staff, r1.data.appointment.appointmentNo, 'AAAAA-BBBBB');
     assert.equal(wrong.status, 409);
     assert.equal(wrong.data.error.code, 'PICKUP_CODE_INVALID');
-    // 跨预约：用 r2 的领取码去领 r1
+    // 跨预约：用 r2 的领取码去领 r1，必须明确返回跨预约拒绝（不是普通错码）
     const cross = await deliver(staff, r1.data.appointment.appointmentNo, r2.data.pickupCode);
     assert.equal(cross.status, 409);
-    assert.equal(cross.data.error.code, 'PICKUP_CODE_INVALID');
+    assert.equal(cross.data.error.code, 'PICKUP_MISMATCH');
+    // 跨预约拒绝不得改变任何预约或领取码状态：两个预约仍为 booked、版本不变、名额不变
+    const r1After = await request('GET', `/api/pickup/appointments/${r1.data.appointment.id}`, auth(carol));
+    const r2After = await request('GET', `/api/pickup/appointments/${r2.data.appointment.id}`, auth(dave));
+    assert.equal(r1After.data.appointment.status, 'booked');
+    assert.equal(r1After.data.appointment.version, 1);
+    assert.equal(r2After.data.appointment.status, 'booked');
+    assert.equal(r2After.data.appointment.version, 1);
+    const slotsAfter = (await request('GET', '/api/pickup/bookable-slots', auth(carol))).data.slots;
+    assert.equal(slotsAfter.find((s) => s.id === slots[1].id).occupied, 2);
+    // r2 的领取码仍是 r2 当前生效码：在窗口内可以正常交付（未被跨预约尝试消费）
+    const ownUse = await deliver(staff, r2.data.appointment.appointmentNo, r2.data.pickupCode);
+    assert.equal(ownUse.status, 200, JSON.stringify(ownUse.data));
     // 主管/办理人任何接口都不含领取码明文（含预约占用列表）
     const adminAppts = await request('GET', '/api/supervisor/pickup/appointments', auth(admin));
     const serialized = JSON.stringify(adminAppts.data);
@@ -450,7 +464,9 @@ test('回执撤销后未交付预约自动失效并释放名额；已交付预�
   assert.equal(bDetail.data.appointment.status, 'revoked');
 
   // 失效预约不能取消/改约/领取
-  const cancel = await request('POST', `/api/pickup/appointments/${b.data.appointment.id}/cancel`, auth(dave, { body: {} }));
+  const cancel = await request('POST', `/api/pickup/appointments/${b.data.appointment.id}/cancel`, auth(dave, {
+    body: { expectedVersion: b.data.appointment.version },
+  }));
   assert.equal(cancel.status, 409);
   assert.equal(cancel.data.error.code, 'APPOINTMENT_NOT_ACTIVE');
   const staleDelivery = await deliver(staff, b.data.appointment.appointmentNo, b.data.pickupCode);
@@ -501,7 +517,9 @@ test('取消/改约与确认交付并发：两个动作只有一个成功', asyn
     assert.equal(a.status, 200, JSON.stringify(a.data));
     const alice2 = await login('alice');
     const [cancelRes, deliverRes] = await Promise.all([
-      request('POST', `/api/pickup/appointments/${a.data.appointment.id}/cancel`, auth(alice2, { body: { reason: '并发取消' } })),
+      request('POST', `/api/pickup/appointments/${a.data.appointment.id}/cancel`, auth(alice2, {
+        body: { reason: '并发取消', expectedVersion: a.data.appointment.version },
+      })),
       deliver(staff, a.data.appointment.appointmentNo, a.data.pickupCode),
     ]);
     const outcomes = [cancelRes.status === 200, deliverRes.status === 200].filter(Boolean).length;
@@ -548,6 +566,100 @@ test('取消/改约与确认交付并发：两个动作只有一个成功', asyn
       assert.equal(oldCodeInWindow.status, 409);
       assert.equal(oldCodeInWindow.data.error.code, 'PICKUP_CODE_OLD');
       await setClock(admin, base + HOUR);
+    }
+  } finally {
+    await resetClock(admin);
+  }
+});
+
+test('取消/改约/确认交付三方同时发起：只有一个动作成功，名额/版本/最终状态一致', async () => {
+  const admin = await login('supervisor1');
+  const alice = await login('alice');
+  await cleanupActive(alice);
+  const receipts = (await request('GET', '/api/receipts', auth(alice))).data.receipts;
+
+  // 两个同日时间段：交付窗口与改约目标都落在固定时钟内
+  const base = Date.now() + 1 * DAY;
+  const locRes = await request('POST', '/api/supervisor/pickup/locations', auth(admin, {
+    body: { name: '三方并发网点', address: '三方并发测试地址 1 号' },
+  }));
+  assert.equal(locRes.status, 200, JSON.stringify(locRes.data));
+  const locId = locRes.data.location.id;
+  const saRes = await request('POST', `/api/supervisor/pickup/locations/${locId}/slots`, auth(admin, {
+    body: { startAt: base, endAt: base + 2 * HOUR, capacity: 5 },
+  }));
+  assert.equal(saRes.status, 200, JSON.stringify(saRes.data));
+  const sbRes = await request('POST', `/api/supervisor/pickup/locations/${locId}/slots`, auth(admin, {
+    body: { startAt: base + 3 * HOUR, endAt: base + 5 * HOUR, capacity: 5 },
+  }));
+  assert.equal(sbRes.status, 200, JSON.stringify(sbRes.data));
+  const slotA = saRes.data.slot.id;
+  const slotB = sbRes.data.slot.id;
+
+  const staff = await login('pickup1');
+  await setClock(admin, base + HOUR);
+  try {
+    const booked = await book(alice, receipts[0].receiptNo, slotA);
+    assert.equal(booked.status, 200, JSON.stringify(booked.data));
+    const appt = booked.data.appointment;
+    assert.equal(appt.version, 1);
+    const alice2 = await login('alice');
+    const alice3 = await login('alice');
+
+    // 同一预约（版本 1）同时发起取消、改约、确认交付
+    const [cancelRes, rescheduleRes, deliverRes] = await Promise.all([
+      request('POST', `/api/pickup/appointments/${appt.id}/cancel`, auth(alice2, {
+        body: { reason: '三方并发取消', expectedVersion: 1 },
+      })),
+      request('POST', `/api/pickup/appointments/${appt.id}/reschedule`, auth(alice3, {
+        body: { slotId: slotB, expectedVersion: 1 },
+      })),
+      deliver(staff, appt.appointmentNo, booked.data.pickupCode),
+    ]);
+
+    const results = [
+      { name: 'cancel', res: cancelRes },
+      { name: 'reschedule', res: rescheduleRes },
+      { name: 'deliver', res: deliverRes },
+    ];
+    const winners = results.filter((r) => r.res.status === 200);
+    const losers = results.filter((r) => r.res.status !== 200);
+    assert.equal(winners.length, 1,
+      `只能一个动作成功：${JSON.stringify(results.map((r) => [r.name, r.res.status, r.res.data?.error?.code]))}`);
+    assert.equal(losers.length, 2);
+    for (const loser of losers) {
+      assert.equal(loser.res.status, 409, `${loser.name} 必须明确返回冲突`);
+      assert.ok(loser.res.data.error.code, `${loser.name} 必须携带业务错误码`);
+    }
+
+    // 最终状态与胜者一致；版本只推进一格（不存在两个动作都落库）
+    const final = (await request('GET', `/api/pickup/appointments/${appt.id}`, auth(alice))).data.appointment;
+    assert.equal(final.version, 2, '版本只应推进一次');
+    const slotsNow = (await request('GET', '/api/pickup/bookable-slots', auth(alice))).data.slots;
+    const occA = slotsNow.find((s) => s.id === slotA).occupied;
+    const occB = slotsNow.find((s) => s.id === slotB).occupied;
+    const winner = winners[0].name;
+    if (winner === 'cancel') {
+      assert.equal(final.status, 'cancelled');
+      assert.equal(occA, 0, '取消必须释放原名额');
+      assert.equal(occB, 0);
+      assert.equal(rescheduleRes.data.error.code, 'APPOINTMENT_NOT_ACTIVE');
+      assert.equal(deliverRes.data.error.code, 'PICKUP_NOT_ACTIVE');
+    } else if (winner === 'reschedule') {
+      assert.equal(final.status, 'rescheduled');
+      assert.equal(occA, 0, '改约必须释放旧名额');
+      assert.equal(occB, 1, '改约必须占用新名额');
+      // 取消携带的是旧版本号，必须明确版本冲突
+      assert.equal(cancelRes.data.error.code, 'APPOINTMENT_VERSION_CONFLICT');
+      // 交付用旧领取码：新窗口未到或旧码已失效，都是明确拒绝
+      assert.ok(['PICKUP_CODE_OLD', 'PICKUP_TOO_EARLY'].includes(deliverRes.data.error.code),
+        `实际：${deliverRes.data.error.code}`);
+    } else {
+      assert.equal(final.status, 'delivered');
+      assert.equal(occA, 1, '交付消耗名额，不释放');
+      assert.equal(occB, 0);
+      assert.equal(cancelRes.data.error.code, 'APPOINTMENT_DELIVERED_READONLY');
+      assert.equal(rescheduleRes.data.error.code, 'APPOINTMENT_DELIVERED_READONLY');
     }
   } finally {
     await resetClock(admin);

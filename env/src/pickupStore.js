@@ -455,7 +455,7 @@ export function reschedulePickup({ user, sessionId, appointmentId, expectedVersi
   });
 }
 
-export function cancelPickup({ user, appointmentId, reason = '' }) {
+export function cancelPickup({ user, appointmentId, expectedVersion, reason = '' }) {
   const actor = actorOf(user);
   const auditRef = {};
   return runPickupMutation({
@@ -472,15 +472,20 @@ export function cancelPickup({ user, appointmentId, reason = '' }) {
       auditRef.slotId = appt.slot_id;
       if (appt.status === 'delivered') throw new PickupDenial('APPOINTMENT_DELIVERED_READONLY');
       if (!['booked', 'rescheduled'].includes(appt.status)) throw new PickupDenial('APPOINTMENT_NOT_ACTIVE');
+      // 乐观锁：取消/改约/确认交付在同一版本上互斥——版本不符说明该预约
+      // 已被并发的改约或交付改变，本次取消必须明确冲突而不是覆盖对方结果
+      if (appt.version !== expectedVersion) throw new PickupDenial('APPOINTMENT_VERSION_CONFLICT');
 
       const ts = nowMs();
       const result = db.prepare(`
         UPDATE pickup_appointments
         SET status = 'cancelled', version = version + 1,
             cancel_reason = ?, cancelled_at = ?, updated_at = ?
-        WHERE id = ? AND status IN ('booked', 'rescheduled')
-      `).run(String(reason).slice(0, 200), ts, ts, appt.id);
-      if (result.changes !== 1) throw new PickupDenial('APPOINTMENT_NOT_ACTIVE');
+        WHERE id = ? AND version = ? AND status IN ('booked', 'rescheduled')
+      `).run(String(reason).slice(0, 200), ts, ts, appt.id, expectedVersion);
+      // 双重条件（先查 version + UPDATE WHERE version）兜底极端并发：
+      // 另一个页面在本事务等待写锁期间改了状态/版本，此处必须整体回滚。
+      if (result.changes !== 1) throw new PickupDenial('APPOINTMENT_VERSION_CONFLICT');
       releaseSlotTx(appt.slot_id);
       rotateCodesTx(appt.id);
       writeAuditTx({
@@ -508,6 +513,9 @@ function loadActiveForDeliveryTx(appointmentNo) {
 
 // 码校验：先比对当前生效码（错码 / 其他预约码不匹配时，继续比对历史版本，
 // 以便把“旧领取码”与“错码”明确区分）；命中 rotated 即旧码、consumed 即已交付。
+// 本预约全部版本都不命中时，再比对其他预约的领取码：能命中说明是“拿别的预约
+// 的码来领本预约”，必须明确返回跨预约拒绝（PICKUP_MISMATCH）而不是普通错码；
+// 整个校验只读，任何拒绝都由外层回滚，不改变任何预约或领取码状态。
 function verifyCurrentCodeTx(appt, rawCode) {
   const rows = db.prepare(`
     SELECT * FROM pickup_codes WHERE appointment_id = ? ORDER BY code_seq DESC
@@ -521,6 +529,23 @@ function verifyCurrentCodeTx(appt, rawCode) {
     if (row.status === 'current') return;
     if (row.status === 'consumed') throw new PickupDenial('PICKUP_ALREADY_DELIVERED');
     throw new PickupDenial('PICKUP_CODE_OLD');
+  }
+  // 跨预约检测：该码是否属于其他预约（含其历史版本）。摘要绑定预约编号与
+  // code_seq，只有真实签发过的领取码才可能命中，错码不会误判。
+  const others = db.prepare(`
+    SELECT c.code_hash, c.code_seq, a.appointment_no
+    FROM pickup_codes c
+    JOIN pickup_appointments a ON a.id = c.appointment_id
+    WHERE c.appointment_id <> ?
+  `).all(appt.id);
+  for (const row of others) {
+    if (codeDigestMatches(row.code_hash, {
+      appointmentNo: row.appointment_no,
+      codeSeq: row.code_seq,
+      rawCode,
+    })) {
+      throw new PickupDenial('PICKUP_MISMATCH');
+    }
   }
   throw new PickupDenial('PICKUP_CODE_INVALID');
 }

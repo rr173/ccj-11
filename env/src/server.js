@@ -2820,6 +2820,7 @@ async function cancelAppointmentRoute(req, res, user, rawAppointmentId) {
   const result = cancelPickup({
     user,
     appointmentId,
+    expectedVersion: parsed.value.expectedVersion,
     reason: parsed.value.reason,
   });
   if (!result.ok) {
