@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // 离线核验设备本机逻辑（浏览器与 Node 测试共用，零外部依赖，全部使用 Web Crypto）：
 //   - 载入授权包：验服务器 Ed25519 签名（包内嵌公钥）；验签失败一律拒绝。
-//   - 离线核验：过期 / 停用 / 超期未同步（撤销宽限）/ 范围外 / 核验码不符 / 已撤销全部拒绝。
+//   - 离线核验：过期 / 停用 / 超期未同步（撤销宽限，自上次成功同步起算）/ 范围外 / 核验码不符 / 已撤销全部拒绝。
 //   - 日志：按本机递增序号记录，每条摘要串联上一条摘要（prevDigest）。
 //   - 同步后增量应用：新增/状态变化回执写入本地视图，撤销立即生效；游标单调推进。
 //
@@ -63,7 +63,7 @@ export function createDeviceState({ deviceId, token, now = () => Date.now() }) {
     lastDigest: '',             // 日志链头
     logs: [],                   // 全部日志（已上传的保留以延续摘要链）
     pending: [],                // 待上传日志
-    syncDeadlineAt: 0,          // 上次同步给出的“必须在此前再次同步”时刻（0=无撤销宽限压力）
+    syncDeadlineAt: 0,          // 服务器同步响应给出的“必须在此前再次同步”时刻（0=无）；本机生效期限见 effectiveSyncDeadline
   };
 }
 
@@ -100,6 +100,17 @@ export function restoreState(json, { now = () => Date.now() } = {}) {
   state.logs = data.logs || [];
   state.syncDeadlineAt = data.syncDeadlineAt || 0;
   return state;
+}
+
+// 本机生效的“必须再次同步”截止时刻：取服务器下发的撤销同步期限（syncDeadlineAt）
+// 与“上次成功同步 + 撤销宽限期”的较早者（0 = 尚未载入授权包，无有效期限）。
+// 撤销可能发生在上次同步后的任意时刻，离线设备无法察觉，因此宽限期一律自上次成功
+// 同步（或授权包签发）起算：超过该时刻仍未同步，设备必须本机立即拒绝核验，不能等
+// 日志上传服务器后才发现结果失效。
+export function effectiveSyncDeadline(state) {
+  const local = state.lastSuccessfulSyncAt ? state.lastSuccessfulSyncAt + state.graceMs : 0;
+  if (state.syncDeadlineAt && (!local || state.syncDeadlineAt < local)) return state.syncDeadlineAt;
+  return local;
 }
 
 // 载入授权包：验签 + 绑定设备 + 初始化本地视图与基线游标
@@ -153,21 +164,28 @@ function inScope(state, receiptNo) {
   return state.scope.receiptNos.includes(receiptNo);
 }
 
-// 离线核验：返回 { verdict, receipt? }；拒绝时 verdict='rejected' 并记录 reason，
-// 抛 DeviceError 仅用于“设备自身不可用”（未载入有效授权包/过期/停用/超期未同步）。
+// 离线核验：返回 { verdict, receipt? }；拒绝时 verdict='rejected' 并记录 reason 入摘要链，
+// 抛 DeviceError 仅用于“设备自身不可用”（未载入有效授权包/过期/停用）。
 export async function offlineVerify(state, { receiptNo, code, at = state.now() }) {
   if (!state.packageVerified) throw new DeviceError('PACKAGE_SIGNATURE_INVALID', '尚未载入有效的离线授权包');
   if (state.disabled) throw new DeviceError('DEVICE_DISABLED');
   if (at >= state.expiresAt) throw new DeviceError('DEVICE_EXPIRED');
-  // 撤销宽限：超过上次同步给出的同步期限仍未联网，设备必须自我停用核验
-  if (state.syncDeadlineAt && at >= state.syncDeadlineAt) {
-    throw new DeviceError('REVOKED_BEYOND_GRACE', '已超过撤销宽限期仍未完成同步，本机暂停核验');
-  }
 
   const normalized = String(receiptNo || '').replace(/[\s-]/g, '').toUpperCase();
   const no = /^\d{8}[0-9A-Z]{8}$/.test(normalized)
     ? `HZ-${normalized.slice(0, 8)}-${normalized.slice(8)}`
     : receiptNo;
+
+  // 撤销宽限：超过本机“必须再次同步”的截止时刻仍未联网，立即明确拒绝并留痕入链——
+  // 离线期间可能已发生撤销而本机无法察觉，不能等日志上传后才由服务器判定结果失效。
+  const syncDeadline = effectiveSyncDeadline(state);
+  if (syncDeadline && at >= syncDeadline) {
+    const entry = await appendLog(state, {
+      receiptNo: no, result: VERDICT.rejected, reason: REJECT_REASONS.SYNC_OVERDUE, at,
+    });
+    return { verdict: VERDICT.rejected, reason: REJECT_REASONS.SYNC_OVERDUE, receipt: null, entry };
+  }
+
   const record = state.records.get(no);
   let verdict = VERDICT.rejected;
   let reason = '';

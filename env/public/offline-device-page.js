@@ -37,7 +37,8 @@ function renderDevice() {
   renderSyncCard();
 
   const expired = state.now() >= state.expiresAt;
-  const deadlineMissed = state.syncDeadlineAt && state.now() >= state.syncDeadlineAt;
+  const syncDeadline = runtime.effectiveSyncDeadline(state);
+  const deadlineMissed = syncDeadline && state.now() >= syncDeadline;
   const scopeText = state.scope.kind === 'all'
     ? `全部回执（当前载入 ${state.records.size} 份）`
     : `指定 ${state.scope.receiptNos.length} 份`;
@@ -48,7 +49,7 @@ function renderDevice() {
     <div>撤销宽限：${state.graceMs / 1000} 秒</div>
     <div>同步游标：<b>${state.cursor}</b>｜上次成功同步：${fmt(state.lastSuccessfulSyncAt)}</div>
     <div>下一日志序号：${state.nextSeq}｜链头：<code>${esc((state.lastDigest || '∅').slice(0, 16))}…</code></div>
-    ${state.syncDeadlineAt ? `<div>撤销同步期限：${fmt(state.syncDeadlineAt)} ${deadlineMissed ? '<span class="pill-reject">已超期未同步，本机已暂停核验</span>' : ''}</div>` : ''}
+    ${syncDeadline ? `<div>必须再次同步期限：${fmt(syncDeadline)} ${deadlineMissed ? '<span class="pill-reject">已超期未同步，本机拒绝核验</span>' : ''}</div>` : ''}
     ${state.disabled ? '<div class="pill-reject">设备已停用</div>' : ''}
   `;
   renderLogs();
@@ -152,6 +153,7 @@ $('verifyBtn').addEventListener('click', async () => {
       const reasons = {
         not_found: '回执不存在', code_mismatch: '核验码不符', revoked: '回执已撤销',
         out_of_scope: '回执不在本设备授权范围',
+        sync_overdue: '已超过撤销宽限期未同步，本机拒绝核验（请联网同步后重试）',
       };
       show($('verifyResult'), 'error', `<b>核验被拒绝：</b>${esc(reasons[result.reason] || result.reason)}<br><span class="muted small">已记录本机日志 #${result.entry.seq}</span>`);
     }

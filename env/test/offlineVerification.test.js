@@ -437,6 +437,104 @@ describe('电子回执离线核验：离线撤销与宽限边界', () => {
   });
 });
 
+describe('电子回执离线核验：宽限期结束设备本机立即拒绝', () => {
+  let alice; let erin; let supervisor; let aliceReceipt; let erinReceipt;
+
+  before(async () => {
+    alice = await login('alice');
+    erin = await login('erin');
+    supervisor = await login('supervisor1');
+    await resetClock(supervisor);
+    ({ receipt: aliceReceipt } = await completeWorkflow(alice));
+    ({ receipt: erinReceipt } = await completeWorkflow(erin));
+  });
+
+  after(async () => {
+    await resetClock(supervisor);
+  });
+
+  test('离线期间错过撤销且超宽限未同步：本机立即拒绝（sync_overdue）并留痕；同步撤销增量后继续立即拒绝', async () => {
+    // 撤销时间由服务器以真实时间落库（db.js 的 now() 不受测试时钟控制），
+    // 因此 t0 取真实当前时刻，与既有宽限测试保持一致
+    const t0 = Date.now();
+    await setClock(supervisor, t0);
+    const GRACE = 10 * 60000;
+    const no = aliceReceipt.receiptNo;
+    const kit = await provisionDevice(supervisor, { name: '本机宽限拒绝机', graceMs: GRACE });
+    // 授权包签发即“上次成功同步”：本机必须再次同步的期限 = t0 + GRACE
+    assert.equal(kit.state.lastSuccessfulSyncAt, t0);
+    assert.equal(dev.effectiveSyncDeadline(kit.state), t0 + GRACE);
+
+    // 回执在设备离线期间被撤销（t0 + 1min），设备始终未同步、无从得知
+    const revokedAt = t0 + 60000;
+    await setClock(supervisor, revokedAt);
+    const rv = await request('POST', `/api/receipts/${encodeURIComponent(no)}?action=revoke`, auth(alice, { body: { reason: '离线撤销-本机宽限测试' } }));
+    assert.equal(rv.status, 200);
+
+    // 宽限期内（上次同步后 5 分钟）：本机无撤销信息，宽限允许通过
+    const within = await dev.offlineVerify(kit.state, { receiptNo: no, code: aliceReceipt.code, at: t0 + 5 * 60000 });
+    assert.equal(within.verdict, 'accepted');
+
+    // 宽限期结束时刻：本机立即明确拒绝，不等日志上传服务器
+    const atDeadline = await dev.offlineVerify(kit.state, { receiptNo: no, code: aliceReceipt.code, at: t0 + GRACE });
+    assert.equal(atDeadline.verdict, 'rejected');
+    assert.equal(atDeadline.reason, 'sync_overdue');
+
+    // 宽限期过后更晚时刻：依旧本机拒绝（全程未与服务器通信）
+    const later = await dev.offlineVerify(kit.state, { receiptNo: no, code: aliceReceipt.code, at: t0 + 60 * 60000 });
+    assert.equal(later.verdict, 'rejected');
+    assert.equal(later.reason, 'sync_overdue');
+
+    // 拒绝同样进入摘要链日志（可审计留痕，链不断）
+    assert.equal(kit.state.logs.length, 3);
+    assert.equal(kit.state.logs[0].result, 'accepted');
+    assert.equal(kit.state.logs[1].reason, 'sync_overdue');
+    assert.equal(kit.state.logs[2].reason, 'sync_overdue');
+    assert.equal(kit.state.logs[2].prevDigest, kit.state.logs[1].digest);
+
+    // 重新联网：宽限内的“通过”与超期后的“拒绝”日志都被服务器接受，并下发撤销增量
+    await setClock(supervisor, t0 + 61 * 60000);
+    const sync = await kit.sync();
+    assert.equal(sync.status, 200, JSON.stringify(sync.data));
+    assert.equal(sync.data.acceptedCount, 3);
+    assert.ok(sync.data.delta.some((d) => d.receiptNo === no && d.kind === 'revoked'));
+    assert.equal(sync.data.mustSyncBefore, 0);
+    assert.equal(kit.state.records.get(no).status, 'revoked');
+
+    // 同步到撤销增量后：继续立即拒绝（reason 变为 revoked）
+    const afterSync = await dev.offlineVerify(kit.state, { receiptNo: no, code: aliceReceipt.code, at: t0 + 62 * 60000 });
+    assert.equal(afterSync.verdict, 'rejected');
+    assert.equal(afterSync.reason, 'revoked');
+  });
+
+  test('无撤销也须定期同步：超宽限未同步本机拒绝，同步后期限顺延恢复核验', async () => {
+    const t0 = Date.now();
+    await setClock(supervisor, t0);
+    const GRACE = 5 * 60000;
+    const kit = await provisionDevice(supervisor, { name: '定期同步机', graceMs: GRACE });
+    const no = erinReceipt.receiptNo;
+    assert.equal(dev.effectiveSyncDeadline(kit.state), t0 + GRACE);
+
+    // 宽限期内正常通过（该回执从未被撤销）
+    const ok = await dev.offlineVerify(kit.state, { receiptNo: no, code: erinReceipt.code, at: t0 + 4 * 60000 });
+    assert.equal(ok.verdict, 'accepted');
+
+    // 超过宽限期未同步：即使回执从未被撤销，本机也必须拒绝（离线无法排除撤销）
+    const overdue = await dev.offlineVerify(kit.state, { receiptNo: no, code: erinReceipt.code, at: t0 + GRACE });
+    assert.equal(overdue.verdict, 'rejected');
+    assert.equal(overdue.reason, 'sync_overdue');
+
+    // 同步后期限自新的“上次成功同步”顺延，核验恢复
+    await setClock(supervisor, t0 + 6 * 60000);
+    const sync = await kit.sync();
+    assert.equal(sync.status, 200, JSON.stringify(sync.data));
+    assert.equal(sync.data.acceptedCount, 2);
+    assert.equal(dev.effectiveSyncDeadline(kit.state), t0 + 6 * 60000 + GRACE);
+    const recovered = await dev.offlineVerify(kit.state, { receiptNo: no, code: erinReceipt.code, at: t0 + 6 * 60000 });
+    assert.equal(recovered.verdict, 'accepted');
+  });
+});
+
 describe('电子回执离线核验：设备停用与授权轮换', () => {
   let dave; let supervisor; let receipt;
 
