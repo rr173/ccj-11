@@ -89,6 +89,19 @@
         <h3 class="small">迁移记录</h3>
         <div id="calendarMigrationList" class="archive-list"></div>
       </section>
+      <section class="card">
+        <h2>离线核验设备事件审计</h2>
+        <p class="muted small">完整记录每次授权包签发/下载、离线核验结果、同步（含幂等重传）、各类拒绝（范围外/过期/停用/序号缺口/重复冲突/摘要链分叉/游标倒退/身份不符/超宽限）、轮换与停用。只追加、不可改写。</p>
+        <div class="filter-bar">
+          <select id="offlineAuditResult">
+            <option value="">全部结果</option>
+            <option value="success">成功</option>
+            <option value="denied">拒绝</option>
+          </select>
+          <button id="refreshOfflineAuditBtn" class="button secondary" type="button">刷新</button>
+        </div>
+        <div id="offlineAuditList" class="archive-list"></div>
+      </section>
       <section id="objectionView" class="card hidden"></section>
       <section id="detailView" class="card hidden"></section>
       <section id="comparisonView" class="card hidden"></section>

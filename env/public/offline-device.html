@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>电子回执离线核验设备</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <h1>电子回执离线核验设备</h1>
+        <p class="subtitle">凭一次性下载凭证载入授权包；断网核验、摘要链日志与重新联网增量同步</p>
+      </div>
+      <div class="top-actions">
+        <a class="button secondary" href="/">返回首页</a>
+      </div>
+    </header>
+
+    <section id="provisionCard" class="card">
+      <h2>1. 设备初始化（联网，仅一次）</h2>
+      <p class="muted small">由主管在管理页登记设备后，把<b>设备令牌</b>与<b>一次性下载凭证</b>录入本机。授权包只能下载一次，下载后请妥善保存。</p>
+      <label class="form-row">设备令牌
+        <textarea id="tokenInput" rows="2" placeholder="主管提供的设备同步令牌（请保密）"></textarea>
+      </label>
+      <label class="form-row">一次性下载凭证
+        <textarea id="credentialInput" rows="2" placeholder="主管生成授权包时给出的一次性凭证"></textarea>
+      </label>
+      <div class="record-actions">
+        <button id="loadPackageBtn" class="button primary" type="button">下载并校验授权包</button>
+        <button id="restoreBtn" class="button secondary" type="button">从本机存储恢复</button>
+        <button id="wipeBtn" class="button secondary" type="button">清除本机数据</button>
+      </div>
+      <div id="provisionError" class="alert error hidden"></div>
+    </section>
+
+    <section id="deviceCard" class="card hidden">
+      <h2>设备状态</h2>
+      <div id="deviceStatus" class="muted small"></div>
+    </section>
+
+    <section id="verifyCard" class="card hidden">
+      <h2>2. 离线核验</h2>
+      <div class="filter-bar">
+        <label class="switch-label"><input type="checkbox" id="offlineMode" checked> 断网模式（核验不走服务器）</label>
+      </div>
+      <div class="form-row">
+        <label>回执编号<input id="verifyNo" placeholder="HZ-YYYYMMDD-XXXXXXXX"></label>
+        <label>核验码<input id="verifyCode" placeholder="XXXXXXXX"></label>
+      </div>
+      <button id="verifyBtn" class="button primary" type="button">执行离线核验</button>
+      <div id="verifyResult" class="alert hidden"></div>
+    </section>
+
+    <section id="syncCard" class="card hidden">
+      <h2>3. 重新联网：上传日志 &amp; 拉取增量</h2>
+      <div class="filter-bar">
+        <button id="syncBtn" class="button primary" type="button">同步（上传待传日志并拉取增量）</button>
+        <button id="retryLastBtn" class="button secondary" type="button">重试上一批次（幂等）</button>
+      </div>
+      <div id="syncResult" class="muted small"></div>
+    </section>
+
+    <section id="logsCard" class="card hidden">
+      <h2>本机核验日志（摘要链）</h2>
+      <p class="muted small">每条日志按本机递增序号记录并串联上一条摘要；待上传 <b id="pendingCount">0</b> 条。</p>
+      <div id="logList" class="archive-list"></div>
+    </section>
+  </main>
+  <script type="module" src="/offline-device-page.js"></script>
+</body>
+</html>

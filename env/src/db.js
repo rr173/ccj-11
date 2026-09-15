@@ -53,6 +53,8 @@ import * as escalationNs from './objectionEscalationStore.js';
 import { seedWorkingCalendars } from './workingCalendarStore.js';
 // 线下领取预约：撤销回执时在同一事务内把未交付预约置失效并释放名额（惰性调用，规避循环依赖）
 import * as pickupNs from './pickupStore.js';
+// 电子回执离线核验：回执签发/撤销时在同一事务内追加脱敏增量 feed
+import * as offlineNs from './offlineStore.js';
 
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
@@ -1603,6 +1605,160 @@ BEGIN
 END;
 `);
 
+// ---------------------------------------------------------------------------
+// 电子回执离线核验设备与增量同步
+//
+// offline_devices        设备登记（名称、有效期、撤销宽限、授权版本、启用状态）
+// offline_device_tokens  设备同步令牌（只存 SHA-256 摘要；轮换即作废旧令牌）
+// offline_authorizations 授权包（整包自包含、服务器 Ed25519 签名；只存库不外显私钥）
+// offline_pkg_credential 授权包一次性下载凭证（随机码哈希，到期/下载后失效）
+// offline_feed           回执签发/撤销增量（全局单调 seq；只存脱敏字段与摘要）
+// offline_logs           设备上传的离线核验日志（每设备序号唯一、摘要链）
+// offline_batches        幂等批次（同 batchId 内容指纹必须一致）
+// offline_device_state   每台设备最后已接受游标/序号/链头（同步幂等与防倒退的权威）
+// offline_audit          只追加审计（发包/核验/同步/拒绝/停用；触发器禁止改写）
+// ---------------------------------------------------------------------------
+db.exec(`
+CREATE TABLE IF NOT EXISTS offline_devices (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+  scope_kind TEXT NOT NULL CHECK (scope_kind IN ('all', 'list')),
+  scope_receipt_nos TEXT NOT NULL DEFAULT '[]',
+  expires_at INTEGER NOT NULL,
+  grace_ms INTEGER NOT NULL,
+  key_version INTEGER NOT NULL DEFAULT 1,
+  registered_by_user_id TEXT,
+  registered_by_label TEXT NOT NULL DEFAULT '',
+  disabled_at INTEGER,
+  disabled_by_user_id TEXT,
+  disable_reason TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_offline_devices_status ON offline_devices(status, created_at);
+
+CREATE TABLE IF NOT EXISTS offline_device_tokens (
+  device_id TEXT NOT NULL REFERENCES offline_devices(id) ON DELETE CASCADE,
+  token_seq INTEGER NOT NULL,
+  token_hash BLOB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'current' CHECK (status IN ('current', 'rotated')),
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (device_id, token_seq)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_offline_device_tokens_hash ON offline_device_tokens(token_hash);
+
+CREATE TABLE IF NOT EXISTS offline_authorizations (
+  id TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL REFERENCES offline_devices(id) ON DELETE CASCADE,
+  key_version INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'downloaded', 'rotated', 'superseded')),
+  scope_kind TEXT NOT NULL,
+  scope_receipt_nos TEXT NOT NULL DEFAULT '[]',
+  envelope_json TEXT NOT NULL,
+  baseline_cursor INTEGER NOT NULL,
+  receipt_count INTEGER NOT NULL,
+  grace_ms INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_by_user_id TEXT,
+  created_by_label TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  downloaded_at INTEGER,
+  rotated_at INTEGER,
+  UNIQUE(device_id, key_version)
+);
+CREATE INDEX IF NOT EXISTS idx_offline_auth_device ON offline_authorizations(device_id, key_version);
+
+CREATE TABLE IF NOT EXISTS offline_pkg_credentials (
+  id TEXT PRIMARY KEY,
+  authorization_id TEXT NOT NULL REFERENCES offline_authorizations(id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL,
+  code_hash BLOB NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'used', 'expired')),
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_offline_pkg_cred_auth ON offline_pkg_credentials(authorization_id);
+
+CREATE TABLE IF NOT EXISTS offline_feed (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  receipt_no TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('issued', 'revoked')),
+  status TEXT NOT NULL CHECK (status IN ('issued', 'revoked')),
+  masked_json TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  receipt_owner_user_id TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_offline_feed_receipt ON offline_feed(receipt_no, seq);
+
+CREATE TABLE IF NOT EXISTS offline_logs (
+  id TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL REFERENCES offline_devices(id) ON DELETE CASCADE,
+  key_version INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  receipt_no TEXT NOT NULL DEFAULT '',
+  result TEXT NOT NULL CHECK (result IN ('accepted', 'rejected')),
+  reason TEXT NOT NULL DEFAULT '',
+  prev_digest TEXT NOT NULL DEFAULT '',
+  digest TEXT NOT NULL,
+  entry_at INTEGER NOT NULL,
+  batch_id TEXT NOT NULL,
+  received_at INTEGER NOT NULL,
+  UNIQUE(device_id, key_version, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_offline_logs_receipt ON offline_logs(receipt_no, entry_at);
+CREATE INDEX IF NOT EXISTS idx_offline_logs_device_seq ON offline_logs(device_id, seq);
+
+CREATE TABLE IF NOT EXISTS offline_batches (
+  batch_id TEXT NOT NULL,
+  device_id TEXT NOT NULL REFERENCES offline_devices(id) ON DELETE CASCADE,
+  fingerprint TEXT NOT NULL,
+  first_seq INTEGER NOT NULL,
+  last_seq INTEGER NOT NULL,
+  entry_count INTEGER NOT NULL,
+  cursor_before INTEGER NOT NULL,
+  received_at INTEGER NOT NULL,
+  PRIMARY KEY (device_id, batch_id)
+);
+
+CREATE TABLE IF NOT EXISTS offline_device_state (
+  device_id TEXT PRIMARY KEY REFERENCES offline_devices(id) ON DELETE CASCADE,
+  accepted_seq INTEGER NOT NULL DEFAULT 0,
+  last_digest TEXT NOT NULL DEFAULT '',
+  cursor_seq INTEGER NOT NULL DEFAULT 0,
+  last_sync_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS offline_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL,
+  device_id TEXT NOT NULL DEFAULT '',
+  device_name TEXT NOT NULL DEFAULT '',
+  receipt_no TEXT NOT NULL DEFAULT '',
+  actor_user_id TEXT,
+  actor_role TEXT NOT NULL DEFAULT '',
+  actor_label TEXT NOT NULL DEFAULT '',
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  result TEXT NOT NULL DEFAULT 'success' CHECK (result IN ('success', 'denied')),
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_offline_audit_device ON offline_audit(device_id, id);
+CREATE INDEX IF NOT EXISTS idx_offline_audit_receipt ON offline_audit(receipt_no, id);
+CREATE INDEX IF NOT EXISTS idx_offline_audit_result ON offline_audit(result, id);
+CREATE TRIGGER IF NOT EXISTS trg_offline_audit_no_update
+BEFORE UPDATE ON offline_audit
+BEGIN
+  SELECT RAISE(ABORT, 'offline_audit is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_offline_audit_no_delete
+BEFORE DELETE ON offline_audit
+BEGIN
+  SELECT RAISE(ABORT, 'offline_audit is append-only');
+END;
+`);
+
 // 每人至多一条进行中的办理（更正接口并发调用不会产生两条）
 db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_workflows_one_open
@@ -1880,6 +2036,9 @@ seedWorkingCalendars();
 if (legacyWorkflows || !hasReceipts) {
   backfillReceipts();
 }
+
+// 离线核验增量 feed：库中已有回执（升级场景）幂等补入基线；之后由签发/撤销事务实时追加
+offlineNs.backfillFeedForExistingReceipts();
 
 export function findUserByLogin(username, password) {
   const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
@@ -2393,7 +2552,10 @@ function insertReceiptRow(workflow, issuedAt) {
     try {
       const id = cryptoId();
       insert.run(id, receiptNo, workflow.id, workflow.user_id, snapshotJson, issuedAt);
-      return db.prepare('SELECT * FROM receipts WHERE id = ?').get(id);
+      const row = db.prepare('SELECT * FROM receipts WHERE id = ?').get(id);
+      // 离线核验增量：同一事务内追加脱敏签发事件（失败则整笔回滚）
+      offlineNs.onReceiptIssuedTx(row);
+      return row;
     } catch (error) {
       if (String(error?.message || '').includes('UNIQUE') && attempt < 4) continue;
       throw error;
@@ -2472,7 +2634,10 @@ export function revokeReceipt({ userId, receiptNo, reason }) {
     addEvent(row.workflow_id, 'receipt.revoked', null, { receiptNo: row.receipt_no, reason: String(reason || '').slice(0, 200) });
     // 撤销联动：未交付预约在同一事务内失效并释放名额；已交付预约保持只读
     pickupNs.invalidateAppointmentsForReceiptRevokedTx({ receiptNo: row.receipt_no, at: ts });
-    return { ok: true, receipt: hydrateReceipt(db.prepare('SELECT * FROM receipts WHERE id = ?').get(row.id)) };
+    // 离线核验增量：同一事务内追加撤销事件（设备同步后必须立即拒绝该回执）
+    const revokedRow = db.prepare('SELECT * FROM receipts WHERE id = ?').get(row.id);
+    offlineNs.onReceiptRevokedTx(revokedRow, ts);
+    return { ok: true, receipt: hydrateReceipt(revokedRow) };
   });
 }
 
@@ -3161,6 +3326,8 @@ export function getStateForUser(userId) {
   // 线下领取预约：状态、冻结领取信息、可预约时间段（领取码明文不在任何接口返回）
   envelope.pickupAppointments = pickupNs.listAppointmentsForOwner(userId);
   envelope.bookableSlots = pickupNs.listBookableSlots({});
+  // 办理人只能看到自己回执是否曾被离线核验（不含设备密钥/授权包/他人回执）
+  envelope.offlineVerifications = offlineNs.listOfflineVerificationsForOwner(userId);
   return envelope;
 }
 
@@ -3365,3 +3532,20 @@ export {
   listRecentDenials,
   listPickupAudit,
 } from './pickupStore.js';
+
+// 电子回执离线核验设备与增量同步：统一从 db.js 重导出
+export {
+  OfflineDenial,
+  registerDeviceWithPackage,
+  generateAuthorization,
+  rotateAuthorization,
+  disableDevice,
+  redeemPackageCredential,
+  deviceSync,
+  listDevicesForSupervisor,
+  getDeviceForSupervisor,
+  getDeviceLogsForSupervisor,
+  listOfflineAuditForAuditor,
+  listOfflineVerificationsForOwner,
+  backfillFeedForExistingReceipts,
+} from './offlineStore.js';

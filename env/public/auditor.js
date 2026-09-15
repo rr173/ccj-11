@@ -73,6 +73,7 @@ async function boot(knownUser = null) {
     await loadObjectionExtensions();
     await loadCalendarVersions();
     await loadCalendarMigrations();
+    await loadOfflineAudit();
   } catch (error) {
     $('#loginView').classList.remove('hidden');
     $('#appView').classList.add('hidden');
@@ -521,3 +522,23 @@ async function loadCalendarMigrations() {
 }
 $('#refreshCalBtn')?.addEventListener('click', loadCalendarVersions);
 $('#refreshMigrationBtn')?.addEventListener('click', loadCalendarMigrations);
+
+// 离线核验设备事件审计（只追加）
+async function loadOfflineAudit() {
+  const el = $('#offlineAuditList');
+  if (!el) return;
+  const result = $('#offlineAuditResult')?.value || '';
+  try {
+    const data = await api('GET', `/api/auditor/offline/audit${result ? `?result=${result}` : ''}`);
+    el.innerHTML = data.audit.map((a) => `
+      <div class="audit-row ${a.result === 'denied' ? 'audit-denied' : ''}">
+        <div><b>${escapeHtml(a.type)}</b> ${a.result === 'denied' ? '<span class="pill-reject">拒绝</span>' : '<span class="pill-accept">成功</span>'}</div>
+        <div class="muted small">${formatTime(a.createdAt)} · 设备 ${escapeHtml(a.deviceName || (a.deviceId || '').slice(0, 8))}${a.receiptNo ? ` · 回执 ${escapeHtml(a.receiptNo)}` : ''} · 操作 ${escapeHtml(a.actor.label || a.actor.role || '')}</div>
+        ${Object.keys(a.detail || {}).length ? `<div class="muted small mono">${escapeHtml(JSON.stringify(a.detail))}</div>` : ''}
+      </div>`).join('') || '<p class="muted small">暂无事件</p>';
+  } catch (error) {
+    el.innerHTML = `<p class="muted small">加载失败：${escapeHtml(error.message)}</p>`;
+  }
+}
+$('#refreshOfflineAuditBtn')?.addEventListener('click', loadOfflineAudit);
+$('#offlineAuditResult')?.addEventListener('change', loadOfflineAudit);

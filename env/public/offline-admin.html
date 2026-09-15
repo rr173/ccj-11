@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>离线核验设备管理（主管）</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <h1>电子回执离线核验设备</h1>
+        <p class="subtitle">登记核验设备、选择授权回执范围与有效期、生成只能下载一次的离线授权包</p>
+      </div>
+      <div class="top-actions">
+        <span id="userName" class="user-box"></span>
+        <a class="button secondary" href="/offline-device">设备端页面</a>
+        <button id="logoutBtn" class="button secondary" type="button">退出</button>
+      </div>
+    </header>
+
+    <section id="loginView" class="card login-card">
+      <h2>主管登录</h2>
+      <p class="muted">演示主管账号：supervisor1 / password123</p>
+      <form id="loginForm">
+        <label>用户名<input name="username" autocomplete="username" required></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+        <div id="loginError" class="alert error hidden"></div>
+        <button class="button primary" type="submit">登录</button>
+      </form>
+    </section>
+
+    <section id="appView" class="app hidden">
+      <div id="globalAlert" class="alert hidden"></div>
+
+      <section class="card">
+        <h2>登记新核验设备</h2>
+        <p class="muted small">授权包只包含脱敏姓名/手机号、事项、完成时间、核验码摘要与服务器签名；<b>不含</b>证件号、完整地址、完整手机号或办理备注。</p>
+        <form id="registerForm">
+          <label class="form-row">设备名称<input name="name" required maxlength="80" placeholder="例如：市民中心一号窗口核验机"></label>
+          <div class="form-row">
+            <b>允许核验的回执范围</b>
+            <label class="radio-row"><input type="radio" name="scopeKind" value="all" checked> 全部已签发回执</label>
+            <label class="radio-row"><input type="radio" name="scopeKind" value="list"> 指定回执编号（逗号/换行分隔）</label>
+            <textarea name="receiptNos" rows="3" placeholder="HZ-YYYYMMDD-XXXXXXXX&#10;HZ-YYYYMMDD-XXXXXXXX" disabled></textarea>
+          </div>
+          <div class="form-row form-grid-2">
+            <label>授权有效期（天，1-365）<input name="ttlDays" type="number" min="1" max="365" value="30"></label>
+            <label>撤销宽限期（分钟，1-60）<input name="graceMinutes" type="number" min="1" max="60" value="5"></label>
+          </div>
+          <button class="button primary" type="submit">登记并生成首包</button>
+        </form>
+        <div id="issueResult" class="card hidden"></div>
+      </section>
+
+      <section class="card">
+        <div class="receipt-head">
+          <h2>已登记设备</h2>
+          <button id="refreshBtn" class="button secondary" type="button">刷新</button>
+        </div>
+        <div id="deviceList" class="archive-list">读取中…</div>
+      </section>
+
+      <section id="deviceDetail" class="card hidden"></section>
+
+      <section class="card">
+        <h2>离线核验设备审计（主管视图）</h2>
+        <div class="filter-bar">
+          <select id="auditResult">
+            <option value="">全部结果</option>
+            <option value="success">成功</option>
+            <option value="denied">拒绝</option>
+          </select>
+          <button id="refreshAuditBtn" class="button secondary" type="button">刷新审计</button>
+        </div>
+        <div id="auditList" class="archive-list"></div>
+      </section>
+    </section>
+  </main>
+  <script type="module" src="/offline-admin.js"></script>
+</body>
+</html>

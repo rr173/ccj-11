@@ -179,6 +179,18 @@ import {
   listAuditForAppointment,
   listRecentDenials,
   listPickupAudit,
+  // 电子回执离线核验设备与增量同步
+  registerDeviceWithPackage,
+  generateAuthorization,
+  rotateAuthorization,
+  disableDevice,
+  redeemPackageCredential,
+  deviceSync,
+  listDevicesForSupervisor,
+  getDeviceForSupervisor,
+  getDeviceLogsForSupervisor,
+  listOfflineAuditForAuditor,
+  listOfflineVerificationsForOwner,
 } from './db.js';
 import {
   parseComparisonCreateInput,
@@ -309,8 +321,33 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/delivery' && req.method === 'GET') {
       return serveStaticFile(req, res, '/delivery.html');
     }
+    // 离线核验设备：免登录工作台（设备令牌/一次性下载凭证本身即授权）
+    if (url.pathname === '/offline-device' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/offline-device.html');
+    }
+    if (url.pathname === '/offline-device.js' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/offline-device-runtime.js');
+    }
+    if (url.pathname === '/offline-core.js' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/offline-core.js');
+    }
+    if (url.pathname === '/offline-device-page.js' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/offline-device-page.js');
+    }
+    // 主管离线设备管理页（登录后按 supervisor 角色访问）
+    if (url.pathname === '/offline-admin' && req.method === 'GET') {
+      return serveStaticFile(req, res, '/offline-admin.html');
+    }
     if (url.pathname === '/api/archives/external-verify' && req.method === 'POST') {
       return archiveExternalVerify(req, res);
+    }
+    // 离线设备：一次性下载凭证兑换授权包（凭证本身即授权，只能使用一次）
+    if (url.pathname === '/api/offline/packages/redeem' && req.method === 'POST') {
+      return offlinePackageRedeem(req, res);
+    }
+    // 离线设备：凭设备令牌上传日志批次并拉取增量（Bearer 令牌认证，免登录会话）
+    if (url.pathname === '/api/offline/sync' && req.method === 'POST') {
+      return offlineSyncRoute(req, res);
     }
     // 一次性下载凭证兑换文件（无需登录：凭证本身即授权，且只能使用一次）
     const archiveDownloadMatch = /^\/api\/archives\/exports\/([^/]+)\/download$/.exec(url.pathname);
@@ -471,7 +508,14 @@ async function handleApi(req, res, url) {
 
   // 回执相关
   if (url.pathname === '/api/receipts' && req.method === 'GET') {
-    return sendJson(res, 200, { receipts: listReceiptsForUser(user.id) });
+    return sendJson(res, 200, {
+      receipts: listReceiptsForUser(user.id),
+      offlineVerifications: listOfflineVerificationsForOwner(user.id),
+    });
+  }
+  // 办理人：只能看到本人回执是否曾被离线核验（不暴露设备密钥/授权包/他人回执）
+  if (url.pathname === '/api/receipts/offline-verifications' && req.method === 'GET') {
+    return sendJson(res, 200, { offlineVerifications: listOfflineVerificationsForOwner(user.id) });
   }
   const receiptDocMatch = /^\/api\/receipts\/([^/]+)\/print$/.exec(url.pathname);
   if (receiptDocMatch && req.method === 'GET') {
@@ -1097,7 +1141,132 @@ function handleSupervisorApi(req, res, user, url) {
   if (url.pathname === '/api/supervisor/pickup/audit' && req.method === 'GET') {
     return sendJson(res, 200, { audit: listPickupAudit() });
   }
+
+  // -------------------------------------------------------------------------
+  // 电子回执离线核验设备
+  // -------------------------------------------------------------------------
+  if (url.pathname === '/api/supervisor/offline/devices' && req.method === 'GET') {
+    return sendJson(res, 200, { devices: listDevicesForSupervisor() });
+  }
+  if (url.pathname === '/api/supervisor/offline/devices' && req.method === 'POST') {
+    return offlineRegisterRoute(req, res, user);
+  }
+  const offlineDeviceMatch = /^\/api\/supervisor\/offline\/devices\/([^/]+)$/.exec(url.pathname);
+  if (offlineDeviceMatch && req.method === 'GET') {
+    const device = getDeviceForSupervisor(decodeURIComponent(offlineDeviceMatch[1]));
+    if (!device) return sendJson(res, 404, { error: { code: 'DEVICE_NOT_FOUND', message: '设备不存在' } });
+    return sendJson(res, 200, { device, logs: getDeviceLogsForSupervisor(device.id) });
+  }
+  const offlineAuthorizeMatch = /^\/api\/supervisor\/offline\/devices\/([^/]+)\/authorize$/.exec(url.pathname);
+  if (offlineAuthorizeMatch && req.method === 'POST') {
+    return offlineAuthorizeRoute(req, res, user, offlineAuthorizeMatch[1]);
+  }
+  const offlineRotateMatch = /^\/api\/supervisor\/offline\/devices\/([^/]+)\/rotate$/.exec(url.pathname);
+  if (offlineRotateMatch && req.method === 'POST') {
+    return offlineRotateRoute(req, res, user, offlineRotateMatch[1]);
+  }
+  const offlineDisableMatch = /^\/api\/supervisor\/offline\/devices\/([^/]+)\/disable$/.exec(url.pathname);
+  if (offlineDisableMatch && req.method === 'POST') {
+    return offlineDisableRoute(req, res, user, offlineDisableMatch[1]);
+  }
+  if (url.pathname === '/api/supervisor/offline/audit' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      audit: listOfflineAuditForAuditor({
+        type: url.searchParams.get('type') || '',
+        result: url.searchParams.get('result') || '',
+        deviceId: url.searchParams.get('deviceId') || '',
+        receiptNo: url.searchParams.get('receiptNo') || '',
+      }),
+    });
+  }
   return sendJson(res, 404, { error: { code: 'NOT_FOUND' } });
+}
+
+// ---------------------------------------------------------------------------
+// 主管：离线核验设备路由
+// ---------------------------------------------------------------------------
+async function offlineRegisterRoute(req, res, user) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const result = registerDeviceWithPackage({
+    user,
+    name: body.name,
+    scope: body.scope,
+    ttlMs: body.ttlMs,
+    graceMs: body.graceMs,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 400, { error: { code: result.code, message: result.message } });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    device: result.device,
+    token: result.token,
+    authorizationId: result.authorizationId,
+    credential: result.credential,
+    keyVersion: result.keyVersion,
+    credentialExpiresAt: result.expiresAt,
+    devices: listDevicesForSupervisor(),
+  });
+}
+
+async function offlineAuthorizeRoute(req, res, user, rawDeviceId) {
+  const deviceId = decodeURIComponent(rawDeviceId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(deviceId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '设备标识不正确' } });
+  }
+  const result = generateAuthorization({ user, deviceId });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, { error: { code: result.code, message: result.message } });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    authorizationId: result.authorizationId,
+    credential: result.credential,
+    keyVersion: result.keyVersion,
+    credentialExpiresAt: result.expiresAt,
+    devices: listDevicesForSupervisor(),
+  });
+}
+
+async function offlineRotateRoute(req, res, user, rawDeviceId) {
+  const deviceId = decodeURIComponent(rawDeviceId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(deviceId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '设备标识不正确' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const result = rotateAuthorization({
+    user, deviceId,
+    ttlMs: body.ttlMs,
+    graceMs: body.graceMs,
+  });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, { error: { code: result.code, message: result.message } });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    token: result.token,
+    authorizationId: result.authorizationId,
+    credential: result.credential,
+    keyVersion: result.keyVersion,
+    credentialExpiresAt: result.expiresAt,
+    devices: listDevicesForSupervisor(),
+  });
+}
+
+async function offlineDisableRoute(req, res, user, rawDeviceId) {
+  const deviceId = decodeURIComponent(rawDeviceId);
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(deviceId)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '设备标识不正确' } });
+  }
+  const body = await readJson(req, res);
+  if (!body) return;
+  const result = disableDevice({ user, deviceId, reason: body.reason });
+  if (!result.ok) {
+    return sendJson(res, result.status || 409, { error: { code: result.code, message: result.message } });
+  }
+  return sendJson(res, 200, { ok: true, device: result.device, devices: listDevicesForSupervisor() });
 }
 
 // ---------------------------------------------------------------------------
@@ -1464,6 +1633,20 @@ function handleAuditorArchiveApi(req, res, user, url) {
       return sendJson(res, 403, { error: { code: 'COMPARE_VIEW_FORBIDDEN', message: COMPARISON_ERRORS.COMPARE_VIEW_FORBIDDEN } });
     }
     return sendJson(res, 200, { comparison });
+  }
+  // 离线核验设备：审计员可查看全部发包/下载/离线核验/同步/拒绝/停用事件（只读）
+  if (url.pathname === '/api/auditor/offline/audit' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      audit: listOfflineAuditForAuditor({
+        type: url.searchParams.get('type') || '',
+        result: url.searchParams.get('result') || '',
+        deviceId: url.searchParams.get('deviceId') || '',
+        receiptNo: url.searchParams.get('receiptNo') || '',
+      }),
+    });
+  }
+  if (url.pathname === '/api/auditor/offline/devices' && req.method === 'GET') {
+    return sendJson(res, 200, { devices: listDevicesForSupervisor() });
   }
   const match = /^\/api\/auditor\/archives\/([^/]+)$/.exec(url.pathname);
   if (match && req.method === 'GET') {
@@ -3588,6 +3771,69 @@ async function servePublicReceiptDoc(req, res, url, rawReceiptNo) {
   const receipt = ownerReceipt(row, snapshotOfReceiptRow(row));
   const html = renderReceiptDocument(receipt, { publicView: true });
   return sendReceiptDocument(res, 200, html, receipt.receiptNo);
+}
+
+// ---------------------------------------------------------------------------
+// 离线核验设备：免登录设备接口（一次性下载凭证 / 设备令牌 Bearer 认证）
+// ---------------------------------------------------------------------------
+async function offlinePackageRedeem(req, res) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const credential = String(body.credential || '').trim();
+  if (!/^[A-Za-z0-9_-]{20,300}$/.test(credential)) {
+    return sendJson(res, 400, { error: { code: 'INVALID_INPUT', message: '下载凭证格式不正确' } });
+  }
+  const result = redeemPackageCredential({ rawCredential: credential });
+  if (!result.ok) {
+    const status = {
+      PACKAGE_NOT_FOUND: 404,
+      PACKAGE_ALREADY_DOWNLOADED: 410,
+      PACKAGE_CREDENTIAL_EXPIRED: 410,
+      AUTHORIZATION_ROTATED: 410,
+      DEVICE_DISABLED: 410,
+    }[result.code] || 409;
+    return sendJson(res, status, { error: { code: result.code, message: result.message } });
+  }
+  // 下载即一次性消费：响应体直接给出授权包，服务端不提供再次下载入口
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    ...securityHeaders(),
+  });
+  res.end(JSON.stringify({
+    ok: true,
+    package: result.envelope,
+    keyVersion: result.keyVersion,
+    expiresAt: result.expiresAt,
+    hint: '授权包只能下载一次，请立即安全保存到核验设备。',
+  }));
+}
+
+function bearerToken(req) {
+  const header = String(req.headers.authorization || '');
+  const match = /^Bearer\s+([A-Za-z0-9._-]+)$/.exec(header);
+  return match ? match[1] : '';
+}
+
+async function offlineSyncRoute(req, res) {
+  const body = await readJson(req, res);
+  if (!body) return;
+  const token = bearerToken(req);
+  if (!token) {
+    return sendJson(res, 401, { error: { code: 'DEVICE_TOKEN_INVALID', message: '缺少设备令牌' } });
+  }
+  const result = deviceSync({ rawToken: token, body });
+  if (!result.ok) {
+    const status = {
+      DEVICE_TOKEN_INVALID: 401,
+      AUTHORIZATION_ROTATED: 401,
+      DEVICE_DISABLED: 410,
+      DEVICE_NOT_FOUND: 404,
+      IDENTITY_MISMATCH: 403,
+    }[result.code] || 409;
+    return sendJson(res, status, { error: { code: result.code, message: result.message, ...(result.extra || {}) } });
+  }
+  return sendJson(res, 200, result);
 }
 
 async function testSetClock(req, res) {

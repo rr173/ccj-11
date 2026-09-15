@@ -71,6 +71,27 @@ export const config = {
   pickupGraceMs: Number(process.env.PICKUP_GRACE_MS || 15 * 60 * 1000),
   // 超期未领取预约的落定扫描间隔（NO_PICKUP_SWEEP=1 关闭）
   pickupSweepMs: Number(process.env.PICKUP_SWEEP_MS || 1000),
+  // ---------------------------------------------------------------------------
+  // 电子回执离线核验设备与增量同步
+  // ---------------------------------------------------------------------------
+  // 授权包服务器签名密钥（Ed25519 PEM）：优先环境变量，否则在数据目录持久化生成
+  offlineSignKeyPath: process.env.OFFLINE_SIGN_KEY_PATH
+    || path.join(path.dirname(dbPath), 'offline-signing-ed25519.pem'),
+  offlineSignKeyPem: process.env.OFFLINE_SIGN_KEY_PEM || '',
+  // 授权包下载凭证有效期（主管生成后须在该窗口内完成一次性下载）
+  offlinePackageCredentialTtlMs: Number(process.env.OFFLINE_PACKAGE_CREDENTIAL_TTL_MS || 15 * 60 * 1000),
+  // 设备令牌长度固定（生成 32 字节随机串，库内只存 SHA-256 摘要）
+  // 每次同步最多接受的核验日志条数 / 最多下发的增量条数
+  offlineSyncMaxLogs: Number(process.env.OFFLINE_SYNC_MAX_LOGS || 500),
+  offlineSyncMaxDelta: Number(process.env.OFFLINE_SYNC_MAX_DELTA || 500),
+  // 离线撤销宽限期的允许范围（主管在登记/轮换时为每台设备选择；默认 5 分钟）
+  offlineGraceMinMs: Number(process.env.OFFLINE_GRACE_MIN_MS || 60 * 1000),
+  offlineGraceMaxMs: Number(process.env.OFFLINE_GRACE_MAX_MS || 60 * 60 * 1000),
+  offlineGraceDefaultMs: Number(process.env.OFFLINE_GRACE_DEFAULT_MS || 5 * 60 * 1000),
+  // 设备授权有效期允许范围
+  offlineTtlMinMs: Number(process.env.OFFLINE_TTL_MIN_MS || 10 * 60 * 1000),
+  offlineTtlMaxMs: Number(process.env.OFFLINE_TTL_MAX_MS || 365 * 24 * 60 * 60 * 1000),
+  offlineTtlDefaultMs: Number(process.env.OFFLINE_TTL_DEFAULT_MS || 30 * 24 * 60 * 60 * 1000),
 };
 
 config.isProduction = config.nodeEnv === 'production';
